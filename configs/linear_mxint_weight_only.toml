@@ -1,0 +1,15 @@
+# Weight-only MXINT4 quantization on linear layers
+
+by = "regex_name"
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 16
+weight_width = 4
+
+# --- MLP projections ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 16
+weight_width = 4
