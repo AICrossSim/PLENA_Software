@@ -6,3 +6,4 @@ build/
 logs/
 .claude/
 *.ipynb
+*.log

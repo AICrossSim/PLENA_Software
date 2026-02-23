@@ -97,7 +97,7 @@ def eval_main(
 
     # Load model
     tokenizer, model = setup_model(
-        model_name, model_parallel, dtype=torch.float32,
+        model_name, model_parallel, dtype=torch.float16,
         device=device_id if not model_parallel else None,
     )
     model.eval()
@@ -109,14 +109,15 @@ def eval_main(
         has_gptq = "gptq" in pass_args
 
         if has_gptq:
-            # GPTQ manages its own device placement (moves layers to GPU one by one)
-            logger.info("Applying GPTQ + quantization")
-            model, _ = quantize_module_transform_pass(model, pass_args)
-        else:
-            logger.info("Applying quantization")
-            model, _ = quantize_module_transform_pass(model, pass_args)
+            pass_args["gptq"]["device"] = device_id
 
-    # Move to device (quantize pass creates new modules on CPU)
+        n_linear = sum(1 for _, m in model.named_modules() if isinstance(m, torch.nn.Linear))
+        logger.info("Quantizing %d linear layers...", n_linear)
+        t0 = time.time()
+        model, _ = quantize_module_transform_pass(model, pass_args)
+        logger.info("Quantization complete in %.1fs", time.time() - t0)
+
+    # Move to device
     if model_parallel:
         model = move_to_gpu(model, model_parallel)
     else:

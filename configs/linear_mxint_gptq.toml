@@ -1,0 +1,36 @@
+# Weight-only MXINT4 with GPTQ calibration
+#
+# GPTQ optimizes weights first using Hessian-based calibration,
+# then linear layers are replaced with LinearMXInt (gptq=true skips re-quantizing weights)
+
+by = "regex_name"
+
+[gptq]
+model_name = "meta-llama/Meta-Llama-3-8B"
+device = "cuda:2"
+dataset = "wikitext2"
+nsamples = 128
+seqlen = 2048
+format = "mxint"
+quantile_search = true
+clip_search_y = true
+checkpoint_dir = "checkpoints/mxint4_gptq"
+# max_layers = 16  # optional: limit GPTQ to first N layers
+
+    [gptq.weight_config]
+    weight_block_size = 16
+    weight_width = 4
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 16
+weight_width = 4
+gptq = true
+
+# --- MLP projections ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 16
+weight_width = 4
+gptq = true
