@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "quant_eval"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "transformers>=4.40",
+    "lm-eval>=0.4",
+    "datasets",
+    "accelerate",
+    "colorlog",
+    "safetensors",
+    "tqdm",
+    "jsonargparse",
+]
+#For Now ONLY: mase-tools installed separately: pip install -e /path/to/mase
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["quant_eval*"]
