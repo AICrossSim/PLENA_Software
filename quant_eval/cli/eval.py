@@ -92,6 +92,9 @@ def eval_main(
         log_dir = create_experiment_log_dir(log_dir)
         full_args = locals().copy()
         save_args(log_dir, full_args)
+        if quant_config:
+            import shutil
+            shutil.copy(quant_config, log_dir / "quant_config.toml")
 
     transformers.set_seed(0)
 
