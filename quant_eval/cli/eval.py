@@ -46,6 +46,7 @@ def eval_main(
     model_name: str = "meta-llama/Meta-Llama-3-8B",
     tasks: Union[str, list[str]] = "wikitext",
     device_id: str = "cuda:0",
+    dtype: str = "float16",
 
     # Quantization config: single TOML file path
     quant_config: Union[str, None] = None,
@@ -99,8 +100,11 @@ def eval_main(
     transformers.set_seed(0)
 
     # Load model
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    torch_dtype = dtype_map.get(dtype, torch.float16)
+
     tokenizer, model = setup_model(
-        model_name, model_parallel, dtype=torch.float16,
+        model_name, model_parallel, dtype=torch_dtype,
         device=device_id if not model_parallel else None,
     )
     model.eval()

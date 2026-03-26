@@ -8,3 +8,4 @@ logs/
 *.ipynb
 *.log
 checkpoints/
+site/

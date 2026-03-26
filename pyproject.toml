@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "quant_eval"
@@ -8,7 +8,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
-    "transformers>=4.40",
+    "transformers>=4.55",
     "lm-eval>=0.4",
     "datasets",
     "accelerate",
@@ -17,8 +17,13 @@ dependencies = [
     "tqdm",
     "jsonargparse",
 ]
-#For Now ONLY: mase-tools installed separately: pip install -e /path/to/mase
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["quant_eval*"]
+[project.optional-dependencies]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9.5",
+    "mkdocstrings[python]>=0.25",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["quant_eval"]
