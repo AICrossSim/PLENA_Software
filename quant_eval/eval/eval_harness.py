@@ -4,6 +4,7 @@ from lm_eval.utils import make_table
 from transformers import PreTrainedModel, PreTrainedTokenizer
 from typing import Union, List, Dict
 
+
 def evaluate_with_lm_eval(
     model: PreTrainedModel,
     tokenizer: PreTrainedTokenizer,
@@ -27,7 +28,7 @@ def evaluate_with_lm_eval(
         Dictionary of evaluation results.
     """
     if isinstance(tasks, str):
-        tasks = [tasks]
+        tasks = [t.strip() for t in tasks.split(",")]
 
     model_lm_eval = HFLM(pretrained=model, tokenizer=tokenizer, max_length=max_length)
 
