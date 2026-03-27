@@ -1,0 +1,30 @@
+# LLaDA KV cache only MXINT4 quantization
+#
+# Replaces LLaDALlamaBlock with LLaDABlockMXInt.
+# Only the KV cache is quantized — QK/AV matmul, RoPE, and softmax are bypassed.
+#
+# Usage:
+#   python -m quant_eval.cli.eval_llada --tasks gsm8k --num_fewshot 0 \
+#       --model llada_dist \
+#       --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=32,use_cache=True,quant_config='configs/llada_kv_mxint4.toml'
+
+by = "regex_name"
+
+["model\\.transformer\\.blocks\\.\\d+"]
+name = "mxint"
+
+    ["model\\.transformer\\.blocks\\.\\d+".qk_matmul]
+    bypass = true
+
+    ["model\\.transformer\\.blocks\\.\\d+".av_matmul]
+    bypass = true
+
+    ["model\\.transformer\\.blocks\\.\\d+".rope]
+    bypass = true
+
+    ["model\\.transformer\\.blocks\\.\\d+".softmax]
+    bypass = true
+
+    ["model\\.transformer\\.blocks\\.\\d+".kv_cache]
+    data_in_block_size = 32
+    data_in_width = 4

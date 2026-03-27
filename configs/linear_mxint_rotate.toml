@@ -1,15 +1,24 @@
-# Weight-only MXINT4 quantization on linear layers
+# MXINT4 with QuaRot rotation (offline + online Hadamard)
 
 by = "regex_name"
+
+[rotation]
+online_rotate = true
 
 # --- Attention projections ---
 ["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
 name = "mxint"
 weight_block_size = 16
 weight_width = 4
+data_in_block_size = 16
+data_in_width = 4
+online_rotate = true
 
 # --- MLP projections ---
 ["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
 name = "mxint"
 weight_block_size = 16
 weight_width = 4
+data_in_block_size = 16
+data_in_width = 4
+online_rotate = true

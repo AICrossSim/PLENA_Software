@@ -1,0 +1,3 @@
+[submodule "quant_eval/benchmarks/OSWorld"]
+	path = quant_eval/benchmarks/OSWorld
+	url = git@github.com:jiaeenie/OSWorld.git

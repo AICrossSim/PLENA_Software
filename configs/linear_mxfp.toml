@@ -1,0 +1,31 @@
+# Replaces nn.Linear with LinearMXFP (E2M1, block_size=16):
+#   - q/k/v/o_proj     → LinearMXFP
+#   - gate/up/down_proj → LinearMXFP
+
+by = "regex_name"
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxfp"
+weight_block_size = 16
+weight_exponent_width = 2
+weight_frac_width = 1
+data_in_block_size = 16
+data_in_exponent_width = 2
+data_in_frac_width = 1
+bias_block_size = 16
+bias_exponent_width = 2
+bias_frac_width = 1
+
+# --- MLP projections ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxfp"
+weight_block_size = 16
+weight_exponent_width = 2
+weight_frac_width = 1
+data_in_block_size = 16
+data_in_exponent_width = 2
+data_in_frac_width = 1
+bias_block_size = 16
+bias_exponent_width = 2
+bias_frac_width = 1
