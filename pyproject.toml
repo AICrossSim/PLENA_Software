@@ -30,7 +30,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
-mase = { git = "https://github.com/jiaeenie/mase.git", branch = "jiaeenie/mx-quant-ptq" }
+mase = { git = "https://github.com/DeepWok/mase.git", branch = "releases/plena-experiments" }
 
 [build-system]
 requires = ["hatchling"]
