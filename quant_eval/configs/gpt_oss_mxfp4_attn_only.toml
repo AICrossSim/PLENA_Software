@@ -1,0 +1,12 @@
+# GPT-OSS MXFP4 (E2M1): attention projections only
+
+by = "regex_name"
+
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxfp"
+weight_block_size = 32
+weight_exponent_width = 2
+weight_frac_width = 1
+data_in_block_size = 32
+data_in_exponent_width = 2
+data_in_frac_width = 1

@@ -1,0 +1,16 @@
+# GPT-OSS MXInt4: attention projections only
+#
+# MoE expert weights are pre-quantized (MXFP4) by OpenAI — skip them.
+# Only attention q/k/v/o projections are full-precision BF16.
+
+by = "regex_name"
+
+# --- Attention projections → LinearMXInt4 ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 4
+data_in_block_size = 32
+data_in_width = 4
+bias_block_size = 32
+bias_width = 4

@@ -1,0 +1,13 @@
+# Calibration-only TOML for the humaneval_plena-qwen3-ablation sweep.
+# TokenCollector captures input_ids during real evalplus forwards on
+# humaneval, then aborts once 32 prefill samples of length 512 are
+# collected. nsamples=32, seqlen=512 → 16k tokens needed; humaneval has
+# 164 prompts × ~150 tokens ≈ 24k tokens — comfortably fills the buffer.
+
+[token_collector]
+target_nsamples    = 32
+seqlen             = 512
+save_path          = "calib/Qwen_Qwen3-8B_humaneval_n32_s512.pt"
+overwrite          = false
+min_prefill_tokens = 8
+raise_on_full      = true

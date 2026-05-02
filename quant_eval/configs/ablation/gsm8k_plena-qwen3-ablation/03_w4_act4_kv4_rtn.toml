@@ -1,0 +1,42 @@
+# Row 3 — W-only INT4 + ACT & KV INT4 (still RTN). Adds activation
+# quantization on every linear (data_in_width = 4) plus attention-module
+# quantization (qk_matmul / av_matmul / kv_cache all at INT4). Still no GPTQ.
+by = "regex_name"
+
+# Attention module: Q@K^T, attn@V, KV-cache all at INT4.
+['model\.layers\.\d+\.self_attn$']
+name = "mxint"
+
+['model\.layers\.\d+\.self_attn$'.qk_matmul]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.av_matmul]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.kv_cache]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.softmax]
+bypass = true
+
+['model\.layers\.\d+\.self_attn$'.rope]
+bypass = true
+
+# Attention projections — INT4 weights AND activations.
+['model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj']
+name = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
+
+# MLP projections — INT4 weights AND activations.
+['model\.layers\.\d+\.mlp\.(gate|up|down)_proj']
+name = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4

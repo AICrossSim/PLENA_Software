@@ -1,0 +1,21 @@
+# LLaMA MXInt4: attention + MLP projections
+
+by = "regex_name"
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8
+bias_block_size = 32
+bias_width = 8
+
+# --- MLP projections ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8

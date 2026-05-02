@@ -39,21 +39,21 @@ root_logger.propagate = False
 
 def set_logging_verbosity(level: str = "info"):
     level = level.lower()
-    match level:
-        case "debug":
-            root_logger.setLevel(logging.DEBUG)
-        case "info":
-            root_logger.setLevel(logging.INFO)
-        case "warning":
-            root_logger.setLevel(logging.WARNING)
-        case "error":
-            root_logger.setLevel(logging.ERROR)
-        case "critical":
-            root_logger.setLevel(logging.CRITICAL)
-        case _:
-            raise ValueError(
-                f"Unknown logging level: {level}, should be one of: debug, info, warning, error, critical"
-            )
+    if level == "debug":
+        root_logger.setLevel(logging.DEBUG)
+    elif level == "info":
+        root_logger.setLevel(logging.INFO)
+    elif level == "warning":
+        root_logger.setLevel(logging.WARNING)
+    elif level == "error":
+        root_logger.setLevel(logging.ERROR)
+    elif level == "critical":
+        root_logger.setLevel(logging.CRITICAL)
+    else:
+        raise ValueError(
+            f"Unknown logging level: {level}, should be one of: debug, info, warning, error, critical"
+        )
+
     root_logger.info(f"Set logging level to {level}")
 
 
@@ -106,15 +106,21 @@ def create_device_map(
 # Model loading
 # ---------------------------------------------------------------------------
 
-def setup_model(model_name, model_parallel, dtype, device):
+def setup_model(model_name, model_parallel, dtype, device, attn_implementation="sdpa"):
     logger = get_logger("setup")
-    logger.info(f"Setting up model {model_name} with dtype {dtype} and device {device}")
+    logger.info(
+        f"Setting up model {model_name} with dtype {dtype}, device {device}, "
+        f"attn_implementation={attn_implementation}"
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     logger.info("Tokenizer setup complete")
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=dtype, attn_implementation="eager", trust_remote_code=True
+        model_name,
+        torch_dtype=dtype,
+        attn_implementation=attn_implementation,
+        trust_remote_code=True,
     )
     logger.info("Model setup complete")
     return tokenizer, model
@@ -126,6 +132,7 @@ def move_to_gpu(model, model_parallel=True):
         return model
     if model_parallel:
         device_map = create_device_map(model, "auto-balanced")
+        print(f"Device map: {device_map}")
         model = dispatch_model(model, device_map=device_map)
     else:
         model = model.to(device)
