@@ -49,10 +49,4 @@ plugins:
             heading_level: 3
 
 nav:
-  - Home: index.md
-  - Getting Started: getting-started.md
-  - Configuration:
-      - Overview: configuration/overview.md
-      - TOML Reference: configuration/toml-reference.md
-  - Evaluation: evaluation.md
-  - API Reference: api-reference.md
+  - TOML Reference: configuration/toml-reference.md
