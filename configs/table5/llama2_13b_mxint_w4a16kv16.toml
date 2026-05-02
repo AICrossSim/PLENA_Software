@@ -1,0 +1,32 @@
+# Table 5 — LLaMA-2-13B, W/A/KV = 4/16/16
+# 7 linear GEMMs (q/k/v/o + gate/up/down): MXInt4 weights only.
+# Weights via GPTQ + activation-aware (y-norm) clip search.
+
+by = "regex_name"
+
+[gptq]
+model_name = "meta-llama/Llama-2-13b-hf"
+dataset = "wikitext2"
+nsamples = 128
+seqlen = 2048
+format = "mxint"
+quantile_search = true
+clip_search_y = true
+cali_batch_size = 32
+checkpoint_dir = "/data/models/jn517/plena_checkpoints/table5/llama2_13b_mxint_w4a16kv16"
+
+    [gptq.weight_config]
+    weight_block_size = 32
+    weight_width = 4
+
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 4
+gptq = true
+
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 4
+gptq = true
