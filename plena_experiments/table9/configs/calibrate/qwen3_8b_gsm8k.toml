@@ -1,4 +1,5 @@
-# Calibration-only TOML for the gsm8k_plena-qwen3-ablation sweep.
+# Calibration-only TOML for the gsm8k ablation sweep
+# (plena_experiments/table9/configs/gsm8k).
 # Attaches a TokenCollector hook that captures input_ids during a real
 # lm-eval pass on gsm8k, then aborts once 64 prefill samples of length
 # 1024 are collected. The output file is referenced by 04/05 ablation

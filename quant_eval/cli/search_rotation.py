@@ -8,7 +8,7 @@ final-combined perplexity.
 
 Example:
     python -m quant_eval.cli.search_rotation \\
-        --base_config quant_eval/configs/ablation/gsm8k_plena-qwen3-ablation/04_w4_act4_kv4_gptq.toml \\
+        --base_config plena_experiments/table9/configs/gsm8k/04_w4_act4_kv4_gptq.toml \\
         --calib_data file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt \\
         --calib_nsamples 32 \\
         --calib_seqlen 1024 \\
@@ -37,7 +37,7 @@ set_logging_verbosity("debug")
 
 def main(
     model_name: str = "Qwen/Qwen3-8B",
-    base_config: str = "quant_eval/configs/ablation/gsm8k_plena-qwen3-ablation/05_w4_act4_kv4_gptq_erryclip.toml",
+    base_config: str = "plena_experiments/table9/configs/gsm8k/05_w4_act4_kv4_gptq_erryclip.toml",
     calib_data: str = "file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
