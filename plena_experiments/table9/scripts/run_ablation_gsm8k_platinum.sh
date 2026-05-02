@@ -7,9 +7,13 @@
 #
 # CONFIGS is REQUIRED — pass a CSV of TOML paths.
 #
-# Examples:
-#   CONFIGS=quant_eval/configs/ablation/gsm8k_platinum_plena-qwen3-ablation/04_w4_act4_kv4_gptq.toml \
-#       bash quant_eval/scripts/run_ablation_gsm8k_platinum.sh
+# Pre-flight: each selected TOML's `file:...` calib refs must already be
+# on disk, and any TOML with [rotation_search] (row 06) must point at an
+# existing `gptq.checkpoint_dir` (row 05). See plena_experiments/table9/README.md.
+#
+# Examples (run from repo root):
+#   CONFIGS=plena_experiments/table9/configs/gsm8k_platinum/04_w4_act4_kv4_gptq.toml \
+#       bash plena_experiments/table9/scripts/run_ablation_gsm8k_platinum.sh
 
 set -eu
 
@@ -19,14 +23,14 @@ TASKS=${TASKS:-gsm8k_platinum}
 LIMIT=${LIMIT:-1209}
 SEQLEN=${SEQLEN:-4096}
 BATCH_SIZE=${BATCH_SIZE:-32}
-LOG_DIR=${LOG_DIR:-logs/ablation_gsm8k_platinum_$(date +%Y%m%d_%H%M%S)}
+LOG_DIR=${LOG_DIR:-logs/ablation_${TASKS}_$(date +%Y%m%d_%H%M%S)}
 
 DEFAULT_PY=$([[ -x .venv/bin/python ]] && echo .venv/bin/python || echo python)
 PY=${PY:-$DEFAULT_PY}
 
 if [[ -z "${CONFIGS:-}" ]]; then
     echo "ERROR: CONFIGS env var is required (CSV of TOML paths)." >&2
-    echo "  Example: CONFIGS=quant_eval/configs/ablation/gsm8k_platinum_plena-qwen3-ablation/04_w4_act4_kv4_gptq.toml \\" >&2
+    echo "  Example: CONFIGS=plena_experiments/table9/configs/gsm8k_platinum/04_w4_act4_kv4_gptq.toml \\" >&2
     echo "             bash $0" >&2
     exit 1
 fi
@@ -36,6 +40,29 @@ for toml in "${selected_tomls[@]}"; do
     if [[ ! -f "$toml" ]]; then
         echo "ERROR: $toml does not exist" >&2
         exit 1
+    fi
+done
+
+# Pre-flight: required calib files / row-05 checkpoints must exist.
+for toml in "${selected_tomls[@]}"; do
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        if [[ ! -f "$f" ]]; then
+            echo "ERROR: $toml needs calib file $f, but it's missing." >&2
+            echo "       Run the calibrate Step 0 from plena_experiments/table9/README.md first." >&2
+            exit 1
+        fi
+    done < <(grep -hE '^[[:space:]]*(dataset|calib_data)[[:space:]]*=[[:space:]]*"file:' "$toml" \
+              | sed 's/.*"file:\([^"]*\)".*/\1/' | sort -u)
+
+    if grep -qE '^\[rotation_search\]' "$toml"; then
+        ckpt=$(grep -E '^[[:space:]]*checkpoint_dir[[:space:]]*=' "$toml" \
+               | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+        if [[ -n "$ckpt" && ! -d "$ckpt" ]]; then
+            echo "ERROR: $toml has [rotation_search] but checkpoint_dir $ckpt is missing." >&2
+            echo "       Run row 05 (gptq+erryclip) first." >&2
+            exit 1
+        fi
     fi
 done
 

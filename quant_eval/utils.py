@@ -155,8 +155,9 @@ def print_all_layers(model: nn.Module):
 
 
 def create_experiment_log_dir(base_dir: str = "logs") -> Path:
-    root_dir = Path(__file__).resolve().parent
-    log_root = root_dir / base_dir
+    # Relative paths are interpreted from CWD (matching shell convention),
+    # so callers and surrounding bash tee logs land in the same tree.
+    log_root = Path(base_dir)
     timestamp = datetime.now(ZoneInfo("Europe/London")).strftime("%Y%m%d-%H%M%S")
     log_dir = log_root / f"run-{timestamp}"
     log_dir.mkdir(parents=True, exist_ok=True)

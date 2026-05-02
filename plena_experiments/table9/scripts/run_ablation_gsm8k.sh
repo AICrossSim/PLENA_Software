@@ -4,15 +4,16 @@
 # CONFIGS is REQUIRED — pass a CSV of TOML paths. No glob, no basenames:
 # you give the script the exact files to run.
 #
-# Stage 1 (auto): if any config uses `dataset = "file:..."` and the file
-# isn't on disk, run $CALIB_CONFIG first to collect task-aligned tokens.
-# Stage 2: run each config in order.
+# Pre-flight (no auto-collect): each selected TOML's `file:...` calib refs
+# must already be on disk, and any TOML with [rotation_search] must point
+# at an existing `gptq.checkpoint_dir`. See plena_experiments/table9/README.md
+# for the calibrate (Step 0) and row-05 prerequisites.
 #
-# Examples:
-#   CONFIGS=quant_eval/configs/ablation/gsm8k_plena-qwen3-ablation/04_w4_act4_kv4_gptq.toml \
-#       bash quant_eval/scripts/run_ablation_gsm8k.sh
+# Examples (run from repo root):
+#   CONFIGS=plena_experiments/table9/configs/gsm8k/04_w4_act4_kv4_gptq.toml \
+#       bash plena_experiments/table9/scripts/run_ablation_gsm8k.sh
 #
-#   CONFIGS=path/a.toml,path/b.toml bash quant_eval/scripts/run_ablation_gsm8k.sh
+#   CONFIGS=path/a.toml,path/b.toml bash plena_experiments/table9/scripts/run_ablation_gsm8k.sh
 
 set -eu
 
@@ -22,16 +23,14 @@ TASKS=${TASKS:-gsm8k}
 LIMIT=${LIMIT:-1319}
 SEQLEN=${SEQLEN:-4096}
 BATCH_SIZE=${BATCH_SIZE:-32}
-CALIB_CONFIG=${CALIB_CONFIG:-quant_eval/configs/calibrate/qwen3_8b_gsm8k.toml}
-CALIB_LIMIT=${CALIB_LIMIT:-200}
-LOG_DIR=${LOG_DIR:-logs/ablation_$(date +%Y%m%d_%H%M%S)}
+LOG_DIR=${LOG_DIR:-logs/ablation_${TASKS}_$(date +%Y%m%d_%H%M%S)}
 
 DEFAULT_PY=$([[ -x .venv/bin/python ]] && echo .venv/bin/python || echo python)
 PY=${PY:-$DEFAULT_PY}
 
 if [[ -z "${CONFIGS:-}" ]]; then
     echo "ERROR: CONFIGS env var is required (CSV of TOML paths)." >&2
-    echo "  Example: CONFIGS=quant_eval/configs/ablation/gsm8k_plena-qwen3-ablation/04_w4_act4_kv4_gptq.toml \\" >&2
+    echo "  Example: CONFIGS=plena_experiments/table9/configs/gsm8k/04_w4_act4_kv4_gptq.toml \\" >&2
     echo "             bash $0" >&2
     exit 1
 fi
@@ -44,32 +43,31 @@ for toml in "${selected_tomls[@]}"; do
     fi
 done
 
-mkdir -p "$LOG_DIR"
+# Pre-flight: required calib files / row-05 checkpoints must exist.
+for toml in "${selected_tomls[@]}"; do
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        if [[ ! -f "$f" ]]; then
+            echo "ERROR: $toml needs calib file $f, but it's missing." >&2
+            echo "       Run the calibrate Step 0 from plena_experiments/table9/README.md first." >&2
+            exit 1
+        fi
+    done < <(grep -hE '^[[:space:]]*(dataset|calib_data)[[:space:]]*=[[:space:]]*"file:' "$toml" \
+              | sed 's/.*"file:\([^"]*\)".*/\1/' | sort -u)
 
-# Stage 1 — collect calibration if any selected TOML references "file:..." that isn't on disk.
-calib_paths=$(
-    grep -h '^dataset *= *"file:' "${selected_tomls[@]}" 2>/dev/null \
-        | sed 's/.*"file:\([^"]*\)".*/\1/' \
-        | sort -u
-)
-need_calib=0
-for calib in $calib_paths; do
-    [[ -f "$calib" ]] || need_calib=1
+    if grep -qE '^\[rotation_search\]' "$toml"; then
+        ckpt=$(grep -E '^[[:space:]]*checkpoint_dir[[:space:]]*=' "$toml" \
+               | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+        if [[ -n "$ckpt" && ! -d "$ckpt" ]]; then
+            echo "ERROR: $toml has [rotation_search] but checkpoint_dir $ckpt is missing." >&2
+            echo "       Run row 05 (gptq+erryclip) first." >&2
+            exit 1
+        fi
+    fi
 done
 
-if [[ "$need_calib" == "1" ]]; then
-    echo ">>> collecting calibration via $CALIB_CONFIG (hook aborts when full)"
-    $PY -m quant_eval.cli.eval_lm \
-        --model_name   "$MODEL" \
-        --device_id    "$DEVICE" \
-        --tasks        "$TASKS" \
-        --quant_config "$CALIB_CONFIG" \
-        --limit        $CALIB_LIMIT \
-        --log_dir      "$LOG_DIR/_calibrate" \
-        2>&1 | tee "$LOG_DIR/calib.log"
-fi
+mkdir -p "$LOG_DIR"
 
-# Stage 2 — sweep selected TOMLs sequentially.
 echo "Sweep:"
 for t in "${selected_tomls[@]}"; do echo "  - $t"; done
 

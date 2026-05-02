@@ -27,6 +27,5 @@ uv pip install -e ./fast-hadamard-transform --no-build-isolation
 ## 4. Install evaluation backends
 
 ```bash
-uv pip install lm-eval
-uv pip install evalplus
+uv pip install lm-eval evalplus jsonargparse accelerate colorlog tqdm
 ```

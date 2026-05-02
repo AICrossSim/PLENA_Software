@@ -20,13 +20,13 @@ set -eu
 
 MODEL=${MODEL:-Qwen/Qwen3-8B}
 DEVICE=${DEVICE:-cuda:0}
-BASE_CONFIG=${BASE_CONFIG:-quant_eval/configs/ablation/gsm8k_plena-qwen3-ablation/05_w4_act4_kv4_gptq_erryclip.toml}
+BASE_CONFIG=${BASE_CONFIG:-plena_experiments/table9/configs/gsm8k/05_w4_act4_kv4_gptq_erryclip.toml}
 CALIB_DATA=${CALIB_DATA:-file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt}
 CALIB_NSAMPLES=${CALIB_NSAMPLES:-32}
 CALIB_SEQLEN=${CALIB_SEQLEN:-1024}
 IMPROVEMENT_EPS=${IMPROVEMENT_EPS:-0.0}
 MATMUL_TYPES=${MATMUL_TYPES:-}            # empty = all 9 (10 with kv_cache)
-CALIB_CONFIG=${CALIB_CONFIG:-quant_eval/configs/calibrate/qwen3_8b_gsm8k.toml}
+CALIB_CONFIG=${CALIB_CONFIG:-plena_experiments/table9/configs/calibrate/qwen3_8b_gsm8k.toml}
 CALIB_LIMIT=${CALIB_LIMIT:-200}
 LOG_DIR=${LOG_DIR:-logs/rotation_search_$(date +%Y%m%d_%H%M%S)}
 

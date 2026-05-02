@@ -1,4 +1,5 @@
-# Calibration-only TOML for the humaneval_plena-qwen3-ablation sweep.
+# Calibration-only TOML for the humaneval ablation sweep
+# (plena_experiments/table9/configs/humaneval).
 # TokenCollector captures input_ids during real evalplus forwards on
 # humaneval, then aborts once 32 prefill samples of length 512 are
 # collected. nsamples=32, seqlen=512 → 16k tokens needed; humaneval has
