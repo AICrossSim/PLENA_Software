@@ -1,0 +1,3 @@
+# Row 1 — FP16 baseline. No quantization, no GPTQ. eval_lm.py sees no quant
+# blocks and skips the whole transform pipeline.
+by = "regex_name"

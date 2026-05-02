@@ -34,9 +34,12 @@ def load_quant_config(path: str | Path) -> dict:
     by = raw.pop("by", "regex_name")
     pass_args = {"by": by}
 
-    gptq = raw.pop("gptq", None)
-    if gptq is not None:
-        pass_args["gptq"] = deepcopy(gptq)
+    # Top-level utility blocks pass through verbatim (NOT wrapped in
+    # {"config": ...}); regex/name/type selectors do get wrapped below.
+    for util_key in ("gptq", "token_collector", "rotation_search"):
+        block = raw.pop(util_key, None)
+        if block is not None:
+            pass_args[util_key] = deepcopy(block)
 
     for key, value in raw.items():
         pass_args[key] = {"config": deepcopy(value)}

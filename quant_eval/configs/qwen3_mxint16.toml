@@ -1,0 +1,47 @@
+# Qwen mixed precision: MXInt8 attention, MXInt4 MLP
+#
+# Attention layers use higher precision (8-bit) since they are
+# more sensitive to quantization noise (KV cache quality).
+# MLP layers use lower precision (4-bit) for efficiency.
+
+by = "regex_name"
+
+# --- Attention module itself (for Q@K^T, softmax, attn@V quantization) ---
+# NOTE: sub-tables use single brackets [x.y], NOT double brackets [[x.y]].
+# Double brackets = array-of-tables, which breaks Qwen3AttentionMXInt.__init__.
+["model\\.layers\\.\\d+\\.self_attn$"]
+name = "mxint"
+
+["model\\.layers\\.\\d+\\.self_attn$".qk_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".av_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".kv_cache]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".softmax]
+bypass = true
+
+["model\\.layers\\.\\d+\\.self_attn$".rope]
+bypass = true
+
+# --- Attention projections (MXInt8) ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 16
+data_in_block_size = 32
+data_in_width = 16
+
+# --- MLP projections (MXInt4) ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 16
+data_in_block_size = 32
+data_in_width = 16

@@ -1,0 +1,37 @@
+# Qwen3-MoE MXInt4: attention + expert MLP projections
+#
+# Qwen3-MoE uses individual nn.Linear per expert (not batched 3D tensors).
+# Expert gate/up/down_proj are quantized as regular linear layers.
+#
+# What this quantizes:
+#   - Attention q/k/v/o_proj → LinearMXInt4
+#   - Expert MLP gate/up/down_proj → LinearMXInt4
+#   - Shared MLP gate/up/down_proj → LinearMXInt4
+
+by = "regex_name"
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 4
+data_in_block_size = 32
+data_in_width = 4
+bias_block_size = 32
+bias_width = 4
+
+# --- MoE expert MLP projections (each expert has separate Linear layers) ---
+["model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 4
+data_in_block_size = 32
+data_in_width = 4
+
+# --- Shared expert MLP projections ---
+["model\\.layers\\.\\d+\\.mlp\\.shared_expert\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 4
+data_in_block_size = 32
+data_in_width = 4

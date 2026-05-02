@@ -1,0 +1,53 @@
+# Qwen3 MXInt with online Hadamard rotation at the activation quantizers.
+#
+# Same precision profile as qwen3_mxint16.toml, but every quantize step on
+# the activation side runs through `mxint_rotate_quantizer` (H @ x ->
+# mxint_quant -> H.T @ x). Trigger by setting `name = "mxint_rotate"` instead
+# of `"mxint"` -- the module-level pass dispatches to the *Rotate variants in
+# `quantized_module_map` (Qwen3AttentionMXIntRotate, RotateMXIntLinear, ...).
+#
+# Requires fast-hadamard-transform installed at runtime.
+
+by = "regex_name"
+
+# --- Attention module: Q@K^T, attn@V, KV-cache all rotate ---
+# (softmax / rope are not rotated; their bypass flags are unchanged.)
+["model\\.layers\\.\\d+\\.self_attn$"]
+name = "mxint_rotate"
+
+["model\\.layers\\.\\d+\\.self_attn$".qk_matmul]
+data_in_block_size = 32
+data_in_width = 8
+# force_fp32_had = true   # uncomment to do the Hadamard mat-muls in fp32
+
+["model\\.layers\\.\\d+\\.self_attn$".av_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".kv_cache]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".softmax]
+bypass = true
+
+["model\\.layers\\.\\d+\\.self_attn$".rope]
+bypass = true
+
+# --- Attention projections (MXInt with online rotate at activation side) ---
+# Pair with the offline rotate pass (apply_exact_had_to_linear) on o_proj /
+# down_proj if you want the rotation to cancel mathematically end-to-end.
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint_rotate"
+weight_block_size = 32
+weight_width = 16
+data_in_block_size = 32
+data_in_width = 16
+
+# --- MLP projections (MXInt with online rotate at activation side) ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint_rotate"
+weight_block_size = 32
+weight_width = 16
+data_in_block_size = 32
+data_in_width = 16

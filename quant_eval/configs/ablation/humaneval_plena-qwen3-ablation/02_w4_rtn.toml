@@ -1,0 +1,18 @@
+# Row 2 — W-only INT4 (RTN). Weights → MXInt4, activations stay 16-bit so
+# the LinearMXInt forward is effectively weight-only. No GPTQ → standard
+# round-to-nearest. No attention-module quantization.
+by = "regex_name"
+
+['model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj']
+name = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 16
+
+['model\.layers\.\d+\.mlp\.(gate|up|down)_proj']
+name = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 16

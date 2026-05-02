@@ -1,0 +1,46 @@
+by = "regex_name"
+
+["model\\.layers\\.\\d+\\.self_attn$"]
+name = "mxint"
+data_in_width = 16
+data_in_block_size = 32
+weight_width = 16
+weight_block_size = 32
+
+["model\\.layers\\.\\d+\\.self_attn$".qk_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".av_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".kv_cache]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".softmax]
+bypass = true
+
+["model\\.layers\\.\\d+\\.self_attn$".rope]
+bypass = true
+
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8
+bias_block_size = 32
+bias_width = 8
+
+
+# --- Dense MLP projections ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8

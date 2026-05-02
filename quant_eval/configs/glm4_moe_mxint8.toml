@@ -1,0 +1,70 @@
+# GLM-4 MoE MXInt8: attention + expert MLP projections
+#
+# GLM-4 MoE uses individual nn.Linear per expert (not batched 3D tensors).
+# Expert gate/up/down_proj are quantized as regular linear layers.
+#
+# What this quantizes:
+#   - Attention q/k/v/o_proj → LinearMXInt8
+#   - Dense MLP gate/up/down_proj (first_k_dense_replace layers) → LinearMXInt8
+#   - Expert MLP gate/up/down_proj → LinearMXInt8
+#   - Shared expert MLP gate/up/down_proj → LinearMXInt8
+
+by = "regex_name"
+# --- Attention module itself (for Q@K^T, softmax, attn@V quantization) ---
+# NOTE: sub-tables use single brackets [x.y], NOT double brackets [[x.y]].
+# Double brackets = array-of-tables, which breaks Glm4MoeAttentionMXInt.__init__.
+["model\\.layers\\.\\d+\\.self_attn$"]
+name = "mxint"
+
+["model\\.layers\\.\\d+\\.self_attn$".qk_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".av_matmul]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".kv_cache]
+data_in_block_size = 32
+data_in_width = 8
+
+["model\\.layers\\.\\d+\\.self_attn$".softmax]
+bypass = true
+
+
+["model\\.layers\\.\\d+\\.self_attn$".rope]
+bypass = true
+
+# --- Attention projections ---
+["model\\.layers\\.\\d+\\.self_attn\\.(q|k|v|o)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8
+bias_block_size = 32
+bias_width = 8
+
+# --- Dense MLP projections (first_k_dense_replace layers, usually 0..2) ---
+["model\\.layers\\.\\d+\\.mlp\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8
+
+# --- MoE expert MLP projections (each expert has separate Linear layers) ---
+["model\\.layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8
+
+# --- Shared expert MLP projections (GLM uses shared_experts, plural) ---
+["model\\.layers\\.\\d+\\.mlp\\.shared_experts\\.(gate|up|down)_proj"]
+name = "mxint"
+weight_block_size = 32
+weight_width = 8
+data_in_block_size = 32
+data_in_width = 8

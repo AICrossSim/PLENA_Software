@@ -1,0 +1,73 @@
+# Row 6 — Same as 05 + automatic per-matmul rotation search.
+#
+# What's new vs row 05: a [rotation_search] block. On first run it greedy-
+# forward-searches the 10 matmul types using gsm8k calib perplexity, then
+# leaves the model with the winning subset of online Hadamard rotations
+# enabled. Decisions cache to <gptq.checkpoint_dir>/rotation_decisions.json
+# (mirrors GPTQ's auto-resume); subsequent runs skip the search entirely
+# and just apply the saved winners. Delete that file to force a re-search.
+#
+# Same task-aligned calibration as row 04/05; same checkpoint conventions.
+by = "regex_name"
+
+[gptq]
+model_name        = "Qwen/Qwen3-8B"
+dataset           = "file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt"
+nsamples          = 64
+seqlen            = 1024
+format            = "mxint"
+quantile_search   = true
+clip_search_y     = true
+cali_batch_size   = 32
+checkpoint_dir    = "/data/models/cx922/plena_camera/gsm8k_05_w4_act4_kv4_gptq_erryclip"
+
+[gptq.weight_config]
+weight_block_size = 16
+weight_width      = 4
+
+[rotation_search]
+# calib_data defaults to [gptq].dataset; uncomment to override.
+# calib_data       = "file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt"
+calib_nsamples    = 32
+calib_seqlen      = 1024
+improvement_eps   = 0.0       # require strict ppl drop to commit
+# cache_path defaults to <gptq.checkpoint_dir>/rotation_decisions.json
+# matmul_types    = ["q_proj", "k_proj", "v_proj", "o_proj", "qk_matmul",
+#                    "av_matmul", "kv_cache", "up_proj", "gate_proj", "down_proj"]
+
+# Attention block — keep as "mxint"; the search auto-promotes to
+# "mxint_rotate" with all 3 stage flags off, then flips winners on.
+['model\.layers\.\d+\.self_attn$']
+name = "mxint"
+
+['model\.layers\.\d+\.self_attn$'.qk_matmul]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.av_matmul]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.kv_cache]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.softmax]
+bypass = true
+
+['model\.layers\.\d+\.self_attn$'.rope]
+bypass = true
+
+['model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj']
+name = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.mlp\.(gate|up|down)_proj']
+name = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
