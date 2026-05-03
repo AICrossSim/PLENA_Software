@@ -1,9 +1,25 @@
-# Row 3 — W-only INT4 + ACT & KV INT4 (still RTN). Adds activation
-# quantization on every linear (data_in_width = 4) plus attention-module
-# quantization (qk_matmul / av_matmul / kv_cache all at INT4). Still no GPTQ.
+# Row 5 — Same as 04 + Erry Clip (output-aware quantile search).
+# clip_search_y = true makes mxint quantizer pick the per-block percentile
+# that minimizes ||X · W_q - X · W||_2 instead of just ||W_q - W||_2,
+# trading ~30-50% extra GPTQ time for better low-bit accuracy.
+# Same task-aligned calibration as row 4.
 by = "regex_name"
 
-# Attention module: Q@K^T, attn@V, KV-cache all at INT4.
+[gptq]
+model_name        = "Qwen/Qwen3-32B"
+dataset           = "file:calib/Qwen_Qwen3-32B_gsm8k_n64_s1024.pt"
+nsamples          = 64
+seqlen            = 1024
+format            = "mxint"
+quantile_search   = true
+clip_search_y     = true       # ← the only diff from 04
+cali_batch_size   = 32
+checkpoint_dir    = "/data/models/cx922/plena_camera/gemm7/gsm8k_qwen3_32b_05_w4_act4_kv4_gptq_erryclip"
+
+[gptq.weight_config]
+weight_block_size = 16
+weight_width      = 4
+
 ['model\.layers\.\d+\.self_attn$']
 name = "mxint"
 
@@ -27,7 +43,6 @@ bypass = true
 ['model\.layers\.\d+\.self_attn$'.rope]
 bypass = true
 
-# Attention projections — INT4 weights AND activations.
 ['model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj']
 name = "mxint"
 weight_block_size  = 16
@@ -35,7 +50,6 @@ weight_width       = 4
 data_in_block_size = 16
 data_in_width      = 4
 
-# MLP projections — INT4 weights AND activations.
 ['model\.layers\.\d+\.mlp\.(gate|up|down)_proj']
 name = "mxint"
 weight_block_size  = 16

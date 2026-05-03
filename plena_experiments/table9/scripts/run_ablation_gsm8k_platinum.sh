@@ -23,6 +23,10 @@ TASKS=${TASKS:-gsm8k_platinum}
 LIMIT=${LIMIT:-1209}
 SEQLEN=${SEQLEN:-4096}
 BATCH_SIZE=${BATCH_SIZE:-32}
+NUM_FEWSHOT=${NUM_FEWSHOT:-4}
+APPLY_CHAT_TEMPLATE=${APPLY_CHAT_TEMPLATE:-true}
+FEWSHOT_AS_MULTITURN=${FEWSHOT_AS_MULTITURN:-true}
+GEN_KWARGS=${GEN_KWARGS:-max_gen_toks=2048}
 LOG_DIR=${LOG_DIR:-logs/ablation_${TASKS}_$(date +%Y%m%d_%H%M%S)}
 
 DEFAULT_PY=$([[ -x .venv/bin/python ]] && echo .venv/bin/python || echo python)
@@ -75,14 +79,18 @@ for toml in "${selected_tomls[@]}"; do
     tag=$(basename "$toml" .toml)
     echo ">>> $tag"
     $PY -m quant_eval.cli.eval_lm \
-        --model_name   "$MODEL" \
-        --tasks        "$TASKS" \
-        --device_id    "$DEVICE" \
-        --quant_config "$toml" \
-        --seqlen       $SEQLEN \
-        --batch_size   $BATCH_SIZE \
-        --limit        $LIMIT \
-        --log_dir      "$LOG_DIR/$tag" \
+        --model_name           "$MODEL" \
+        --tasks                "$TASKS" \
+        --device_id            "$DEVICE" \
+        --quant_config         "$toml" \
+        --seqlen               $SEQLEN \
+        --batch_size           $BATCH_SIZE \
+        --limit                $LIMIT \
+        --log_dir              "$LOG_DIR/$tag" \
+        --num_fewshot          $NUM_FEWSHOT \
+        --apply_chat_template  $APPLY_CHAT_TEMPLATE \
+        --fewshot_as_multiturn $FEWSHOT_AS_MULTITURN \
+        --gen_kwargs           "$GEN_KWARGS" \
         2>&1 | tee "$LOG_DIR/$tag.log" || echo "FAIL: $tag"
 done
 

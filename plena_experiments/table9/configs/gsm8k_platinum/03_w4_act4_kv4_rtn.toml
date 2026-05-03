@@ -8,10 +8,12 @@ by = "regex_name"
 name = "mxint"
 
 ['model\.layers\.\d+\.self_attn$'.qk_matmul]
+bypass             = true
 data_in_block_size = 16
 data_in_width      = 4
 
 ['model\.layers\.\d+\.self_attn$'.av_matmul]
+bypass             = true
 data_in_block_size = 16
 data_in_width      = 4
 

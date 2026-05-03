@@ -1,7 +1,7 @@
 # Row 6 — Same as 05 + automatic per-matmul rotation search.
 #
 # What's new vs row 05: a [rotation_search] block. On first run it greedy-
-# forward-searches the 10 matmul types using gsm8k calib perplexity, then
+# forward-searches the 10 matmul types using bfcl calib perplexity, then
 # leaves the model with the winning subset of online Hadamard rotations
 # enabled. Decisions cache to <gptq.checkpoint_dir>/rotation_decisions.json
 # (mirrors GPTQ's auto-resume); subsequent runs skip the search entirely
@@ -11,15 +11,15 @@
 by = "regex_name"
 
 [gptq]
-model_name        = "Qwen/Qwen3-8B"
-dataset           = "file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt"
-nsamples          = 64
-seqlen            = 1024
+model_name        = "Qwen/Qwen3-32B"
+dataset           = "file:calib/Qwen_Qwen3-32B_bfcl_n32_s2048.pt"
+nsamples          = 32
+seqlen            = 2048
 format            = "mxint"
 quantile_search   = true
 clip_search_y     = true
 cali_batch_size   = 32
-checkpoint_dir    = "/data/models/cx922/plena_camera/gemm7/gsm8k_05_w4_act4_kv4_gptq_erryclip"
+checkpoint_dir    = "/data/models/cx922/plena_camera/gemm7/bfcl_qwen3_32b_05_w4_act4_kv4_gptq_erryclip"
 
 [gptq.weight_config]
 weight_block_size = 16
@@ -27,9 +27,9 @@ weight_width      = 4
 
 [rotation_search]
 # calib_data defaults to [gptq].dataset; uncomment to override.
-# calib_data       = "file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt"
+# calib_data       = "file:calib/Qwen_Qwen3-32B_bfcl_n32_s2048.pt"
 calib_nsamples    = 32
-calib_seqlen      = 1024
+calib_seqlen      = 2048
 improvement_eps   = 0.0       # require strict ppl drop to commit
 # cache_path defaults to <gptq.checkpoint_dir>/rotation_decisions.json
 matmul_types     = ["q_proj", "k_proj", "v_proj", "o_proj",

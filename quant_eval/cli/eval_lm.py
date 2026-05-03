@@ -48,6 +48,10 @@ def main(
     batch_size: Union[int, str] = 64,
     limit: Union[int, float, None] = None,
     log_dir: Union[str, None] = None,
+    num_fewshot: Union[int, None] = None,
+    apply_chat_template: bool = False,
+    fewshot_as_multiturn: bool = False,
+    gen_kwargs: Union[str, None] = None,
 ):
     """
     Run lm-eval against an MX-quantized HF model with a single fixed
@@ -178,6 +182,10 @@ def main(
             batch_size=batch_size,
             log_samples=False,
             limit=limit,
+            num_fewshot=num_fewshot,
+            apply_chat_template=apply_chat_template,
+            fewshot_as_multiturn=fewshot_as_multiturn,
+            gen_kwargs=gen_kwargs,
         )
     except CollectorFull as e:
         logger.info("[calibration mode] aborted lm-eval as planned: %s", e)

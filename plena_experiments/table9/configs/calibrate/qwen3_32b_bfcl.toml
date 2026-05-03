@@ -1,0 +1,15 @@
+# Calibration-only TOML for the bfcl ablation sweep
+# (plena_experiments/table9/configs/bfcl).
+# TokenCollector captures input_ids during real bfcl generate forwards on
+# the web-search categories, then aborts once 32 prefill samples of length
+# 2048 are collected. Larger seqlen than gsm8k/humaneval because BFCL
+# prompts inline tool schemas and search snippets, which routinely push
+# past 1k tokens.
+
+[token_collector]
+target_nsamples    = 32
+seqlen             = 2048
+save_path          = "calib/Qwen_Qwen3-32B_bfcl_n32_s2048.pt"
+overwrite          = false
+min_prefill_tokens = 8
+raise_on_full      = true

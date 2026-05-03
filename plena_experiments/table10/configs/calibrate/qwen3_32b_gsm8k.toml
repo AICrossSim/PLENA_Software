@@ -1,0 +1,14 @@
+# Calibration-only TOML for the gsm8k ablation sweep
+# (plena_experiments/table10/configs/gsm8k).
+# Attaches a TokenCollector hook that captures input_ids during a real
+# lm-eval pass on gsm8k, then aborts once 64 prefill samples of length
+# 1024 are collected. The output file is referenced by 04/05 ablation
+# TOMLs via `dataset = "file:<path>"`.
+
+[token_collector]
+target_nsamples    = 64
+seqlen             = 1024
+save_path          = "calib/Qwen_Qwen3-32B_gsm8k_n64_s1024.pt"
+overwrite          = false
+min_prefill_tokens = 8
+raise_on_full      = true
