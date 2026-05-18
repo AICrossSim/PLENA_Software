@@ -81,9 +81,12 @@ def main(
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map.get(dtype, torch.bfloat16)
 
+    attn_impl = "eager" if quant_config else "sdpa"
+
     tokenizer, model = setup_model(
         model_name, model_parallel, dtype=torch_dtype,
         device=device_id if not model_parallel else None,
+        attn_implementation=attn_impl,
     )
     model.eval()
 
@@ -93,6 +96,8 @@ def main(
         pass_args = load_quant_config(quant_config)
         if "gptq" in pass_args:
             pass_args["gptq"]["device"] = device_id
+        if "rotation_search" in pass_args:
+            pass_args["rotation_search"]["device"] = device_id
 
         n_linear = sum(1 for _, m in model.named_modules() if isinstance(m, torch.nn.Linear))
         logger.info("Quantizing %d linear layers...", n_linear)
