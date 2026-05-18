@@ -1,0 +1,48 @@
+# Table 5 — LLaMA-2-13B, W/A/KV = 4/4/16 — MXInt with GPTQ + y-clip + selective rotation
+# w4a16kv16 checkpoint for this model still running; uses its own checkpoint dir.
+
+by = "regex_name"
+
+[gptq]
+model_name      = "meta-llama/Llama-2-13b-hf"
+dataset         = "wikitext2"
+nsamples        = 128
+seqlen          = 2048
+format          = "mxint"
+quantile_search = true
+clip_search_y   = true
+cali_batch_size = 32
+checkpoint_dir  = "checkpoints/table5/llama2_13b_mxint_w4a16kv16"
+
+[gptq.weight_config]
+weight_block_size = 16
+weight_width      = 4
+
+[rotation_search]
+calib_nsamples  = 128
+calib_seqlen    = 2048
+improvement_eps = 0.0
+matmul_types    = ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "gate_proj", "down_proj"]
+cache_path      = "checkpoints/table5/llama2_13b_mxint_w4a4kv16/rotation_decisions.json"
+
+# Stock attention used (W4A4KV16: KV stays fp16, qk/av stay fp16).
+# Linear projections (q/k/v/o/up/gate/down_proj) below are still wrapped
+# by LinearMXInt. The attention CLASS itself stays as stock
+# LlamaAttention — numerically identical to LlamaAttentionMXInt with all
+# stage flags bypassed.
+
+['model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj']
+name               = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
+gptq               = true
+
+['model\.layers\.\d+\.mlp\.(gate|up|down)_proj']
+name               = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
+gptq               = true
