@@ -12,7 +12,7 @@ dependencies = [
     "colorlog",
     "tqdm",
     "jsonargparse",
-    "mase",
+    "mase[mx-ptq]",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +20,23 @@ docs = [
     "mkdocs>=1.6",
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.25",
+    "mkdocs-jupyter>=0.25",
+]
+evalplus = [
+    "evalplus",
+    "stop-sequencer",
+]
+serve = [
+    "fastapi",
+    "uvicorn",
+]
+bfcl = [
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "beautifulsoup4",
+    "markdownify",
+    "ddgs",
 ]
 
 [[tool.uv.index]]
@@ -31,6 +48,9 @@ explicit = true
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
 mase = { git = "https://github.com/DeepWok/mase.git", branch = "releases/plena-experiments" }
+
+[tool.uv]
+no-build-isolation-package = ["fast-hadamard-transform"]
 
 [build-system]
 requires = ["hatchling"]
