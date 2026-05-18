@@ -1,0 +1,58 @@
+# Table 6 — MXINT Full System — GPTQ + Err_y Clip (no rotation)
+# Everything quantized: weights of 7 linears (GPTQ + Err_y clip) + activations of
+# all 9 GEMMs + KV cache (RTN on the activation side).
+# Expected PPL on Llama-3-8B (wikitext): 7.60
+
+by = "regex_name"
+
+[gptq]
+model_name      = "meta-llama/Meta-Llama-3-8B"
+dataset         = "wikitext2"
+nsamples        = 128
+seqlen          = 2048
+format          = "mxint"
+quantile_search = true
+clip_search_y   = true
+cali_batch_size = 32
+checkpoint_dir  = "checkpoints/table5/llama3_8b_mxint_w4a16kv16"
+
+[gptq.weight_config]
+weight_block_size = 16
+weight_width      = 4
+
+['model\.layers\.\d+\.self_attn$']
+name = "mxint"
+
+['model\.layers\.\d+\.self_attn$'.qk_matmul]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.av_matmul]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.kv_cache]
+data_in_block_size = 16
+data_in_width      = 4
+
+['model\.layers\.\d+\.self_attn$'.softmax]
+bypass = true
+
+['model\.layers\.\d+\.self_attn$'.rope]
+bypass = true
+
+['model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj']
+name               = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
+gptq               = true
+
+['model\.layers\.\d+\.mlp\.(gate|up|down)_proj']
+name               = "mxint"
+weight_block_size  = 16
+weight_width       = 4
+data_in_block_size = 16
+data_in_width      = 4
+gptq               = true
