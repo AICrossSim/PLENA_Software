@@ -8,6 +8,7 @@ logs/
 *.log
 checkpoints/
 site/
+.cache/
 **mase/
 **fast-hadamard-transform/
 **calib/

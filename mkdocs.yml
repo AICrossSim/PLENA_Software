@@ -1,6 +1,9 @@
 site_name: PLENA Software — Quantization Evaluation Toolkit
 site_description: Evaluate MX-quantized LLMs with perplexity and lm-eval harness benchmarks.
-repo_url: ""
+site_url: https://aicrosssim.github.io/PLENA_Software/
+repo_url: https://github.com/AICrossSim/PLENA_Software
+repo_name: AICrossSim/PLENA_Software
+edit_uri: edit/main/docs/
 
 theme:
   name: material
@@ -18,10 +21,15 @@ theme:
         icon: material/brightness-4
         name: Switch to light mode
   features:
-    - navigation.sections
-    - navigation.expand
+    - navigation.top
+    - navigation.tracking
+    - navigation.instant
+    - toc.follow
     - content.code.copy
+    - content.code.annotate
+    - content.action.edit
     - search.highlight
+    - search.suggest
 
 markdown_extensions:
   - admonition
@@ -47,6 +55,12 @@ plugins:
             show_source: true
             show_root_heading: true
             heading_level: 3
+            # Use static (griffe) analysis only — CI doesn't need torch/mase
+            # imported to render docstrings; just parse the source files.
+            allow_inspection: false
 
 nav:
-  - TOML Reference: configuration/toml-reference.md
+  - Welcome: index.md
+  - Get started: getting-started.md
+  - Evaluation commands: reference/cli.md
+  - Quantization configs: reference/toml-reference.md
