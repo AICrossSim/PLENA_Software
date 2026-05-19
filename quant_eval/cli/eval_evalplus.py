@@ -1,20 +1,23 @@
 """
-Evalplus (HumanEval+/MBPP+) driver for an MX-quantized HuggingFace model.
+HumanEval+/MBPP+ code-generation evaluation with optional MX quantization.
 
-Mirrors ``eval_lm.py`` but routes the evaluation through
-``quant_eval.eval.evalplus.evaluate_with_evalplus`` instead of lm-eval-harness.
-Use this to score code-generation pass@1 under a single fixed-precision
-quantization profile.
+Routes through ``evalplus`` to score pass@1 (or pass@k) on the HumanEval+ or
+MBPP+ benchmarks under a single fixed-precision quantization profile. Use
+this when you want to check whether a quantization recipe still preserves
+the reasoning required for code generation.
+
+Requires the ``evalplus`` extra:
+
+    uv sync --extra evalplus
 
 Example:
-    python -m quant_eval.cli.eval_evalplus \\
-        --model_name Qwen/Qwen3-8B \\
-        --quant_config quant_eval/configs/qwen3_mxint16_rotate.toml \\
-        --dataset humaneval \\
-        --evalplus_output_dir logs/evalplus/qwen3_mxint16_rotate
 
-Requires ``evalplus`` and ``stop_sequencer`` to be installed
-(``uv pip install evalplus stop-sequencer``).
+    python -m quant_eval.cli.eval_evalplus \\
+        --model_name unsloth/Llama-3.2-1B \\
+        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --dataset humaneval \\
+        --greedy \\
+        --evalplus_output_dir logs/evalplus
 """
 
 from typing import Union
@@ -58,28 +61,35 @@ def main(
     log_dir: Union[str, None] = None,
 ):
     """
-    Run evalplus (HumanEval+/MBPP+) against an MX-quantized HF model with a
-    single fixed activation precision profile.
+    Run evalplus (HumanEval+ / MBPP+) on an optionally MX-quantized HF model.
 
     Args:
-        model_name:    HuggingFace model ID.
-        dataset:       "humaneval" or "mbpp".
-        device_id:     CUDA device string.
-        dtype:         Model dtype (float16 / bfloat16 / float32).
-        quant_config:  TOML config for module-level quantization. Set the
-                       per-pattern ``name`` to ``"mxint_rotate"`` to enable
-                       online Hadamard rotation. ``None`` = no quantization.
-        model_parallel: Use HF device_map="auto" pipeline parallel.
-        batch_size:    Generation batch size (samples per task per call).
-        greedy:        Greedy decoding (forces temperature=0, n_samples=1).
-        n_samples:     Samples per task (ignored if greedy=True).
-        max_new_tokens: Max tokens to generate per sample.
-        evalplus_output_dir: Where to dump generated jsonl + eval results.
-        overwrite:     Regenerate even if a previous jsonl exists.
-        base_only:     Only run base tests (skip plus tests).
-        parallel:      Workers for evalplus's code-execution stage.
-        version:       evalplus dataset version.
-        log_dir:       Directory for experiment logs and results.
+        model_name: HuggingFace model ID.
+        dataset: ``"humaneval"`` or ``"mbpp"``.
+        device_id: CUDA device string.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        quant_config: Path to a TOML quantization recipe. ``None`` runs the
+            unquantized baseline.
+        model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        batch_size: Generation batch size (samples per task per call).
+        greedy: Greedy decoding (forces ``temperature=0`` and ``n_samples=1``).
+        n_samples: Samples per task. Ignored when ``greedy=True``.
+        max_new_tokens: Maximum tokens generated per sample.
+        evalplus_output_dir: Directory where evalplus writes the generated
+            solutions JSONL and per-problem evaluation results.
+        overwrite: Regenerate solutions even if a previous JSONL exists.
+        base_only: Score against base tests only (skip the +/plus tests).
+        parallel: Worker count for evalplus's code-execution stage. ``None``
+            runs serially.
+        version: evalplus dataset version (e.g. ``"default"``).
+        log_dir: Directory for ``args.json`` and ``results.json``.
+
+    Returns:
+        evalplus results dict — pass@1 (and pass@k when applicable) plus
+        per-problem outcomes.
+
+    Raises:
+        ValueError: ``dataset`` is not ``"humaneval"`` or ``"mbpp"``.
     """
     if dataset not in ("humaneval", "mbpp"):
         raise ValueError(f"dataset must be 'humaneval' or 'mbpp', got {dataset!r}")

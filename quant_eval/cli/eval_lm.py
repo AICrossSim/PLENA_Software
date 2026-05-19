@@ -1,18 +1,16 @@
 """
-Plain lm-eval driver for an MX-quantized HuggingFace model.
+lm-eval-harness driver with optional MX quantization.
 
-Same shape as ``eval_phase_lm.py`` but **without** PhaseLayerAutoSwitch —
-activation precision is whatever the TOML quant config dictates and stays
-fixed for the whole run. Use this when you want to evaluate a single
-quantization profile (e.g. mxint_rotate) end-to-end without prefill/decode
-disaggregation.
+Applies a TOML quantization recipe once before evaluation; activation
+precision stays fixed for the whole run.
 
 Example:
+
     python -m quant_eval.cli.eval_lm \\
-        --model_name Qwen/Qwen3-8B \\
-        --quant_config quant_eval/configs/qwen3_mxint16_rotate.toml \\
-        --tasks wikitext \\
-        --seqlen 2048
+        --model_name unsloth/Llama-3.2-1B \\
+        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --tasks arc_easy,hellaswag,winogrande \\
+        --limit 500
 """
 
 from typing import Union
@@ -50,23 +48,27 @@ def main(
     log_dir: Union[str, None] = None,
 ):
     """
-    Run lm-eval against an MX-quantized HF model with a single fixed
-    activation precision profile (no phase-aware switching).
+    Run lm-eval-harness on an optionally MX-quantized HF model.
 
     Args:
-        model_name:    HuggingFace model ID.
-        tasks:         lm-eval task(s) to run (comma-separated string OK).
-        device_id:     CUDA device string.
-        dtype:         Model dtype (float16 / bfloat16 / float32).
-        quant_config:  TOML config for module-level quantization. Set the
-                       per-pattern ``name`` to ``"mxint_rotate"`` to enable
-                       online Hadamard rotation. ``None`` = no quantization.
-        model_parallel: Use HF device_map="auto" pipeline parallel.
-        seqlen:        Context window for lm-eval.
-        batch_size:    Eval batch size (int or "auto").
-        limit:         Cap samples per task (int absolute, float in (0,1)
-                       fraction, None = full dataset).
-        log_dir:       Directory for experiment logs and results.
+        model_name: HuggingFace model ID.
+        tasks: lm-eval task name(s) — comma-separated string or list
+            (e.g. ``"arc_easy,hellaswag"``).
+        device_id: CUDA device string.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        quant_config: Path to a TOML quantization recipe. ``None`` runs the
+            unquantized baseline.
+        model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        seqlen: Maximum context length passed to lm-eval.
+        batch_size: Eval batch size. Pass an int for a fixed size, or the
+            string ``"auto"`` for lm-eval's auto-batching.
+        limit: Cap samples per task. Int = absolute count; float in
+            ``(0, 1)`` = fraction of the full dataset; ``None`` = full.
+        log_dir: Directory for ``args.json`` and ``results.json``. ``None``
+            disables logging.
+
+    Returns:
+        lm-eval results dict — per-task metrics plus aggregate scores.
     """
     print("=" * 64)
     print("lm-eval — fixed activation precision (no phase switch)")

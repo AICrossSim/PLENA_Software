@@ -1,18 +1,23 @@
 """
-Run the calibration-aware per-matmul rotation search.
+Calibration-aware per-matmul Hadamard rotation search.
 
-Loads a base TOML quantization config (with all online Hadamard rotations
-OFF), runs ``rotation_search_transform_pass`` from MASE, and writes a JSON
-summary with the per-matmul-type perplexities, the greedy winners, and the
-final-combined perplexity.
+Loads a base TOML quantization config (with all online rotations off), runs
+``rotation_search_transform_pass`` from MASE, and writes a JSON summary
+listing the per-matmul-type perplexities, the greedy winners, and the
+final combined perplexity.
+
+This is a *calibration tool*, not an evaluation — its output
+(``rotation_decisions.json``) is consumed by subsequent ``eval_*`` runs whose
+configs include a ``[rotation_search]`` block.
 
 Example:
+
     python -m quant_eval.cli.search_rotation \\
-        --base_config plena_experiments/table9/configs/gsm8k/04_w4_act4_kv4_gptq.toml \\
-        --calib_data file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt \\
-        --calib_nsamples 32 \\
-        --calib_seqlen 1024 \\
-        --output_json /data/models/cx922/plena_camera/rotation_search_qwen3_8b.json
+        --model_name unsloth/Llama-3.2-1B \\
+        --base_config quant_eval/configs/llama_mxint4.toml \\
+        --calib_data wikitext2 \\
+        --calib_nsamples 128 \\
+        --output_json checkpoints/rotation_decisions.json
 """
 
 import time
@@ -48,26 +53,40 @@ def main(
     improvement_eps: float = 0.0,
     log_dir: Union[str, None] = None,
 ):
-    """Search per-matmul-type online Hadamard rotation by calibration ppl.
+    """
+    Greedy forward search for per-matmul online Hadamard rotations that
+    minimise calibration perplexity.
+
+    Each round tries enabling rotation on every remaining matmul type,
+    commits the one with the largest ppl drop above ``improvement_eps``,
+    and repeats until no candidate helps.
 
     Args:
-        model_name:        HuggingFace model ID (must match base_config).
-        base_config:       TOML quantize config; should set name = "mxint"
-                           everywhere (no rotation). The search adds rotation
-                           per matmul type and measures ppl.
-        calib_data:        Path/spec for calibration loader, e.g.
-                           ``"file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt"``
-                           or ``"wikitext2"``.
-        device_id:         CUDA device for forward passes.
-        dtype:             Model dtype.
-        calib_nsamples:    Number of calibration samples to score ppl on.
-        calib_seqlen:      Sequence length for the calib loader.
-        matmul_types:      Optional comma-separated subset, e.g.
-                           ``"q_proj,o_proj,qk_matmul"``. Default: all 9.
-        output_json:       Where to write the JSON results summary.
-        improvement_eps:   Only flag a matmul type as a winner if it beats
-                           baseline ppl by more than this margin.
-        log_dir:           Directory for experiment artefacts.
+        model_name: HuggingFace model ID — must match the model that
+            ``base_config`` targets.
+        base_config: TOML quantization recipe with all matmul rotations
+            currently off.
+        calib_data: Calibration data spec — a saved-token-batch path
+            (``"file:calib/foo.pt"``) or a dataset name (``"wikitext2"``,
+            ``"c4"``).
+        device_id: CUDA device for forward passes.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        calib_nsamples: Number of calibration samples used to score ppl.
+        calib_seqlen: Sequence length for the calibration loader.
+        matmul_types: Comma-separated subset of matmul types to search
+            (e.g. ``"q_proj,o_proj,qk_matmul"``). ``None`` searches all.
+        output_json: Path where the JSON summary is written.
+        improvement_eps: Minimum ppl drop required to commit a rotation
+            as a winner. ``0.0`` accepts any improvement.
+        log_dir: Directory for ``args.json`` and ``results.json``.
+
+    Returns:
+        Dict summarising the search. Core keys: ``baseline_ppl``,
+        ``final_ppl``, ``winners`` (matmul-type names in commit order),
+        ``rounds`` (per-round candidate-vs-ppl history), ``n_trials``,
+        ``per_type_swap_count``, ``improvement_eps``,
+        ``matmul_types_searched``. When the search resumes from an existing
+        ``output_json``, additionally ``from_cache: True``.
     """
     print("=" * 64)
     print("Calibration-aware per-matmul rotation search")

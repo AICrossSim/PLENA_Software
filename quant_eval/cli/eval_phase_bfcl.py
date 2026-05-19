@@ -1,52 +1,33 @@
 """
 BFCL web-search evaluation with phase- and layer-type-dependent MX quantization.
 
-Supports four independent activation precision settings:
+Serves an MX-quantized model through a lightweight OpenAI-compatible HTTP
+server (backed by HuggingFace ``generate``), then drives the standard BFCL
+CLI against it. Activation precision is set independently for each
+(phase, layer_type) pair via the prefill/decode × attn/FFN flags.
 
-    prefill × attn   prefill × ffn
-    decode  × attn   decode  × ffn
+BFCL is a two-step flow:
 
-Uses PhaseLayerAutoSwitch from phase_quant.py, which combines:
-  - a single lightweight top-level hook for prefill/decode detection
-  - per-submodule hooks that apply the right config to each attention
-    or FFN block immediately before its forward pass
+1. ``bfcl generate`` calls the local server to produce model responses.
+2. ``bfcl evaluate`` scores those responses (no model needed).
 
-The quantized model is served through a lightweight OpenAI-compatible HTTP
-server (backed by HuggingFace generate) so that the standard BFCL CLI can
-drive inference without any modifications to the harness.
+This script orchestrates both steps automatically and exposes the local
+server on ``server_host:server_port``.
 
-BFCL two-step flow
-──────────────────
-  1. bfcl generate  – calls the local server to produce model responses
-  2. bfcl evaluate  – scores responses (no model needed)
+Requires the ``bfcl`` extra and the ``bfcl-eval`` package:
 
-Both steps are orchestrated automatically by this script.
+    uv sync --extra bfcl
+    pip install bfcl-eval
 
-Prerequisites
-─────────────
-    pip install bfcl-eval fastapi uvicorn httpx
+Example:
 
-Usage:
-    python -m quant_eval.cli.eval_phase_bfcl --help
-
-Example — fully disaggregated, both web-search categories:
-    python -m quant_eval.cli.eval_phase_bfcl \\
-        --model_name Qwen/Qwen2.5-1.5B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
-        --prefill_attn_width 4 \\
-        --prefill_ffn_width  4 \\
-        --decode_attn_width  8 \\
-        --decode_ffn_width   6 \\
-        --bfcl_test_categories web_search_base web_search_no_snippet
-
-Example — single category, limit samples for a quick smoke-test:
     python -m quant_eval.cli.eval_phase_bfcl \\
         --model_name Qwen/Qwen2.5-1.5B \\
         --quant_config quant_eval/configs/llama_mxint4.toml \\
         --prefill_attn_width 4 --prefill_ffn_width 4 \\
         --decode_attn_width  8 --decode_ffn_width  8 \\
         --bfcl_test_categories web_search_base \\
-        --limit 20
+        --limit 50
 """
 
 from __future__ import annotations
@@ -642,37 +623,46 @@ def main(
     log_dir: Union[str, None] = None,
 ):
     """
-    Run BFCL web-search evaluation with independent MX activation precision
-    per (phase, layer_type) pair.
+    Run BFCL web-search evaluation with phase- and layer-type-dependent
+    activation precision.
 
-    The quantized model is served locally via a lightweight OpenAI-compatible
-    HTTP server so that the standard ``bfcl generate`` CLI can drive inference
-    without any modifications to the BFCL harness.
+    Spawns a local OpenAI-compatible HTTP server backed by HF ``generate``
+    so that the unmodified ``bfcl generate`` CLI can drive inference, then
+    runs ``bfcl evaluate`` to score responses.
 
     Args:
-        model_name:             HuggingFace model ID.
-        device_id:              CUDA device string.
-        dtype:                  Model dtype (float16 / bfloat16 / float32).
-        quant_config:           TOML config for weight quantization.
-        model_parallel:         Auto-dispatch across all visible GPUs.
-        bfcl_test_categories:   BFCL V4 test category names.  Defaults to
-                                ['web_search_base', 'web_search_no_snippet'].
-        bfcl_num_threads:       Parallel inference threads for bfcl generate.
-        server_host:            Host for the local OpenAI-compatible server.
-        server_port:            Port for the local OpenAI-compatible server.
-        prefill_attn_width:     Activation bit-width for attention during prefill.
-        prefill_ffn_width:      Activation bit-width for FFN during prefill.
+        model_name: HuggingFace model ID. For function-calling, must be an
+            instruction-tuned model with a function-call template
+            (e.g. ``Qwen/Qwen3-8B-FC``).
+        device_id: CUDA device string.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        quant_config: Path to a TOML quantization recipe.
+        model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        bfcl_test_categories: BFCL category names to evaluate (e.g.
+            ``["web_search_base", "web_search_no_snippet"]``). ``None`` uses
+            the default web-search category set.
+        bfcl_num_threads: Parallel inference threads for ``bfcl generate``.
+        server_host: Host for the local OpenAI-compatible server.
+        server_port: Port for the local OpenAI-compatible server.
+        prefill_attn_width: Activation bit-width for attention during prefill.
+        prefill_ffn_width: Activation bit-width for FFN during prefill.
         prefill_attn_block_size: MX block size for attention during prefill.
-        prefill_ffn_block_size:  MX block size for FFN during prefill.
-        decode_attn_width:      Activation bit-width for attention during decode.
-        decode_ffn_width:       Activation bit-width for FFN during decode.
-        decode_attn_block_size:  MX block size for attention during decode.
-        decode_ffn_block_size:   MX block size for FFN during decode.
-        attn_keywords:          Override default attention module name keywords.
-        ffn_keywords:           Override default FFN module name keywords.
-        limit:                  Cap the number of samples per category.
-                                None = full dataset.
-        log_dir:                Directory for experiment logs and results.
+        prefill_ffn_block_size: MX block size for FFN during prefill.
+        decode_attn_width: Activation bit-width for attention during decode.
+        decode_ffn_width: Activation bit-width for FFN during decode.
+        decode_attn_block_size: MX block size for attention during decode.
+        decode_ffn_block_size: MX block size for FFN during decode.
+        attn_keywords: Module-name substrings that identify attention blocks.
+            ``None`` uses the built-in defaults.
+        ffn_keywords: Module-name substrings that identify FFN blocks. ``None``
+            uses the built-in defaults.
+        limit: Cap the number of samples per category. ``None`` = full dataset.
+        log_dir: Directory for ``args.json`` and ``results.json``.
+
+    Returns:
+        BFCL evaluation summary — per-category scores plus aggregate metrics,
+        with ``phase_layer_configs`` recording the resolved (phase, layer)
+        precision table.
     """
     if bfcl_test_categories is None:
         bfcl_test_categories = list(BFCL_WEB_SEARCH_CATEGORIES)

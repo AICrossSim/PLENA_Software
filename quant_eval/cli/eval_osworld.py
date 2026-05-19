@@ -1,22 +1,25 @@
 """
-OSWorld agentic evaluation with optional MASE quantization.
+OSWorld agentic evaluation with optional MX quantization.
 
-Uses text-only mode (a11y_tree) so quantized language models can serve
-as OSWorld agents without vision capabilities.
+Runs the OSWorld desktop-task benchmark in text-only (a11y_tree) mode, so
+quantized language models can serve as OSWorld agents without vision
+capabilities. The agent observes the desktop via the accessibility tree and
+generates ``pyautogui`` code to act on it; the VM is rolled back between
+tasks.
 
-Usage:
-    python -m quant_eval.cli.eval_osworld --help
+Prerequisites:
 
-Example (baseline):
-    python -m quant_eval.cli.eval_osworld \
-        --model_name Qwen/Qwen2.5-1.5B-Instruct \
-        --osworld_path /path/to/OSWorld
+- The OSWorld repository cloned at ``osworld_path``.
+- A configured VM provider (Docker recommended) with the corresponding image.
+- An instruction-tuned / chat model.
 
-Example (quantized):
-    python -m quant_eval.cli.eval_osworld \
-        --model_name Qwen/Qwen2.5-1.5B-Instruct \
-        --quant_config quant_eval/configs/llama_mxint4.toml \
-        --osworld_path /path/to/OSWorld
+Example:
+
+    python -m quant_eval.cli.eval_osworld \\
+        --model_name Qwen/Qwen2.5-7B-Instruct \\
+        --osworld_path quant_eval/benchmarks/OSWorld \\
+        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --domain chrome --max_steps 15
 """
 
 from typing import Union
@@ -71,35 +74,46 @@ def main(
     """
     Run OSWorld agentic evaluation with optional MX quantization.
 
-    The model operates in text-only mode using accessibility tree
-    observations. It generates pyautogui code to interact with the
-    desktop environment.
-
     Args:
-        model_name: HuggingFace model ID (should be an instruct/chat model).
-        osworld_path: Path to the OSWorld repository.
-        device_id: CUDA device.
-        dtype: Model dtype (float16, bfloat16, float32).
-        quant_config: Path to TOML config for quantize_module_transform_pass.
-                      If None, run unquantized baseline.
-        model_parallel: Auto-dispatch across GPUs.
-        provider_name: VM provider (docker, vmware, virtualbox, aws).
-        path_to_vm: Path to VM image (for vmware/virtualbox).
-        domain: Task domain (all, chrome, libreoffice_calc, etc.).
-        max_steps: Maximum steps per task.
-        max_tokens: Max generation tokens per step.
-        temperature: Sampling temperature.
-        top_p: Top-p sampling.
-        max_trajectory_length: Steps of history in context.
-        a11y_tree_max_tokens: Max tokens for accessibility tree text.
-        result_dir: Directory for per-task results.
-        client_password: VM client password.
-        screen_width: VM screen width.
-        screen_height: VM screen height.
-        headless: Run VM without GUI.
-        sleep_after_execution: Pause after each action execution.
-        test_all_meta_path: Path to test_all.json task list.
-        log_dir: Directory to save experiment logs.
+        model_name: HuggingFace model ID — must be an instruction-tuned /
+            chat model.
+        osworld_path: Local path to the OSWorld repository checkout.
+        device_id: CUDA device string.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        quant_config: Path to a TOML quantization recipe. ``None`` runs the
+            unquantized baseline.
+        model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        provider_name: VM provider — one of ``"docker"``, ``"vmware"``,
+            ``"virtualbox"``, ``"aws"``.
+        path_to_vm: Path to the VM image (used by ``vmware`` / ``virtualbox``;
+            ignored for Docker).
+        domain: Task domain to evaluate — ``"all"`` or one of OSWorld's
+            domains (``"chrome"``, ``"libreoffice_calc"``, ``"gimp"``, ...).
+        max_steps: Maximum agent steps per task.
+        max_tokens: Maximum tokens generated per agent step.
+        temperature: Sampling temperature for agent generation.
+        top_p: Top-p sampling for agent generation.
+        max_trajectory_length: Steps of action history retained in the
+            prompt context.
+        a11y_tree_max_tokens: Maximum tokens for the serialized
+            accessibility-tree observation.
+        result_dir: Directory for per-task outputs (trajectories,
+            screenshots, scores).
+        client_password: VM user password (for sudo operations inside the VM).
+        screen_width: VM display width in pixels.
+        screen_height: VM display height in pixels.
+        headless: Run the VM without a visible GUI window.
+        sleep_after_execution: Seconds to pause after each ``pyautogui``
+            action (useful when the VM needs time to render).
+        test_all_meta_path: Path to a ``test_all.json`` task list. ``None``
+            uses OSWorld's default meta file for the chosen domain.
+        log_dir: Directory for top-level ``args.json`` and aggregate
+            ``results.json``.
+
+    Returns:
+        Dict with keys ``avg_score``, ``total_tasks``, ``total_success``,
+        ``all_scores`` (per-task score list), and ``per_domain`` (mapping
+        each domain to ``{avg_score, num_tasks, num_success}``).
     """
     print("=" * 60)
     print("OSWorld Agentic Evaluation")

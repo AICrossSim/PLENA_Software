@@ -1,38 +1,24 @@
 """
-lm-eval harness with phase- and layer-type-dependent MX quantization.
+lm-eval-harness with phase- and layer-type-dependent MX quantization.
 
-Supports four independent activation precision settings:
+Activation precision switches based on (phase, layer_type):
 
-    prefill × attn   prefill × ffn
-    decode  × attn   decode  × ffn
+- **phase**: prefill (seq len > 1) vs decode (seq len == 1), detected from
+  input shape at runtime.
+- **layer_type**: attention vs FFN, detected from module names.
 
-Uses PhaseLayerAutoSwitch from phase_quant.py, which combines:
-  - a single lightweight top-level hook for prefill/decode detection
-  - per-submodule hooks that apply the right config to each attention
-    or FFN block immediately before its forward pass
+The four resulting widths (prefill-attn, prefill-ffn, decode-attn, decode-ffn)
+are set independently. Weight quantization comes from the TOML recipe;
+activation widths come from CLI flags. lm-eval itself is unmodified.
 
-Transparent to lm-eval — no modifications to the harness needed.
+Example — disaggregated W4 prefill / W8 decode:
 
-Usage:
-    python -m quant_eval.cli.eval_phase_lm --help
-
-Example — fully disaggregated:
-    python -m quant_eval.cli.eval_phase_lm \
-        --model_name Qwen/Qwen2.5-1.5B \
-        --quant_config quant_eval/configs/llama_mxint4.toml \
-        --prefill_attn_width 4 \
-        --prefill_ffn_width  4 \
-        --decode_attn_width  8 \
-        --decode_ffn_width   6 \
-        --tasks wikitext
-
-Example — phase-only (attn == ffn per phase, reproduces old behaviour):
-    python -m quant_eval.cli.eval_phase_lm \
-        --model_name Qwen/Qwen2.5-1.5B \
-        --quant_config quant_eval/configs/llama_mxint4.toml \
-        --prefill_attn_width 4 --prefill_ffn_width 4 \
-        --decode_attn_width  8 --decode_ffn_width  8 \
-        --tasks wikitext
+    python -m quant_eval.cli.eval_phase_lm \\
+        --model_name Qwen/Qwen2.5-1.5B \\
+        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --prefill_attn_width 4 --prefill_ffn_width 4 \\
+        --decode_attn_width  8 --decode_ffn_width  8 \\
+        --tasks gsm8k --limit 200
 """
 
 from typing import Union
@@ -84,34 +70,44 @@ def main(
     log_dir: Union[str, None] = None,
 ):
     """
-    Run lm-eval with independent MX activation precision per
+    Run lm-eval with phase- and layer-type-dependent activation precision.
+
+    Phase is detected from input sequence length at runtime; layer type is
+    detected from module names (override via ``attn_keywords`` / ``ffn_keywords``
+    for non-standard architectures). The weight quantization recipe from
+    ``quant_config`` is applied once; the activation widths and block sizes
+    specified here override the recipe's activation sections per
     (phase, layer_type) pair.
 
-    Phase is detected automatically from input sequence length;
-    layer type is detected from module names. lm-eval is unchanged.
-
     Args:
-        model_name:             HuggingFace model ID.
-        tasks:                  lm-eval task(s) to run.
-        device_id:              CUDA device string.
-        dtype:                  Model dtype (float16 / bfloat16 / float32).
-        quant_config:           TOML config for weight quantization.
-        model_parallel:         Auto-dispatch across all visible GPUs.
-        seqlen:                 Maximum context length passed to lm-eval.
-        batch_size:             lm-eval batch size or "auto".
-        prefill_attn_width:     Activation bit-width for attention during prefill.
-        prefill_ffn_width:      Activation bit-width for FFN during prefill.
+        model_name: HuggingFace model ID.
+        tasks: lm-eval task name(s) — comma-separated string or list.
+        device_id: CUDA device string.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        quant_config: Path to a TOML quantization recipe.
+        model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        seqlen: Maximum context length passed to lm-eval.
+        batch_size: lm-eval batch size — int or ``"auto"``.
+        prefill_attn_width: Activation bit-width for attention layers during
+            prefill.
+        prefill_ffn_width: Activation bit-width for FFN layers during prefill.
         prefill_attn_block_size: MX block size for attention during prefill.
-        prefill_ffn_block_size:  MX block size for FFN during prefill.
-        decode_attn_width:      Activation bit-width for attention during decode.
-        decode_ffn_width:       Activation bit-width for FFN during decode.
-        decode_attn_block_size:  MX block size for attention during decode.
-        decode_ffn_block_size:   MX block size for FFN during decode.
-        attn_keywords:          Override default attention module name keywords.
-        ffn_keywords:           Override default FFN module name keywords.
-        limit:                  Cap the number of samples per task. Int = absolute
-                                count, float in (0, 1) = fraction. None = full dataset.
-        log_dir:                Directory for experiment logs and results.
+        prefill_ffn_block_size: MX block size for FFN during prefill.
+        decode_attn_width: Activation bit-width for attention layers during
+            decode.
+        decode_ffn_width: Activation bit-width for FFN layers during decode.
+        decode_attn_block_size: MX block size for attention during decode.
+        decode_ffn_block_size: MX block size for FFN during decode.
+        attn_keywords: Module-name substrings that identify attention blocks.
+            ``None`` uses the built-in defaults.
+        ffn_keywords: Module-name substrings that identify FFN blocks. ``None``
+            uses the built-in defaults.
+        limit: Cap samples per task. Int = absolute count; float in
+            ``(0, 1)`` = fraction; ``None`` = full dataset.
+        log_dir: Directory for ``args.json`` and ``results.json``.
+
+    Returns:
+        lm-eval results dict — per-task metrics plus aggregate scores.
     """
     # ------------------------------------------------------------------
     # Build the nested phase × layer config

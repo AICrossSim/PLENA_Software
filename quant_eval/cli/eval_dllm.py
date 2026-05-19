@@ -1,21 +1,23 @@
 """
-Fast-dLLM v2 evaluation with optional MASE quantization.
+Fast-dLLM v2 (block-diffusion language model) evaluation with optional MX
+quantization.
 
-Evaluates diffusion-based language models using block diffusion sampling
-with lm-eval harness benchmarks (e.g., gsm8k, minerva_math).
+Evaluates diffusion-based language models via lm-eval-harness, using
+block-diffusion sampling instead of standard autoregressive decoding.
+Quantization is applied via the same TOML-config interface as the rest of
+the toolkit.
 
-Usage:
-    python -m quant_eval.cli.eval_dllm --help
+Example — baseline:
 
-Example (baseline):
-    python -m quant_eval.cli.eval_dllm \
-        --model_name Efficient-Large-Model/Fast_dLLM_v2_1.5B \
+    python -m quant_eval.cli.eval_dllm \\
+        --model_name Efficient-Large-Model/Fast_dLLM_v2_1.5B \\
         --tasks gsm8k
 
-Example (quantized):
-    python -m quant_eval.cli.eval_dllm \
-        --model_name Efficient-Large-Model/Fast_dLLM_v2_1.5B \
-        --quant_config configs/linear_mxint.toml \
+Example — quantized:
+
+    python -m quant_eval.cli.eval_dllm \\
+        --model_name Efficient-Large-Model/Fast_dLLM_v2_1.5B \\
+        --quant_config quant_eval/configs/llama_mxint4.toml \\
         --tasks gsm8k
 """
 
@@ -64,23 +66,34 @@ def main(
     """
     Evaluate a Fast-dLLM v2 model with optional MX quantization.
 
+    Decoding is block-diffusion: ``bd_size`` tokens are generated per outer
+    block, then refined through ``small_block_size`` sub-blocks of iterative
+    unmasking.
+
     Args:
-        model_name: HuggingFace model ID (Fast-dLLM v2 model).
-        tasks: lm-eval task(s) to run (e.g., gsm8k, minerva_math).
-        device_id: CUDA device.
-        dtype: Model dtype (float16, bfloat16, float32).
-        quant_config: Path to TOML config for quantize_module_transform_pass.
-                      If None, run unquantized baseline.
-        model_parallel: Auto-dispatch across GPUs.
-        batch_size: Batch size for evaluation.
-        max_new_tokens: Max tokens to generate per sample.
-        num_fewshot: Number of few-shot examples.
-        mask_id: Mask token ID for dLLM (default: 151665 for Qwen-based models).
-        bd_size: Block diffusion size.
-        small_block_size: Sub-block size for iterative unmasking.
-        threshold: Confidence threshold for unmasking tokens.
-        show_speed: Show throughput metrics.
-        log_dir: Directory to save logs.
+        model_name: HuggingFace model ID (must be a Fast-dLLM v2 checkpoint).
+        tasks: lm-eval task name(s) — comma-separated string or list
+            (e.g. ``"gsm8k,minerva_math"``).
+        device_id: CUDA device string.
+        dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
+        quant_config: Path to a TOML quantization recipe. ``None`` runs the
+            unquantized baseline.
+        model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        batch_size: lm-eval batch size.
+        max_new_tokens: Maximum tokens generated per sample.
+        num_fewshot: Few-shot examples prepended to each task prompt.
+        mask_id: Token ID used as the diffusion mask. Default ``151665``
+            (matches Qwen-based Fast-dLLM checkpoints).
+        bd_size: Outer block-diffusion block size — tokens generated per
+            outer sampling step.
+        small_block_size: Inner block size for iterative unmasking within
+            each outer block.
+        threshold: Confidence threshold for committing unmasked tokens.
+        show_speed: Log throughput metrics (tokens/second).
+        log_dir: Directory for ``args.json`` and ``results.json``.
+
+    Returns:
+        lm-eval results dict — per-task metrics plus aggregate scores.
     """
     print("=" * 60)
     print("Fast-dLLM Evaluation")

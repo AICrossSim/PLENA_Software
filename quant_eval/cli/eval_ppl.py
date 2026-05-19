@@ -1,17 +1,19 @@
 """
-WikiText perplexity evaluation with MASE quantization pass.
+Language-modeling perplexity evaluation with optional MX quantization.
 
-Usage:
-    python -m quant_eval.cli.eval_ppl --help
+Sets up an HF causal language model, optionally applies a MASE quantization
+pass driven by a TOML recipe, then computes perplexity on the chosen dataset
+(WikiText by default).
 
-Example (baseline):
-    python -m quant_eval.cli.eval_ppl \
-        --model_name Qwen/Qwen3-30B-A3B
+Example — baseline (fp16):
 
-Example (quantized):
-    python -m quant_eval.cli.eval_ppl \
-        --model_name Qwen/Qwen3-30B-A3B \
-        --quant_config quant_eval/configs/qwen3_moe_mxint4.toml
+    python -m quant_eval.cli.eval_ppl --model_name unsloth/Llama-3.2-1B
+
+Example — quantized:
+
+    python -m quant_eval.cli.eval_ppl \\
+        --model_name unsloth/Llama-3.2-1B \\
+        --quant_config quant_eval/configs/llama_mxint4.toml
 """
 
 from typing import Union
@@ -43,18 +45,23 @@ def main(
     log_dir: Union[str, None] = None,
 ):
     """
-    Evaluate perplexity with optional MX quantization.
+    Evaluate language-modeling perplexity, optionally with MX quantization.
 
     Args:
-        model_name: HuggingFace model ID.
-        dataset: Dataset name (default: wikitext).
-        device_id: CUDA device.
-        dtype: Model dtype (float16, bfloat16, float32).
-        quant_config: Path to TOML config for quantize_module_transform_pass.
-                      If None, run unquantized baseline.
-        model_parallel: Auto-dispatch across GPUs.
-        seqlen: Maximum sequence length.
-        log_dir: Directory to save logs.
+        model_name: HuggingFace model ID (e.g. ``meta-llama/Llama-2-7b-hf``).
+        dataset: Dataset for perplexity scoring. Default ``"wikitext"``.
+        device_id: CUDA device string, e.g. ``"cuda:0"``.
+        dtype: Model dtype — one of ``"float16"``, ``"bfloat16"``, ``"float32"``.
+        quant_config: Path to a TOML quantization recipe. ``None`` runs the
+            unquantized baseline.
+        model_parallel: Distribute the model across all visible GPUs using HF
+            ``device_map="auto"``.
+        seqlen: Maximum sequence length passed to the perplexity evaluator.
+        log_dir: Directory in which to write ``args.json``, ``quant_config.toml``
+            (when quantized), and ``results.json``. ``None`` disables logging.
+
+    Returns:
+        Dict of metric name to scalar. For wikitext: ``{"ppl": float}``.
     """
     print("=" * 60)
     print("Perplexity Evaluation")
