@@ -38,6 +38,12 @@ bfcl = [
     "markdownify",
     "ddgs",
 ]
+dse = [
+    "botorch>=0.11",
+    "gpytorch>=1.11",
+    # plena-simulator imported in-process via sys.path injection
+    # (upstream has broken git submodules — cannot pip-install yet).
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

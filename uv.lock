@@ -496,6 +496,26 @@ css = [
 ]
 
 [[package]]
+name = "botorch"
+version = "0.17.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "gpytorch" },
+    { name = "linear-operator" },
+    { name = "multipledispatch" },
+    { name = "pyre-extensions" },
+    { name = "pyro-ppl" },
+    { name = "scipy" },
+    { name = "threadpoolctl" },
+    { name = "torch" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/28/07/0e1b595021f74497677d4b7eba624e806622f0966920fd50e215444580f3/botorch-0.17.2.tar.gz", hash = "sha256:371461f35d882796a87e70ca9a529f31287f9ed984fd9ca3a1d311af58d3fa0c", size = 3747911, upload-time = "2026-03-05T01:08:55.605Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/69/69/1a6cd32cf55507987b34404714374feb008928a5a90de7d22c9027bf2baa/botorch-0.17.2-py3-none-any.whl", hash = "sha256:956d38fa6bf5e2094199e7a1631b26099d72d2d16066d5c4504dc6a0b4b989bd", size = 4566008, upload-time = "2026-03-05T01:08:53.688Z" },
+]
+
+[[package]]
 name = "certifi"
 version = "2026.2.25"
 source = { registry = "https://pypi.org/simple" }
@@ -1719,6 +1739,21 @@ wheels = [
 ]
 
 [[package]]
+name = "gpytorch"
+version = "1.15.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "linear-operator" },
+    { name = "mpmath" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/23/00/cac3e309b2f66518d937ce4d9fa821f167d9070d004fcb070b1780cd1d94/gpytorch-1.15.2.tar.gz", hash = "sha256:380625e93f851b85f772b25c5fb0a6c6d2e3eb2ef667f1e566ab4f95b8775361", size = 2781831, upload-time = "2026-02-28T01:12:55.172Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b6/70/c419a361b09ccb618b5165daa919003ccdd9c148356f7ff71a710db6bcf0/gpytorch-1.15.2-py3-none-any.whl", hash = "sha256:2112fdc7c0c0bf56a7f2444663cfc80fdfc3e19724399d6303a83d8efdd71e9e", size = 291209, upload-time = "2026-02-28T01:12:52.587Z" },
+]
+
+[[package]]
 name = "greenlet"
 version = "3.3.2"
 source = { registry = "https://pypi.org/simple" }
@@ -2696,6 +2731,19 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f1/45/7fa8f56b17dc0f0a41ec70dd307ecd6787254483549843bef4c30ab5adce/lightning_utilities-0.15.3.tar.gz", hash = "sha256:792ae0204c79f6859721ac7f386c237a33b0ed06ba775009cb894e010a842033", size = 33553, upload-time = "2026-02-22T14:48:53.348Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/25/f4/ead6e0e37209b07c9baa3e984ccdb0348ca370b77cea3aaea8ddbb097e00/lightning_utilities-0.15.3-py3-none-any.whl", hash = "sha256:6c55f1bee70084a1cbeaa41ada96e4b3a0fea5909e844dd335bd80f5a73c5f91", size = 31906, upload-time = "2026-02-22T14:48:52.488Z" },
+]
+
+[[package]]
+name = "linear-operator"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "scipy" },
+    { name = "torch" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/02/1a/0d6d0269cf7327e31a2fe80b274d5bf5001dc4462acbef26240da6ac5dfe/linear_operator-0.6.1.tar.gz", hash = "sha256:3fba49a8080d16f822a5d870f462279cd6afbcf4ed670f4511b38fad96f61831", size = 181898, upload-time = "2026-02-27T23:43:18.716Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/34/ee74708a93704baca5c1ef439817c4cb649f73382c518380ccc5ab335603/linear_operator-0.6.1-py3-none-any.whl", hash = "sha256:a5981c1fcda08df3a210dffb6e8019b4751f4afaf3ffc822c24eaaf56b11eed9", size = 174770, upload-time = "2026-02-27T23:43:17.074Z" },
 ]
 
 [[package]]
@@ -4019,6 +4067,15 @@ wheels = [
 ]
 
 [[package]]
+name = "opt-einsum"
+version = "3.4.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/b9/2ac072041e899a52f20cf9510850ff58295003aa75525e58343591b0cbfb/opt_einsum-3.4.0.tar.gz", hash = "sha256:96ca72f1b886d148241348783498194c577fa30a8faac108586b14f1ba4473ac", size = 63004, upload-time = "2024-09-26T14:33:24.483Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/cd/066e86230ae37ed0be70aae89aabf03ca8d9f39c8aea0dec8029455b5540/opt_einsum-3.4.0-py3-none-any.whl", hash = "sha256:69bb92469f86a1565195ece4ac0323943e83477171b91d24c35afe028a90d7cd", size = 71932, upload-time = "2024-09-26T14:33:23.039Z" },
+]
+
+[[package]]
 name = "optuna"
 version = "4.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -4909,6 +4966,44 @@ wheels = [
 ]
 
 [[package]]
+name = "pyre-extensions"
+version = "0.0.32"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+    { name = "typing-inspect" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a7/53/5bc2532536e921c48366ad1047c1344ccef6afa5e84053f0f6e20a453767/pyre_extensions-0.0.32.tar.gz", hash = "sha256:5396715f14ea56c4d5fd0a88c57ca7e44faa468f905909edd7de4ad90ed85e55", size = 10852, upload-time = "2024-11-22T19:26:44.152Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/7a/9812cb8be9828ab688203c5ac5f743c60652887f0c00995a6f6f19f912bd/pyre_extensions-0.0.32-py3-none-any.whl", hash = "sha256:a63ba6883ab02f4b1a9f372ed4eb4a2f4c6f3d74879aa2725186fdfcfe3e5c68", size = 12766, upload-time = "2024-11-22T19:26:42.465Z" },
+]
+
+[[package]]
+name = "pyro-api"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/25/d7/a0812f5c16b0d4464f80a64a44626c5fe200098070be0f32436dbb662775/pyro-api-0.1.2.tar.gz", hash = "sha256:a1b900d9580aa1c2fab3b123ab7ff33413744da7c5f440bd4aadc4d40d14d920", size = 7349, upload-time = "2020-05-15T16:17:41.501Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fc/81/957ae78e6398460a7230b0eb9b8f1cb954c5e913e868e48d89324c68cec7/pyro_api-0.1.2-py3-none-any.whl", hash = "sha256:10e0e42e9e4401ce464dab79c870e50dfb4f413d326fa777f3582928ef9caf8f", size = 11981, upload-time = "2020-05-15T16:17:40.492Z" },
+]
+
+[[package]]
+name = "pyro-ppl"
+version = "1.9.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "opt-einsum" },
+    { name = "pyro-api" },
+    { name = "torch" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/4c/2e/3bcba8688d58f8dc954cef6831c19d52b6017b035d783685d67cd99fa351/pyro_ppl-1.9.1.tar.gz", hash = "sha256:5e1596de276c038a3f77d2580a90d0a97126e0104900444a088eee620bb0d65e", size = 570861, upload-time = "2024-06-02T00:37:39.688Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ed/37/def183a2a2c8619d92649d62fe0622c4c6c62f60e4151e8fbaa409e7d5ab/pyro_ppl-1.9.1-py3-none-any.whl", hash = "sha256:91fb2c8740d9d3bd548180ac5ecfa04552ed8c471a1ab66870180663b8f09852", size = 755956, upload-time = "2024-06-02T00:37:37.486Z" },
+]
+
+[[package]]
 name = "pytablewriter"
 version = "1.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -5285,6 +5380,10 @@ docs = [
     { name = "mkdocs-material" },
     { name = "mkdocstrings", extra = ["python"] },
 ]
+dse = [
+    { name = "botorch" },
+    { name = "gpytorch" },
+]
 evalplus = [
     { name = "evalplus" },
     { name = "stop-sequencer" },
@@ -5298,12 +5397,14 @@ serve = [
 requires-dist = [
     { name = "accelerate" },
     { name = "beautifulsoup4", marker = "extra == 'bfcl'" },
+    { name = "botorch", marker = "extra == 'dse'", specifier = ">=0.11" },
     { name = "colorlog" },
     { name = "datasets" },
     { name = "ddgs", marker = "extra == 'bfcl'" },
     { name = "evalplus", marker = "extra == 'evalplus'" },
     { name = "fastapi", marker = "extra == 'bfcl'" },
     { name = "fastapi", marker = "extra == 'serve'" },
+    { name = "gpytorch", marker = "extra == 'dse'", specifier = ">=1.11" },
     { name = "httpx", marker = "extra == 'bfcl'" },
     { name = "jsonargparse" },
     { name = "lm-eval", specifier = ">=0.4" },
@@ -5321,7 +5422,7 @@ requires-dist = [
     { name = "uvicorn", marker = "extra == 'bfcl'" },
     { name = "uvicorn", marker = "extra == 'serve'" },
 ]
-provides-extras = ["docs", "evalplus", "serve", "bfcl"]
+provides-extras = ["docs", "evalplus", "serve", "bfcl", "dse"]
 
 [[package]]
 name = "referencing"
@@ -6759,6 +6860,19 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz", hash = "sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466", size = 109391, upload-time = "2025-08-25T13:49:26.313Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl", hash = "sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548", size = 44614, upload-time = "2025-08-25T13:49:24.86Z" },
+]
+
+[[package]]
+name = "typing-inspect"
+version = "0.9.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "mypy-extensions" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/dc/74/1789779d91f1961fa9438e9a8710cdae6bd138c80d7303996933d117264a/typing_inspect-0.9.0.tar.gz", hash = "sha256:b23fc42ff6f6ef6954e4852c1fb512cdd18dbea03134f91f856a95ccc9461f78", size = 13825, upload-time = "2023-05-24T20:25:47.612Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/65/f3/107a22063bf27bdccf2024833d3445f4eea42b2e598abfbd46f6a63b6cb0/typing_inspect-0.9.0-py3-none-any.whl", hash = "sha256:9ee6fc59062311ef8547596ab6b955e1b8aa46242d854bfc78f4f6b0eff35f9f", size = 8827, upload-time = "2023-05-24T20:25:45.287Z" },
 ]
 
 [[package]]

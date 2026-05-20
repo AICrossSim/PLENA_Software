@@ -1,0 +1,30 @@
+{
+  "_comment": "Online DSE config — single-objective (TPS) BO over PLENA hardware knobs. Paths below assume PLENA_Simulator is cloned at ../PLENA_Simulator relative to PLENA_Software. Adjust as needed.",
+
+  "plena_simulator_path": "../PLENA_Simulator",
+  "model_config_path": "../PLENA_Simulator/tools/aria-llama-ops/experiments/llama-3.1-8b.json",
+  "plena_settings_toml": "../PLENA_Simulator/plena_settings.toml",
+  "custom_isa_path": "../PLENA_Simulator/analytic_models/performance/customISA_lib.json",
+
+  "batch_size": 1,
+  "input_seq_len": 2048,
+  "output_seq_len": 128,
+
+  "search": {
+    "BLEN": [64, 128, 256],
+    "MLEN": [1024, 2048, 4096],
+    "VLEN": [1024, 2048, 4096],
+    "HLEN": [64, 128],
+    "VECTOR_SRAM_SIZE": [32768, 65536, 131072],
+    "HBM_V_Prefetch_Amount": [16, 32],
+    "HBM_M_Prefetch_Amount": [1024, 2048, 4096],
+    "HBM_SIZE": [68719476736, 137438953472],
+    "HBM_WIDTH": [256, 512, 1024]
+  },
+
+  "bo": {
+    "n_init": 8,
+    "n_budget": 40,
+    "seed": 0
+  }
+}
