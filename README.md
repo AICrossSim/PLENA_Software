@@ -1,3 +1,11 @@
+# PLENA Software
+
+Quantization and evaluation toolkit for MX-quantized LLMs.
+
+## Documentation
+
+Full documentation is hosted at **<https://aicrosssim.github.io/PLENA_Software/>**, including a getting-started guide, CLI reference for evaluation commands, and the quantization TOML config reference.
+
 # Setup
 
 ## Installation
