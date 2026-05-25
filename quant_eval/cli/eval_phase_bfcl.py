@@ -14,10 +14,9 @@ BFCL is a two-step flow:
 This script orchestrates both steps automatically and exposes the local
 server on ``server_host:server_port``.
 
-Requires the ``bfcl`` extra and the ``bfcl-eval`` package:
+Requires the ``bfcl`` extra:
 
     uv sync --extra bfcl
-    pip install bfcl-eval
 
 Example:
 
@@ -40,7 +39,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Union
+from typing import Sequence, Union
 
 import torch
 import transformers
@@ -499,32 +498,82 @@ def _start_server(app, host: str, port: int) -> threading.Thread:
 #  BFCL CLI helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _bfcl_model_name(model_name: str) -> str:
+def _bfcl_model_name(model_name: str, model_alias: str | None = None) -> str:
     """
     Map a HuggingFace model ID to the BFCL result-file name.
 
     BFCL replaces '/' with '__' internally; we follow the same convention and
     append '-FC' to signal native function-calling support.
     """
-    #return model_name.replace("/", "__") + "-FC"
-    return "Qwen/Qwen3-8B-FC"
+    if model_alias:
+        return model_alias
+
+    normalized = model_name.replace("/", "__")
+    if normalized.endswith("-FC"):
+        return normalized
+    return normalized + "-FC"
+
+
+def _normalize_bfcl_categories(
+    categories: Union[list[str], str, None],
+) -> list[str]:
+    """Normalize category input to a non-empty list of strings."""
+    if categories is None:
+        return list(BFCL_WEB_SEARCH_CATEGORIES)
+
+    if isinstance(categories, str):
+        raw = categories.strip()
+        if not raw:
+            raise ValueError("bfcl_test_categories cannot be empty.")
+
+        # Accept shell-friendly JSON lists and comma-separated strings.
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"invalid JSON for bfcl_test_categories: {raw}"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise ValueError("bfcl_test_categories JSON must be a list.")
+            categories = parsed
+        else:
+            categories = [c.strip() for c in raw.split(",") if c.strip()]
+
+    if not isinstance(categories, list):
+        raise ValueError(
+            "bfcl_test_categories must be a list, JSON list string, or comma-separated string."
+        )
+
+    normalized = []
+    for cat in categories:
+        if not isinstance(cat, str):
+            raise ValueError("bfcl_test_categories entries must be strings.")
+        cat = cat.strip()
+        if cat:
+            normalized.append(cat)
+
+    if not normalized:
+        raise ValueError("bfcl_test_categories resolved to an empty list.")
+    return normalized
 
 
 def _run_bfcl_generate(
     model_name: str,
-    test_categories: list[str],
+    test_categories: Sequence[str],
     host: str,
     port: int,
     result_dir: Path,
     num_threads: int,
     limit: int | None,
+    model_alias: str | None = None,
 ) -> int:
     """Call ``bfcl generate`` against the local server; return the exit code."""
-    bfcl_name = _bfcl_model_name(model_name)
+    bfcl_name = _bfcl_model_name(model_name, model_alias=model_alias)
     cmd = [
         "bfcl", "generate",
         "--model",         bfcl_name,
-        "--test-category", test_categories,
+        "--test-category", *test_categories,
         "--skip-server-setup",
         "--result-dir",    str(result_dir),
         "--num-threads",   str(num_threads),
@@ -547,9 +596,10 @@ def _run_bfcl_evaluate(
     test_categories: list[str],
     result_dir: Path,
     score_dir: Path,
+    model_alias: str | None = None,
 ) -> tuple[int, dict]:
     """Call ``bfcl evaluate``; return (exit_code, parsed_scores)."""
-    bfcl_name = _bfcl_model_name(model_name)
+    bfcl_name = _bfcl_model_name(model_name, model_alias=model_alias)
     cmd = [
         "bfcl", "evaluate",
         "--model",         bfcl_name,
@@ -602,7 +652,8 @@ def main(
     quant_config: str = "quant_eval/configs/llama_mxint4.toml",
     model_parallel: bool = False,
     # ── BFCL settings ──────────────────────────────────────────────────────
-    bfcl_test_categories: Union[list[str], None] = None,
+    bfcl_test_categories: Union[list[str], str, None] = None,
+    bfcl_model_alias:     str | None = None,
     bfcl_num_threads:     int   = 1,
     server_host:          str   = DEFAULT_HOST,
     server_port:          int   = DEFAULT_PORT,
@@ -640,7 +691,10 @@ def main(
         model_parallel: Distribute across GPUs with ``device_map="auto"``.
         bfcl_test_categories: BFCL category names to evaluate (e.g.
             ``["web_search_base", "web_search_no_snippet"]``). ``None`` uses
-            the default web-search category set.
+            the default web-search category set. Also accepts JSON-list string
+            or comma-separated categories.
+        bfcl_model_alias: BFCL result-file model alias. If set, this exact
+            value is used for ``bfcl generate/evaluate --model``.
         bfcl_num_threads: Parallel inference threads for ``bfcl generate``.
         server_host: Host for the local OpenAI-compatible server.
         server_port: Port for the local OpenAI-compatible server.
@@ -664,8 +718,7 @@ def main(
         with ``phase_layer_configs`` recording the resolved (phase, layer)
         precision table.
     """
-    if bfcl_test_categories is None:
-        bfcl_test_categories = list(BFCL_WEB_SEARCH_CATEGORIES)
+    bfcl_test_categories = _normalize_bfcl_categories(bfcl_test_categories)
 
     # ------------------------------------------------------------------
     # Build the nested phase × layer config
@@ -705,6 +758,8 @@ def main(
     print("BFCL Web Search — Phase × Layer-Type Disaggregated Quantization")
     print("=" * 64)
     print(f"  Model      : {model_name}")
+    if bfcl_model_alias:
+        print(f"  BFCL Alias : {bfcl_model_alias}")
     print(f"  Categories : {bfcl_test_categories}")
     print(f"  Weights    : {quant_config}")
     print(f"  Server     : http://{server_host}:{server_port}")
@@ -806,12 +861,13 @@ def main(
     print("\n[1/2] Generating BFCL responses via local server...")
     gen_rc = _run_bfcl_generate(
         model_name      = model_name,
-        test_categories = "web_search_base",
+        test_categories = bfcl_test_categories,
         host            = server_host,
         port            = server_port,
         result_dir      = result_dir,
         num_threads     = bfcl_num_threads,
         limit           = limit,
+        model_alias     = bfcl_model_alias,
     )
     if gen_rc != 0:
         logger.error("bfcl generate exited with code %d", gen_rc)
@@ -825,6 +881,7 @@ def main(
         test_categories = bfcl_test_categories,
         result_dir      = result_dir,
         score_dir       = score_dir,
+        model_alias     = bfcl_model_alias,
     )
 
     switch.disable()

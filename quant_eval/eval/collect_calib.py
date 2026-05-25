@@ -23,6 +23,17 @@ Prompt sources (--prompt_source):
     txt:<path>
         Plain text, one prompt per line.
 
+    bfcl_multiple
+        Use BFCL multiple calibration prompts with default field ``question``.
+        Resolution order for default path:
+            1) ``$BFCL_MULTIPLE_JSONL``
+            2) ``workspace/calib/bfcl_multiple_prompts.jsonl``
+            3) ``bfcl_multiple_prompts.jsonl``
+
+    bfcl_multiple:<jsonl_path>[:<field>]
+        Explicit BFCL multiple JSONL path and optional field name.
+        Default field is ``question``.
+
     lm_eval:<task>[:<limit>]
         Drive forwards via lm-eval-harness on the given task. The hook
         captures whatever lm-eval feeds into ``model.forward`` (so the
@@ -50,6 +61,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -126,6 +138,58 @@ def _iter_txt(path: str, template: str | None) -> Iterator[str]:
             yield template.format(text=line) if template else line
 
 
+def _resolve_default_bfcl_multiple_jsonl() -> Path:
+    """Resolve default BFCL multiple JSONL path or raise a helpful error."""
+    candidates = []
+    env_path = os.environ.get("BFCL_MULTIPLE_JSONL")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend(
+        [
+            Path("workspace/calib/bfcl_multiple_prompts.jsonl"),
+            Path("bfcl_multiple_prompts.jsonl"),
+        ]
+    )
+
+    for path in candidates:
+        if path.exists():
+            return path
+
+    raise FileNotFoundError(
+        "Could not resolve BFCL multiple JSONL. Set BFCL_MULTIPLE_JSONL or use "
+        "prompt_source='bfcl_multiple:/path/to/file.jsonl[:field]'."
+    )
+
+
+def _iter_bfcl_multiple(spec: str, template: str | None) -> Iterator[str]:
+    """spec body: '' or '<path>[:<field>]'"""
+    path: Path
+    field = "question"
+
+    if spec:
+        parts = spec.split(":", 1)
+        path = Path(parts[0])
+        if len(parts) > 1 and parts[1]:
+            field = parts[1]
+    else:
+        path = _resolve_default_bfcl_multiple_jsonl()
+
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if template:
+                yield template.format(**row)
+                continue
+            if field not in row:
+                raise KeyError(
+                    f"field '{field}' missing in BFCL row; row keys = {list(row.keys())}"
+                )
+            yield str(row[field])
+
+
 def iter_prompts(prompt_source: str, template: str | None) -> Iterator[str]:
     if prompt_source.startswith("hf:"):
         yield from _iter_hf(prompt_source[3:], template)
@@ -133,10 +197,14 @@ def iter_prompts(prompt_source: str, template: str | None) -> Iterator[str]:
         yield from _iter_jsonl(prompt_source[6:], template)
     elif prompt_source.startswith("txt:"):
         yield from _iter_txt(prompt_source[4:], template)
+    elif prompt_source == "bfcl_multiple":
+        yield from _iter_bfcl_multiple("", template)
+    elif prompt_source.startswith("bfcl_multiple:"):
+        yield from _iter_bfcl_multiple(prompt_source[len("bfcl_multiple:"):], template)
     else:
         raise ValueError(
             f"unknown prompt_source prefix: {prompt_source!r}. "
-            "Use one of: hf:..., jsonl:..., txt:..."
+            "Use one of: hf:..., jsonl:..., txt:..., bfcl_multiple[:path[:field]]"
         )
 
 
@@ -164,7 +232,8 @@ def main(
         model_name:        HF model id (used both for tokenizer and forward).
         device:            CUDA device.
         dtype:             Model dtype (float16/bfloat16/float32).
-        prompt_source:     ``hf:...`` / ``jsonl:...`` / ``txt:...`` (see module
+        prompt_source:     ``hf:...`` / ``jsonl:...`` / ``txt:...`` /
+                           ``bfcl_multiple[:path[:field]]`` (see module
                            docstring for grammar).
         prompt_template:   Optional Python ``str.format`` template; if None,
                            columns/fields are newline-joined.

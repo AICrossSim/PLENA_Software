@@ -37,6 +37,7 @@ bfcl = [
     "beautifulsoup4",
     "markdownify",
     "ddgs",
+    "bfcl-eval",
 ]
 dse = [
     "botorch>=0.11",
