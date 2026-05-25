@@ -44,6 +44,7 @@ whatever value was set at model-load time — no silent reset to defaults.
 
 from __future__ import annotations
 
+import torch
 from torch import nn
 
 
@@ -87,12 +88,45 @@ def _find_quant_attention_wrappers(model: nn.Module):
     return wrappers
 
 
+_VALID_WEIGHT_MODES = {"quantized", "fp"}
+
+
+def _normalize_weight_mode(overrides: dict | None) -> str:
+    """Return the requested per-phase weight mode. Defaults to quantized."""
+    if not overrides:
+        return "quantized"
+    mode = overrides.get("weight_mode", "quantized")
+    if mode not in _VALID_WEIGHT_MODES:
+        raise ValueError(
+            f"Unsupported weight_mode={mode!r}; expected one of "
+            f"{sorted(_VALID_WEIGHT_MODES)}."
+        )
+    return mode
+
+
+def _apply_module_config(module: nn.Module, overrides: dict) -> None:
+    """Write runtime config keys to one MX layer.
+
+    ``weight_mode`` is switch policy, not a LinearMXInt/LinearMXFP config key.
+    ``bypass`` is both a config value and a module attribute read directly by
+    LinearMXInt.forward(), so keep them in sync.
+    """
+    for key, value in overrides.items():
+        if key == "weight_mode":
+            continue
+        if key == "bypass":
+            module.config["bypass"] = bool(value)
+            if hasattr(module, "bypass"):
+                module.bypass = bool(value)
+            continue
+        if key in module.config:
+            module.config[key] = value
+
+
 def _apply_config(mx_layers: list, overrides: dict) -> None:
-    """Write ``overrides`` into the .config dict of each MX layer."""
+    """Write ``overrides`` into each MX layer's runtime config."""
     for _, module in mx_layers:
-        for key, value in overrides.items():
-            if key in module.config:
-                module.config[key] = value
+        _apply_module_config(module, overrides)
 
 
 def set_phase(model: nn.Module, phase_configs: dict, phase: str) -> None:
@@ -281,7 +315,12 @@ class PhaseLayerAutoSwitch:
             "ffn":  {"data_in_width": 4,  "data_in_block_size": 32},
         },
         "decode": {
-            "attn": {"data_in_width": 8,  "data_in_block_size": 32},
+            "attn": {
+                "data_in_width": 8,
+                "data_in_block_size": 32,
+                "weight_mode": "fp",  # optional: "quantized" (default) or "fp"
+                "bypass": True,       # required for true FP Linear decode
+            },
             "ffn":  {"data_in_width": 6,  "data_in_block_size": 32},
         },
     }
@@ -339,6 +378,12 @@ class PhaseLayerAutoSwitch:
         self.attn_keywords = attn_keywords
         self.ffn_keywords  = ffn_keywords
         self.model_name = model_name
+        self._fp_weight_requested = self._phase_configs_request_fp_weight()
+        if self._fp_weight_requested and model_name is None:
+            raise ValueError(
+                "PhaseLayerAutoSwitch requires model_name when any phase "
+                "config sets weight_mode='fp'."
+            )
 
         # Shared mutable cell — updated by the top-level phase-detection hook,
         # read by every per-submodule hook.  A one-element list is used so
@@ -353,6 +398,13 @@ class PhaseLayerAutoSwitch:
             name: dict(module.config)
             for name, module in self._all_mx_layers
         }
+
+        # For prefill-only mode, decode may temporarily replace quantized/GPTQ
+        # weights with original FP checkpoint weights. Cache the quantized
+        # tensors on CPU so a later decode->prefill transition can restore the
+        # exact runtime state without re-running GPTQ.
+        self._quant_weight_cache: dict[int, dict[str, object]] = {}
+        self._fp_weight_active: set[int] = set()
 
         # id(mx_module) -> full dotted name, for safetensors tensor-key lookup
         # during the disk-backed weight re-quant path.
@@ -384,6 +436,33 @@ class PhaseLayerAutoSwitch:
         self._shard_map: dict[str, str] | None = None
         if model_name is not None:
             self._shard_map = self._build_shard_map(model_name)
+        if self._fp_weight_requested and self._shard_map is None:
+            raise ValueError(
+                f"Could not locate HF safetensors for model_name={model_name!r}; "
+                "weight_mode='fp' cannot load original decode weights."
+            )
+
+    def _phase_requests_fp_weight(self, phase: str) -> bool:
+        """Return whether a specific phase requests original FP weights."""
+        by_layer = self.phase_configs.get(phase, {})
+        if not isinstance(by_layer, dict):
+            return False
+        return any(
+            _normalize_weight_mode(overrides or {}) == "fp"
+            for overrides in by_layer.values()
+        )
+
+    def _phase_configs_request_fp_weight(self) -> bool:
+        """Validate all weight modes and report whether any phase requests FP."""
+        request_fp = False
+        for phase, by_layer in self.phase_configs.items():
+            if not isinstance(by_layer, dict):
+                continue
+            for layer_type, overrides in by_layer.items():
+                mode = _normalize_weight_mode(overrides or {})
+                if mode == "fp":
+                    request_fp = True
+        return request_fp
 
     def _build_shard_map(self, model_name: str) -> dict[str, str] | None:
         """Locate the HF safetensors file(s) for ``model_name`` in the local
@@ -527,9 +606,7 @@ class PhaseLayerAutoSwitch:
             if overrides is None:
                 return
             for mx_module in owned_mx:
-                for key, value in overrides.items():
-                    if key in mx_module.config:
-                        mx_module.config[key] = value
+                _apply_module_config(mx_module, overrides)
 
         return hook
 
@@ -541,14 +618,16 @@ class PhaseLayerAutoSwitch:
         """Central handler called exactly once per real phase change.
 
         Stage 1: mutate attention wrapper qk / av / kv_cache sub-configs.
-        Stage 2: prime LinearMXInt ``weight_width`` in config (so Stage 3's
-                 subsequent ``load_state_dict`` re-runs ``mxint_quantizer``
-                 at the new width).
-        Stage 3: disk-backed re-quant of LinearMXInt weights.
+        Stage 2: prime LinearMXInt ``weight_width`` in config for quantized
+                 phases (FP weight phases skip this because no re-quant runs).
+        Stage 3: load/restore LinearMXInt weights according to weight_mode.
         Stage 4: in-place re-quant of existing K/V cache entries.
 
-        Each stage degrades gracefully if its prerequisites are missing
-        (no model_name, no past_key_values, missing overrides, etc.).
+        Prefill-only v1 note: ``weight_mode='fp'`` means FP Linear weights
+        plus Linear activation bypass during decode. It does NOT imply FP KV
+        cache. Existing K/V entries are still requanted in Stage 4 according
+        to the decode attention config, and any information lost by prefill
+        KV quantization cannot be recovered by the decode transition.
         """
         phase_overrides = self.phase_configs.get(new_phase, {})
 
@@ -572,6 +651,8 @@ class PhaseLayerAutoSwitch:
         # ── Stage 2: prime LinearMXInt weight_width in config ─────────
         for info in self._submodule_info.values():
             lt_overrides = phase_overrides.get(info["layer_type"]) or {}
+            if _normalize_weight_mode(lt_overrides) == "fp":
+                continue
             w  = lt_overrides.get("data_in_width")
             bs = lt_overrides.get("data_in_block_size")
             if w is None:
@@ -581,63 +662,142 @@ class PhaseLayerAutoSwitch:
                 if bs is not None:
                     mx.config["weight_block_size"] = bs
 
-        # ── Stage 3: disk-backed weight re-quant ──────────────────────
-        if self._shard_map is not None:
+        # ── Stage 3: disk-backed weight reload / restore ──────────────
+        if self._shard_map is not None or self._fp_weight_active:
             self._reload_weights_for_phase(new_phase)
 
         # ── Stage 4: in-place re-quant of existing KV cache ───────────
         if past_key_values is not None:
             self._requant_kv_cache(past_key_values, new_phase)
 
-    def _reload_weights_for_phase(self, phase: str) -> None:
-        """For every classified (attn / ffn) layer whose (phase, layer_type)
-        override contains ``data_in_width``, re-read the corresponding fp
-        weight from the local HF safetensors cache and feed it through
-        ``LinearMXInt.load_state_dict``, which re-runs ``mxint_quantizer``
-        at the already-primed ``self.config["weight_width"]``.
-
-        Each shard file is opened exactly once per transition for I/O
-        locality; ``safetensors.safe_open`` mmaps the file so
-        ``get_tensor(name)`` only pages in that tensor's bytes."""
-        if self._shard_map is None:
+    def _cache_quantized_weight(self, mx) -> None:
+        """Save the current quantized/GPTQ Linear state before FP decode."""
+        mx_id = id(mx)
+        if mx_id in self._quant_weight_cache:
             return
+        self._quant_weight_cache[mx_id] = {
+            "weight": mx.weight.detach().to("cpu").clone(),
+            "bias": (
+                mx.bias.detach().to("cpu").clone()
+                if getattr(mx, "bias", None) is not None
+                else None
+            ),
+            "bypass_attr": bool(getattr(mx, "bypass", False)),
+            "config_bypass": mx.config.get("bypass", None),
+        }
 
+    def _restore_quantized_weight(self, mx) -> None:
+        """Restore the cached quantized/GPTQ Linear state after FP decode."""
+        mx_id = id(mx)
+        cached = self._quant_weight_cache.get(mx_id)
+        if cached is None:
+            return
+        with torch.no_grad():
+            mx.weight.data.copy_(
+                cached["weight"].to(mx.weight.device, dtype=mx.weight.dtype)
+            )
+            cached_bias = cached.get("bias")
+            if getattr(mx, "bias", None) is not None and cached_bias is not None:
+                mx.bias.data.copy_(
+                    cached_bias.to(mx.bias.device, dtype=mx.bias.dtype)
+                )
+        config_bypass = cached.get("config_bypass")
+        if config_bypass is None:
+            mx.config.pop("bypass", None)
+        else:
+            mx.config["bypass"] = config_bypass
+        if hasattr(mx, "bypass"):
+            mx.bypass = bool(cached.get("bypass_attr", False))
+        self._fp_weight_active.discard(mx_id)
+
+    def _reload_weights_for_phase(self, phase: str) -> None:
+        """Load or restore Linear weights for the requested phase.
+
+        ``weight_mode='quantized'`` preserves the existing disk-backed
+        re-quant path: read FP checkpoint weights and call ``load_state_dict``
+        so LinearMXInt/LinearMXFP re-quantizes using the primed config.
+
+        ``weight_mode='fp'`` is prefill-only mode: cache the current
+        quantized/GPTQ weight, copy the original checkpoint FP tensor directly
+        into the Linear module, and set ``bypass=True``. This intentionally
+        avoids ``load_state_dict`` because that would either re-quantize the
+        weight or skip GPTQ modules without guaranteeing activation bypass.
+        """
         from safetensors import safe_open
 
         phase_overrides = self.phase_configs.get(phase, {})
 
-        # Group target tensors by shard path for I/O locality
-        by_shard: dict[str, list[tuple[str, object]]] = {}
+        # Group target weight tensors by shard path for I/O locality.
+        by_shard: dict[str, list[tuple[str, object, str]]] = {}
         for info in self._submodule_info.values():
             lt_overrides = phase_overrides.get(info["layer_type"]) or {}
-            if "data_in_width" not in lt_overrides:
+            mode = _normalize_weight_mode(lt_overrides)
+            needs_weight = mode == "fp" or "data_in_width" in lt_overrides
+            if not needs_weight:
                 continue
             for mx in info["owned_mx"]:
+                if mode == "quantized" and id(mx) in self._fp_weight_active:
+                    self._restore_quantized_weight(mx)
+                    # Exact GPTQ/quantized state is back; do not fall through
+                    # to disk reload, which would create a fresh quantization
+                    # and lose the cached GPTQ tensor.
+                    continue
+
                 mx_name = self._mx_name_by_id.get(id(mx))
                 if mx_name is None:
                     continue
                 tensor_name = f"{mx_name}.weight"
-                shard_path = self._shard_map.get(tensor_name)
+                shard_path = None if self._shard_map is None else self._shard_map.get(tensor_name)
                 if shard_path is None:
+                    if mode == "fp":
+                        raise ValueError(
+                            f"Missing checkpoint tensor {tensor_name!r}; "
+                            "cannot enter weight_mode='fp'."
+                        )
                     continue
-                by_shard.setdefault(shard_path, []).append((tensor_name, mx))
+                by_shard.setdefault(shard_path, []).append((tensor_name, mx, mode))
 
         if not by_shard:
             return
 
         for shard_path, items in by_shard.items():
             with safe_open(shard_path, framework="pt") as f:
-                for tensor_name, mx in items:
-                    # Lazy mmap read of this one tensor's bytes
+                shard_keys = set(f.keys())
+                for tensor_name, mx, mode in items:
                     fp_cpu = f.get_tensor(tensor_name)
-                    local_sd = {
-                        "weight": fp_cpu.to(
-                            mx.weight.device, dtype=mx.weight.dtype,
-                        ),
-                    }
-                    # LinearMXInt.load_state_dict re-runs mxint_quantizer
-                    # at self.config["weight_width"] (Stage 2 already set it).
-                    mx.load_state_dict(local_sd, strict=False)
+                    if mode == "fp":
+                        self._cache_quantized_weight(mx)
+                        with torch.no_grad():
+                            mx.weight.data.copy_(
+                                fp_cpu.to(mx.weight.device, dtype=mx.weight.dtype)
+                            )
+                            bias_name = tensor_name[:-len(".weight")] + ".bias"
+                            if getattr(mx, "bias", None) is not None:
+                                bias_cpu = None
+                                if bias_name in shard_keys:
+                                    bias_cpu = f.get_tensor(bias_name)
+                                elif self._shard_map is not None:
+                                    bias_shard = self._shard_map.get(bias_name)
+                                    if bias_shard is not None:
+                                        with safe_open(bias_shard, framework="pt") as bf:
+                                            bias_cpu = bf.get_tensor(bias_name)
+                                if bias_cpu is not None:
+                                    mx.bias.data.copy_(
+                                        bias_cpu.to(mx.bias.device, dtype=mx.bias.dtype)
+                                    )
+                        mx.config["bypass"] = True
+                        if hasattr(mx, "bypass"):
+                            mx.bypass = True
+                        self._fp_weight_active.add(id(mx))
+                    else:
+                        local_sd = {
+                            "weight": fp_cpu.to(
+                                mx.weight.device, dtype=mx.weight.dtype,
+                            ),
+                        }
+                        # LinearMXInt/LinearMXFP.load_state_dict re-runs the
+                        # module's own weight quantizer using Stage 2's config.
+                        mx.load_state_dict(local_sd, strict=False)
 
     def _requant_kv_cache(self, past_key_values, new_phase: str) -> None:
         """In-place fake-quant of existing K/V entries in ``past_key_values``
@@ -647,7 +807,13 @@ class PhaseLayerAutoSwitch:
         ``kv_cache_mxint`` in the forward path
         (``mase/src/chop/nn/quantized/functional/kvcache.py``), so re-quanted
         entries are indistinguishable from entries that would have been
-        produced under the new phase to begin with."""
+        produced under the new phase to begin with.
+
+        Important: this is independent from Linear ``weight_mode='fp'``. FP
+        decode weights do not make existing KV cache entries FP. If prefill
+        already produced quantized KV, this transition only requants that
+        quantized cache to the decode attn config; it cannot reconstruct the
+        original unquantized K/V tensors."""
         from chop.nn.quantizers import mxint_quantizer
 
         # Duck-type HF DynamicCache / StaticCache: both expose key_cache and
@@ -715,6 +881,8 @@ class PhaseLayerAutoSwitch:
             overrides = self.phase_configs.get("prefill", {}).get(info["layer_type"])
             if overrides:
                 _apply_config([(None, m) for m in info["owned_mx"]], overrides)
+        if self._phase_requests_fp_weight("prefill"):
+            self._reload_weights_for_phase("prefill")
 
         return self
 
@@ -726,18 +894,25 @@ class PhaseLayerAutoSwitch:
           - qk_config / av_config / kv_cache_config on every quantized
             attention wrapper
 
-        Does NOT restore Linear weight tensors (they were overwritten
-        during phase-transition re-quant; caller is assumed to be tearing
-        down the model). Does NOT touch past_key_values (caller owns it).
+        Restores any active FP decode weights back to the cached
+        quantized/GPTQ tensors. Does NOT touch past_key_values (caller owns it).
         """
         for h in self._hook_handles:
             h.remove()
         self._hook_handles.clear()
 
+        for _, module in self._all_mx_layers:
+            if id(module) in self._fp_weight_active:
+                self._restore_quantized_weight(module)
+
         for name, module in self._all_mx_layers:
             original = self._original_configs.get(name, {})
+            if "bypass" not in original:
+                module.config.pop("bypass", None)
             for key, value in original.items():
                 module.config[key] = value
+            if hasattr(module, "bypass"):
+                module.bypass = bool(module.config.get("bypass", False))
 
         for name, wrapper in self.attn_wrappers:
             snap = self._original_attn_configs.get(name, {})
@@ -763,9 +938,10 @@ class PhaseLayerAutoSwitch:
                 else:
                     width = cfg.get("data_in_width", "?")
                     bsz   = cfg.get("data_in_block_size", "?")
+                    mode  = _normalize_weight_mode(cfg)
                     lines.append(
                         f"  {phase:10s}  {layer_type:6s}  "
-                        f"MXInt{width}  block_size={bsz}"
+                        f"MXInt{width}  block_size={bsz}  weight={mode}"
                     )
         n_attn = sum(
             1 for info in self._submodule_info.values()

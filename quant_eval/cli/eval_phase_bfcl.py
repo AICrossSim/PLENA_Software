@@ -667,6 +667,7 @@ def main(
     decode_ffn_width:        int = 8,
     decode_attn_block_size:  int = 32,
     decode_ffn_block_size:   int = 32,
+    decode_weight_mode:      str = "quantized",
     # ── Optional keyword overrides ─────────────────────────────────────────
     attn_keywords: Union[list[str], None] = None,
     ffn_keywords:  Union[list[str], None] = None,
@@ -706,6 +707,9 @@ def main(
         decode_ffn_width: Activation bit-width for FFN during decode.
         decode_attn_block_size: MX block size for attention during decode.
         decode_ffn_block_size: MX block size for FFN during decode.
+        decode_weight_mode: ``"quantized"`` keeps current decode behavior;
+            ``"fp"`` loads original checkpoint weights for decode Linear
+            layers and bypasses Linear activation quantization.
         attn_keywords: Module-name substrings that identify attention blocks.
             ``None`` uses the built-in defaults.
         ffn_keywords: Module-name substrings that identify FFN blocks. ``None``
@@ -719,10 +723,20 @@ def main(
         precision table.
     """
     bfcl_test_categories = _normalize_bfcl_categories(bfcl_test_categories)
+    decode_weight_mode = decode_weight_mode.lower()
+    if decode_weight_mode not in ("quantized", "fp"):
+        raise ValueError(
+            "decode_weight_mode must be 'quantized' or 'fp', "
+            f"got {decode_weight_mode!r}."
+        )
 
     # ------------------------------------------------------------------
     # Build the nested phase × layer config
     # ------------------------------------------------------------------
+    decode_weight_policy = {}
+    if decode_weight_mode == "fp":
+        decode_weight_policy = {"weight_mode": "fp", "bypass": True}
+
     phase_configs = {
         "prefill": {
             "attn": {
@@ -738,10 +752,12 @@ def main(
             "attn": {
                 "data_in_width":      decode_attn_width,
                 "data_in_block_size": decode_attn_block_size,
+                **decode_weight_policy,
             },
             "ffn": {
                 "data_in_width":      decode_ffn_width,
                 "data_in_block_size": decode_ffn_block_size,
+                **decode_weight_policy,
             },
         },
     }
@@ -751,8 +767,8 @@ def main(
     # ------------------------------------------------------------------
     _pa = f"MXInt{prefill_attn_width}(bs={prefill_attn_block_size})"
     _pf = f"MXInt{prefill_ffn_width}(bs={prefill_ffn_block_size})"
-    _da = f"MXInt{decode_attn_width}(bs={decode_attn_block_size})"
-    _df = f"MXInt{decode_ffn_width}(bs={decode_ffn_block_size})"
+    _da = f"MXInt{decode_attn_width}(bs={decode_attn_block_size}, W={decode_weight_mode})"
+    _df = f"MXInt{decode_ffn_width}(bs={decode_ffn_block_size}, W={decode_weight_mode})"
 
     print("=" * 64)
     print("BFCL Web Search — Phase × Layer-Type Disaggregated Quantization")
@@ -762,6 +778,7 @@ def main(
         print(f"  BFCL Alias : {bfcl_model_alias}")
     print(f"  Categories : {bfcl_test_categories}")
     print(f"  Weights    : {quant_config}")
+    print(f"  Decode W   : {decode_weight_mode}")
     print(f"  Server     : http://{server_host}:{server_port}")
     print()
     print(f"  {'':10s}  {'attn':>24s}  {'ffn':>24s}")
@@ -842,6 +859,8 @@ def main(
         switch_kwargs["attn_keywords"] = tuple(attn_keywords)
     if ffn_keywords:
         switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
+    if decode_weight_mode == "fp":
+        switch_kwargs["model_name"] = model_name
 
     switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
     switch.enable()
