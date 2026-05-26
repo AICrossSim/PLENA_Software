@@ -1075,8 +1075,12 @@ def main(
     # ------------------------------------------------------------------
     _pa = f"MXInt{prefill_attn_width}(bs={prefill_attn_block_size})"
     _pf = f"MXInt{prefill_ffn_width}(bs={prefill_ffn_block_size})"
-    _da = f"MXInt{decode_attn_width}(bs={decode_attn_block_size}, W={decode_weight_mode})"
-    _df = f"MXInt{decode_ffn_width}(bs={decode_ffn_block_size}, W={decode_weight_mode})"
+    if decode_weight_mode == "fp":
+        _da = "Linear FP/bypass, attn FP/bypass, old KV no-requant"
+        _df = "Linear FP/bypass"
+    else:
+        _da = f"MXInt{decode_attn_width}(bs={decode_attn_block_size}, W=quantized)"
+        _df = f"MXInt{decode_ffn_width}(bs={decode_ffn_block_size}, W=quantized)"
 
     print("=" * 64)
     print("BFCL Web Search — Phase × Layer-Type Disaggregated Quantization")

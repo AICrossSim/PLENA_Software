@@ -88,7 +88,29 @@ def _find_quant_attention_wrappers(model: nn.Module):
     return wrappers
 
 
+_ATTN_CONFIG_ATTRS = (
+    "qk_config",
+    "av_config",
+    "kv_cache_config",
+    "softmax_config",
+    "rope_config",
+)
+_ATTN_BYPASS_ATTRS = (
+    "qk_bypass",
+    "av_bypass",
+    "kv_cache_bypass",
+    "softmax_bypass",
+    "rope_bypass",
+)
+
 _VALID_WEIGHT_MODES = {"quantized", "fp"}
+
+
+def _set_attention_bypass_attrs(wrapper: nn.Module, bypass: bool) -> None:
+    """Synchronise attention wrapper bypass attrs read by forward()."""
+    for attr_name in _ATTN_BYPASS_ATTRS:
+        if hasattr(wrapper, attr_name):
+            setattr(wrapper, attr_name, bool(bypass))
 
 
 def _normalize_weight_mode(overrides: dict | None) -> str:
@@ -416,13 +438,16 @@ class PhaseLayerAutoSwitch:
         # Qwen3AttentionMXInt, ...) by duck-typing. These are mutated on
         # phase transition alongside the LinearMXInt layers.
         self.attn_wrappers = _find_quant_attention_wrappers(model)
-        self._original_attn_configs: dict[str, dict[str, dict]] = {}
+        self._original_attn_configs: dict[str, dict[str, object]] = {}
         for name, wrapper in self.attn_wrappers:
-            snap: dict[str, dict] = {}
-            for attr_name in ("qk_config", "av_config", "kv_cache_config"):
+            snap: dict[str, object] = {"bypass_attrs": {}}
+            for attr_name in _ATTN_CONFIG_ATTRS:
                 target = getattr(wrapper, attr_name, None)
                 if isinstance(target, dict):
                     snap[attr_name] = dict(target)
+            for attr_name in _ATTN_BYPASS_ATTRS:
+                if hasattr(wrapper, attr_name):
+                    snap["bypass_attrs"][attr_name] = bool(getattr(wrapper, attr_name))
             self._original_attn_configs[name] = snap
 
         # Pre-classify every module and collect its owned MX layers.
@@ -623,30 +648,46 @@ class PhaseLayerAutoSwitch:
         Stage 3: load/restore LinearMXInt weights according to weight_mode.
         Stage 4: in-place re-quant of existing K/V cache entries.
 
-        Prefill-only v1 note: ``weight_mode='fp'`` means FP Linear weights
-        plus Linear activation bypass during decode. It does NOT imply FP KV
-        cache. Existing K/V entries are still requanted in Stage 4 according
-        to the decode attention config, and any information lost by prefill
-        KV quantization cannot be recovered by the decode transition.
+        Prefill-only Level 1 note: ``weight_mode='fp'`` means FP Linear
+        weights plus Linear activation bypass during decode. If the decode
+        attention config also sets ``bypass=True``, QK/AV/softmax/rope/new-KV
+        attention paths bypass MX quantization and Stage 4 skips old-KV
+        requant. This still does not reconstruct FP K/V values already lost
+        during a quantized prefill.
         """
         phase_overrides = self.phase_configs.get(new_phase, {})
 
         # ── Stage 1: mutate attention wrapper sub-configs ────────────
-        # Use (phase, "attn") width/block_size as the single source of
-        # truth for qk_matmul, av_matmul, AND kv_cache sub-configs.
+        # Use (phase, "attn") as the single source of truth for QK, AV,
+        # KV-cache, softmax, and rope sub-configs. Width/block size only
+        # matter for MX paths; bypass is mirrored to wrapper attributes because
+        # the attention forward reads qk_bypass/av_bypass/... directly.
         attn_overrides = phase_overrides.get("attn") or {}
         if attn_overrides:
             w  = attn_overrides.get("data_in_width")
             bs = attn_overrides.get("data_in_block_size")
+            bypass = attn_overrides.get("bypass")
             for _, wrapper in self.attn_wrappers:
-                for attr_name in ("qk_config", "av_config", "kv_cache_config"):
+                for attr_name in _ATTN_CONFIG_ATTRS:
                     target = getattr(wrapper, attr_name, None)
                     if not isinstance(target, dict):
                         continue
-                    if w is not None:
+                    if w is not None and attr_name in (
+                        "qk_config",
+                        "av_config",
+                        "kv_cache_config",
+                    ):
                         target["data_in_width"] = w
-                    if bs is not None:
+                    if bs is not None and attr_name in (
+                        "qk_config",
+                        "av_config",
+                        "kv_cache_config",
+                    ):
                         target["data_in_block_size"] = bs
+                    if bypass is not None:
+                        target["bypass"] = bool(bypass)
+                if bypass is not None:
+                    _set_attention_bypass_attrs(wrapper, bool(bypass))
 
         # ── Stage 2: prime LinearMXInt weight_width in config ─────────
         for info in self._submodule_info.values():
@@ -811,9 +852,17 @@ class PhaseLayerAutoSwitch:
 
         Important: this is independent from Linear ``weight_mode='fp'``. FP
         decode weights do not make existing KV cache entries FP. If prefill
-        already produced quantized KV, this transition only requants that
-        quantized cache to the decode attn config; it cannot reconstruct the
-        original unquantized K/V tensors."""
+        already produced quantized KV, this transition can only requant that
+        quantized cache; it cannot reconstruct the original unquantized K/V
+        tensors. With Level 1 decode attention bypass, this function returns
+        early instead: old quantized prefill KV remains as-is, and subsequent
+        decode tokens use the wrapper's ``kv_cache_bypass=True`` path."""
+        attn_overrides = self.phase_configs.get(new_phase, {}).get("attn") or {}
+        if bool(attn_overrides.get("bypass", False)):
+            # Level 1 prefill-only mode: do not re-quant existing KV. This is
+            # not a recovery to FP; already-quantized prefill KV remains lossy.
+            return
+
         from chop.nn.quantizers import mxint_quantizer
 
         # Duck-type HF DynamicCache / StaticCache: both expose key_cache and
@@ -823,7 +872,6 @@ class PhaseLayerAutoSwitch:
         if not isinstance(key_cache, list) or not isinstance(value_cache, list):
             return
 
-        attn_overrides = self.phase_configs.get(new_phase, {}).get("attn") or {}
         w  = attn_overrides.get("data_in_width")
         bs = attn_overrides.get("data_in_block_size")
         if w is None or bs is None:
@@ -891,8 +939,8 @@ class PhaseLayerAutoSwitch:
 
         Restores:
           - LinearMXInt.config on every Linear MX layer
-          - qk_config / av_config / kv_cache_config on every quantized
-            attention wrapper
+          - qk/av/kv-cache/softmax/rope config and bypass attributes on every
+            quantized attention wrapper
 
         Restores any active FP decode weights back to the cached
         quantized/GPTQ tensors. Does NOT touch past_key_values (caller owns it).
@@ -916,12 +964,18 @@ class PhaseLayerAutoSwitch:
 
         for name, wrapper in self.attn_wrappers:
             snap = self._original_attn_configs.get(name, {})
-            for attr_name, original_sub in snap.items():
+            bypass_attrs = snap.get("bypass_attrs", {})
+            for attr_name in _ATTN_CONFIG_ATTRS:
+                original_sub = snap.get(attr_name)
                 target = getattr(wrapper, attr_name, None)
-                if not isinstance(target, dict):
+                if not isinstance(target, dict) or not isinstance(original_sub, dict):
                     continue
                 target.clear()
                 target.update(original_sub)
+            if isinstance(bypass_attrs, dict):
+                for attr_name, original_value in bypass_attrs.items():
+                    if hasattr(wrapper, attr_name):
+                        setattr(wrapper, attr_name, bool(original_value))
 
         self._phase[0] = "prefill"
 
@@ -939,9 +993,11 @@ class PhaseLayerAutoSwitch:
                     width = cfg.get("data_in_width", "?")
                     bsz   = cfg.get("data_in_block_size", "?")
                     mode  = _normalize_weight_mode(cfg)
+                    bypass = bool(cfg.get("bypass", False))
+                    bypass_note = "  bypass" if bypass else ""
                     lines.append(
                         f"  {phase:10s}  {layer_type:6s}  "
-                        f"MXInt{width}  block_size={bsz}  weight={mode}"
+                        f"MXInt{width}  block_size={bsz}  weight={mode}{bypass_note}"
                     )
         n_attn = sum(
             1 for info in self._submodule_info.values()
