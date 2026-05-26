@@ -17,3 +17,6 @@ site/
 !calib/
 calib/*
 !calib/build_bfcl_official_wrapped_llama31.py
+
+# Local BFCL CLI project root/results.
+.bfcl/
