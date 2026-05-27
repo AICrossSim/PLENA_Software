@@ -55,6 +55,8 @@ from quant_eval.utils import (
 )
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.quantize import load_quant_config
+from quant_eval.precision import apply_llama_dse_quant_config, parse_fp_setting, parse_mx_precision, mx_data_config, fp_data_config
+from quant_eval.eval.unified_mx import apply_unified_mx_wrappers
 
 from fastapi import FastAPI, Request
 
@@ -412,7 +414,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute")
             # (<|python_tag|>...<|eom_id|>); strip those before BFCL evaluates.
             if tool_mode == "return":
                 print(f"↩️ Returning completion tool calls at turn {turn + 1}: {[tc['function']['name'] for tc in tool_calls]}")
-                response_text = _normalize_bfcl_return_text(raw_text)
+                response_text = _bfcl_return_text_from_tool_calls(tool_calls)
                 response = {
                     "id":      f"cmpl-{int(time.time()*1000)}",
                     "object":  "text_completion",
@@ -521,6 +523,52 @@ def _normalize_bfcl_return_text(text: str) -> str:
     return normalized or text
 
 
+
+def _bfcl_return_text_from_tool_calls(tool_calls: list) -> str:
+    """Serialize parsed tool calls into BFCL AST-decoder input.
+
+    BFCL non-live categories score the callable payload, not the assistant's
+    surrounding prose. This intentionally preserves the model's function names
+    and argument values exactly as parsed; it only removes transport wrappers
+    such as markdown fences, <tool_call> tags, and Llama special tokens.
+    """
+    payloads = []
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+
+        args = fn.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                # Preserve malformed/non-dict argument payloads rather than
+                # guessing a semantic repair. BFCL should score that failure.
+                pass
+        if not isinstance(args, dict):
+            args = {"value": args}
+
+        payloads.append({"name": name, "parameters": args})
+
+    if len(payloads) == 1:
+        # BFCL's Llama 3.1 handler decodes a single call with eval(), not
+        # json.loads(), so Python literals are required for booleans/None.
+        return repr(payloads[0])
+
+    # For multiple calls the same handler switches to the semicolon path and
+    # json.loads() each segment, so keep standard JSON there.
+    return ";".join(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        for payload in payloads
+    )
+
+
 def _loads_tool_payload(payload: str):
     """Load JSON or Python-literal tool payloads emitted by Llama."""
     try:
@@ -565,6 +613,103 @@ def _append_tool_call(tool_calls: list, parsed: dict) -> None:
     })
 
 
+
+def _parse_bfcl_payload_tool_calls(payload: str) -> list:
+    """Parse BFCL-style callable payload text into OpenAI tool_calls shape.
+
+    Supported payloads are a single JSON/Python dict, a list of dicts, or a
+    semicolon-separated sequence of dict payloads. This parser is deliberately
+    syntax-only: it does not coerce argument values to match BFCL schemas.
+    """
+    payload = (payload or "").strip()
+    if not payload:
+        return []
+
+    if payload[0] not in "[{":
+        return []
+
+    tool_calls = []
+    payloads = [p.strip() for p in payload.split(";") if p.strip()]
+    try:
+        if len(payloads) > 1:
+            for item in payloads:
+                _append_tool_call(tool_calls, _loads_tool_payload(item))
+        else:
+            parsed = _loads_tool_payload(payload)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    _append_tool_call(tool_calls, item)
+            else:
+                _append_tool_call(tool_calls, parsed)
+    except (json.JSONDecodeError, SyntaxError, ValueError):
+        print(f"WARNING: Failed to parse BFCL tool-call payload: {payload[:200]}")
+        return []
+    return tool_calls
+
+
+def _iter_balanced_payloads(text: str):
+    """Yield balanced dict/list substrings embedded in model prose.
+
+    Some Llama outputs are transport-wrapped as plain prose followed by an
+    inline callable JSON object, without markdown fences. BFCL should score
+    the callable payload, not the surrounding prose. This scanner only finds
+    syntactically balanced ``{...}`` or ``[...]`` spans while respecting quoted
+    strings; it does not modify the payload contents.
+    """
+    if not text:
+        return
+
+    open_to_close = {"{": "}", "[": "]"}
+    closers = set(open_to_close.values())
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] not in open_to_close:
+            i += 1
+            continue
+
+        start = i
+        stack = [open_to_close[text[i]]]
+        quote = None
+        escaped = False
+        i += 1
+
+        while i < n and stack:
+            ch = text[i]
+            if quote:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == quote:
+                    quote = None
+            else:
+                if ch in ("'", '"'):
+                    quote = ch
+                elif ch in open_to_close:
+                    stack.append(open_to_close[ch])
+                elif ch in closers:
+                    if ch != stack[-1]:
+                        break
+                    stack.pop()
+            i += 1
+
+        if not stack:
+            yield text[start:i]
+        else:
+            i = start + 1
+
+
+def _parse_embedded_bfcl_payload_tool_calls(text: str) -> list:
+    """Parse callable payloads embedded in prose without semantic repair."""
+    tool_calls = []
+    for candidate in _iter_balanced_payloads(text):
+        candidate_calls = _parse_bfcl_payload_tool_calls(candidate)
+        if candidate_calls:
+            tool_calls.extend(candidate_calls)
+    return tool_calls
+
+
 def _parse_tool_calls(text: str) -> tuple[list | None, str]:
     """
     Attempt to extract OpenAI-format tool_calls from model output.
@@ -602,25 +747,20 @@ def _parse_tool_calls(text: str) -> tuple[list | None, str]:
 
     # Llama 3.1 function-calling output uses <|python_tag|> followed by one
     # JSON object, a list of JSON objects, or semicolon-separated JSON objects.
+    # Also try raw JSON payloads without transport tokens so completion-mode
+    # output is normalized through the same BFCL serialization path.
     llama_payload = _normalize_bfcl_return_text(text)
-    if llama_payload != text.strip():
-        tool_calls = []
-        payloads = [p.strip() for p in llama_payload.split(";") if p.strip()]
-        try:
-            if len(payloads) > 1:
-                for payload in payloads:
-                    _append_tool_call(tool_calls, _loads_tool_payload(payload))
-            else:
-                parsed = _loads_tool_payload(llama_payload)
-                if isinstance(parsed, list):
-                    for item in parsed:
-                        _append_tool_call(tool_calls, item)
-                else:
-                    _append_tool_call(tool_calls, parsed)
-        except (json.JSONDecodeError, SyntaxError, ValueError):
-            print(f"WARNING: Failed to parse Llama tool-call JSON: {llama_payload[:200]}")
-        if tool_calls:
-            return tool_calls, ""
+    tool_calls = _parse_bfcl_payload_tool_calls(llama_payload)
+    if tool_calls:
+        return tool_calls, ""
+
+    # Finally, handle prose + inline callable payloads, e.g.
+    # "Here is the JSON:\n\n{\"name\": ..., \"parameters\": ...}".
+    # This remains syntax-only and does not turn arbitrary code/prose into
+    # function calls.
+    tool_calls = _parse_embedded_bfcl_payload_tool_calls(llama_payload)
+    if tool_calls:
+        return tool_calls, ""
 
     return None, text
 
@@ -742,6 +882,48 @@ def _normalize_gptq_dataset(dataset: str) -> str:
     if dataset.startswith(("file:", "hf:", "jsonl:", "txt:", "lm_eval:")):
         return dataset
     return "file:" + dataset
+
+
+def _normalize_device_id(device_id: str) -> str:
+    """Normalize CLI shorthand like ``0`` to a torch device string."""
+    device_id = str(device_id).strip()
+    if device_id.isdigit():
+        return f"cuda:{device_id}"
+    return device_id
+
+
+def _mark_gptq_projection_configs(pass_args: dict) -> int:
+    """Tell module replacement not to PTQ weights already handled by GPTQ.
+
+    Chop's GPTQ pass writes optimized weights back into the original nn.Linear
+    modules before regex replacement.  LinearMXInt/LinearMXFP will quantize
+    weights again during replacement unless their config has ``gptq=True``.
+    Mark every weight-quantized Linear config so GPTQ remains the only weight
+    quantizer; activation quantization still runs normally in forward().
+    """
+    marked = 0
+    for key, entry in pass_args.items():
+        if key in {"by", "gptq", "token_collector", "rotation_search"}:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        cfg = entry.get("config")
+        if not isinstance(cfg, dict):
+            cfg = entry
+        is_mx_linear_config = cfg.get("name") in {"mxint", "mxfp"}
+        has_weight_quant = any(
+            k in cfg
+            for k in (
+                "weight_width",
+                "weight_exponent_width",
+                "weight_frac_width",
+                "weight_block_size",
+            )
+        )
+        if is_mx_linear_config and has_weight_quant:
+            cfg["gptq"] = True
+            marked += 1
+    return marked
 
 
 def _inject_gptq_config(
@@ -950,17 +1132,26 @@ def main(
     gptq_weight_block_size:int = 32,
     gptq_cali_batch_size:  int = 1,
     gptq_max_layers:       int | None = None,
-    # ── Activation precision: prefill ──────────────────────────────────────
+    # ── Legacy width controls; overridden by precision tokens below ───────
     prefill_attn_width:      int = 4,
     prefill_ffn_width:       int = 4,
     prefill_attn_block_size: int = 32,
     prefill_ffn_block_size:  int = 32,
-    # ── Activation precision: decode ───────────────────────────────────────
     decode_attn_width:       int = 8,
     decode_ffn_width:        int = 8,
     decode_attn_block_size:  int = 32,
     decode_ffn_block_size:   int = 32,
-    decode_weight_mode:      str = "quantized",
+    # ── Codesign-style precision controls ──────────────────────────────────
+    act_element_width_prefill: str | None = None,
+    act_element_width_decode:  str | None = None,
+    kv_element_width_prefill:  str | None = None,
+    kv_element_width_decode:   str | None = None,
+    fp_setting_prefill:        str | None = None,
+    fp_setting_decode:         str | None = None,
+    dse_mx_block_size:         int = 16,
+    dse_weight_precision:      str | None = None,
+    dse_weight_block_size:     int | None = None,
+    decode_weight_mode:        str = "quantized",
     # ── Optional keyword overrides ─────────────────────────────────────────
     attn_keywords: Union[list[str], None] = None,
     ffn_keywords:  Union[list[str], None] = None,
@@ -981,7 +1172,8 @@ def main(
             (e.g. ``Qwen/Qwen3-8B-FC``).
         device_id: CUDA device string.
         dtype: Model dtype — ``"float16"``, ``"bfloat16"``, or ``"float32"``.
-        quant_config: Path to a TOML quantization recipe.
+        quant_config: Path to a TOML quantization recipe. Use ``"none"``
+            for a true FP baseline that skips quantization and phase switching.
         model_parallel: Distribute across GPUs with ``device_map="auto"``.
         bfcl_test_categories: BFCL category names to evaluate (e.g.
             ``["web_search_base", "web_search_no_snippet"]``). ``None`` uses
@@ -1006,14 +1198,16 @@ def main(
         gptq_weight_block_size: GPTQ quantized weight block size.
         gptq_cali_batch_size: GPTQ calibration batch size.
         gptq_max_layers: Optional layer cap for quick smoke tests.
-        prefill_attn_width: Activation bit-width for attention during prefill.
-        prefill_ffn_width: Activation bit-width for FFN during prefill.
-        prefill_attn_block_size: MX block size for attention during prefill.
-        prefill_ffn_block_size: MX block size for FFN during prefill.
-        decode_attn_width: Activation bit-width for attention during decode.
-        decode_ffn_width: Activation bit-width for FFN during decode.
-        decode_attn_block_size: MX block size for attention during decode.
-        decode_ffn_block_size: MX block size for FFN during decode.
+        prefill_attn_width/prefill_ffn_width/decode_attn_width/decode_ffn_width:
+            Legacy MXInt width controls. These are ignored for any phase where
+            codesign-style precision tokens are provided.
+        act_element_width_prefill/act_element_width_decode: Codesign ACT precision
+            tokens, e.g. ``MXINT_4`` or ``MXFP_E4M3``.
+        kv_element_width_prefill/kv_element_width_decode: Codesign KV precision
+            tokens.
+        fp_setting_prefill/fp_setting_decode: Codesign nonlinear minifloat
+            tokens for RoPE/softmax/SiLU/RMSNorm, e.g. ``FP_E3M2``.
+        dse_mx_block_size: MX block size used by codesign-style precision tokens.
         decode_weight_mode: ``"quantized"`` keeps current decode behavior;
             ``"fp"`` loads original checkpoint weights for decode Linear
             layers and bypasses Linear activation quantization.
@@ -1037,50 +1231,181 @@ def main(
             "decode_weight_mode must be 'quantized' or 'fp', "
             f"got {decode_weight_mode!r}."
         )
+    device_id = _normalize_device_id(device_id)
+    quant_config_is_none = quant_config is None or str(quant_config).strip().lower() in {"", "none", "fp", "false"}
+    if quant_config_is_none:
+        quant_config = "none"
+        quant_related = {
+            "gptq_dataset": gptq_dataset,
+            "act_element_width_prefill": act_element_width_prefill,
+            "act_element_width_decode": act_element_width_decode,
+            "kv_element_width_prefill": kv_element_width_prefill,
+            "kv_element_width_decode": kv_element_width_decode,
+            "fp_setting_prefill": fp_setting_prefill,
+            "fp_setting_decode": fp_setting_decode,
+            "dse_weight_precision": dse_weight_precision,
+        }
+        active_quant_related = [name for name, value in quant_related.items() if value is not None]
+        if active_quant_related:
+            raise ValueError(
+                "--quant_config none requests a true FP baseline, but quantization "
+                f"options were also provided: {active_quant_related}."
+            )
+        if decode_weight_mode != "quantized":
+            raise ValueError(
+                "--decode_weight_mode is only meaningful for quantized runs; "
+                "use the default with --quant_config none."
+            )
 
     # ------------------------------------------------------------------
-    # Build the nested phase × layer config
+    # Build the nested phase × layer/nonlinear config
     # ------------------------------------------------------------------
     decode_weight_policy = {}
     if decode_weight_mode == "fp":
         decode_weight_policy = {"weight_mode": "fp", "bypass": True}
 
+    def _legacy_mx_config(width: int, block_size: int) -> dict:
+        return {"data_in_width": width, "data_in_block_size": block_size}
+
+    def _resolve_phase_precision(phase: str) -> dict:
+        if phase == "prefill":
+            act = act_element_width_prefill
+            kv = kv_element_width_prefill
+            fp = fp_setting_prefill
+            legacy_attn = _legacy_mx_config(prefill_attn_width, prefill_attn_block_size)
+            legacy_ffn = _legacy_mx_config(prefill_ffn_width, prefill_ffn_block_size)
+        else:
+            act = act_element_width_decode
+            kv = kv_element_width_decode
+            fp = fp_setting_decode
+            legacy_attn = _legacy_mx_config(decode_attn_width, decode_attn_block_size)
+            legacy_ffn = _legacy_mx_config(decode_ffn_width, decode_ffn_block_size)
+
+        provided = {"ACT_ELEMENT_WIDTH": act, "KV_ELEMENT_WIDTH": kv, "FP_SETTING": fp}
+        if any(v is not None for v in provided.values()) and not all(v is not None for v in provided.values()):
+            missing = [name for name, value in provided.items() if value is None]
+            raise ValueError(
+                f"{phase} DSE precision requires ACT_ELEMENT_WIDTH, "
+                f"KV_ELEMENT_WIDTH, and FP_SETTING together; missing {missing}."
+            )
+
+        if act is None and kv is None and fp is None:
+            return {
+                "attn": dict(legacy_attn),
+                "ffn": dict(legacy_ffn),
+                "mlp": {},
+                "rms_norm": {},
+                "display": f"MXInt{legacy_attn['data_in_width']}(bs={legacy_attn['data_in_block_size']})",
+                "ffn_display": f"MXInt{legacy_ffn['data_in_width']}(bs={legacy_ffn['data_in_block_size']})",
+                "metadata": {
+                    "ACT_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
+                    "KV_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
+                    "FP_SETTING": None,
+                },
+            }
+
+        act_spec = parse_mx_precision(act or "MXINT_4")
+        kv_spec = parse_mx_precision(kv or act_spec.canonical)
+        fp_spec = parse_fp_setting(fp or "FP_E3M2")
+        act_cfg = mx_data_config(act_spec, dse_mx_block_size)
+        kv_cfg = mx_data_config(kv_spec, dse_mx_block_size)
+        fp_cfg = fp_data_config(fp_spec)
+        attn_cfg = {**act_cfg, "kv_cache": dict(kv_cfg), "softmax": dict(fp_cfg), "rope": dict(fp_cfg)}
+        ffn_cfg = dict(act_cfg)
+        mlp_cfg = dict(fp_cfg)
+        rms_cfg = {
+            **fp_cfg,
+            "weight_exponent_width": fp_spec.exp,
+            "weight_frac_width": fp_spec.frac,
+            "weight_is_finite": True,
+            "weight_round_mode": "rn",
+        }
+        return {
+            "attn": attn_cfg,
+            "ffn": ffn_cfg,
+            "mlp": mlp_cfg,
+            "rms_norm": rms_cfg,
+            "display": f"{act_spec.canonical}/KV={kv_spec.canonical}/NL={fp_spec.canonical}(B{dse_mx_block_size})",
+            "ffn_display": f"{act_spec.canonical}/NL={fp_spec.canonical}(B{dse_mx_block_size})",
+            "metadata": {
+                "ACT_ELEMENT_WIDTH": act_spec.canonical,
+                "KV_ELEMENT_WIDTH": kv_spec.canonical,
+                "FP_SETTING": fp_spec.canonical,
+            },
+        }
+
+    _prefill_precision = _resolve_phase_precision("prefill")
+    _decode_precision = _resolve_phase_precision("decode")
+
+    def _resolve_dse_weight_precision() -> tuple[str, int | None]:
+        # ACT/KV/FP_SETTING DSE should not silently lower projection weight
+        # precision. If GPTQ is enabled, keep the module-replacement weight
+        # config aligned with the GPTQ CLI weight format so non-GPTQ layers in
+        # max_layers smoke runs are not accidentally PTQ'd to INT4.
+        if dse_weight_precision is not None:
+            return dse_weight_precision, dse_weight_block_size
+        if gptq_dataset is not None:
+            if gptq_format.lower() != "mxint":
+                raise ValueError(
+                    "dse_weight_precision must be set explicitly when "
+                    f"gptq_format={gptq_format!r}; only mxint can be inferred "
+                    "from gptq_weight_width."
+                )
+            return f"MXINT_{gptq_weight_width}", (
+                dse_weight_block_size if dse_weight_block_size is not None else gptq_weight_block_size
+            )
+        return "MXINT_8", dse_weight_block_size
+
+    _resolved_dse_weight_precision, _resolved_dse_weight_block_size = _resolve_dse_weight_precision()
+
+    decode_nonlinear_policy = {"bypass": True} if decode_weight_mode == "fp" else {}
     phase_configs = {
         "prefill": {
-            "attn": {
-                "data_in_width":      prefill_attn_width,
-                "data_in_block_size": prefill_attn_block_size,
-            },
-            "ffn": {
-                "data_in_width":      prefill_ffn_width,
-                "data_in_block_size": prefill_ffn_block_size,
-            },
+            "attn": _prefill_precision["attn"],
+            "ffn": _prefill_precision["ffn"],
+            "mlp": _prefill_precision["mlp"],
+            "rms_norm": _prefill_precision["rms_norm"],
         },
         "decode": {
-            "attn": {
-                "data_in_width":      decode_attn_width,
-                "data_in_block_size": decode_attn_block_size,
-                **decode_weight_policy,
-            },
-            "ffn": {
-                "data_in_width":      decode_ffn_width,
-                "data_in_block_size": decode_ffn_block_size,
-                **decode_weight_policy,
-            },
+            "attn": {**_decode_precision["attn"], **decode_weight_policy},
+            "ffn": {**_decode_precision["ffn"], **decode_weight_policy},
+            "mlp": {**_decode_precision["mlp"], **decode_nonlinear_policy},
+            "rms_norm": {**_decode_precision["rms_norm"], **decode_nonlinear_policy},
         },
     }
+    precision_metadata = {
+        "prefill": _prefill_precision["metadata"],
+        "decode": _decode_precision["metadata"],
+        "dse_mx_block_size": dse_mx_block_size,
+        "dse_weight_precision": _resolved_dse_weight_precision,
+        "dse_weight_block_size": _resolved_dse_weight_block_size,
+    }
+
+    _codesign_tokens_enabled = any(v is not None for v in (
+        act_element_width_prefill, act_element_width_decode,
+        kv_element_width_prefill, kv_element_width_decode,
+        fp_setting_prefill, fp_setting_decode,
+    ))
+    if _codesign_tokens_enabled:
+        # Parsing above is the validation. Mixed ACT/KV and prefill/decode MX
+        # families are supported by quant_eval's unified MX wrappers, which are
+        # installed immediately after the Chop quantization pass.
+        parse_mx_precision(precision_metadata["prefill"]["ACT_ELEMENT_WIDTH"])
+        parse_mx_precision(precision_metadata["prefill"]["KV_ELEMENT_WIDTH"])
+        parse_mx_precision(precision_metadata["decode"]["ACT_ELEMENT_WIDTH"])
+        parse_mx_precision(precision_metadata["decode"]["KV_ELEMENT_WIDTH"])
 
     # ------------------------------------------------------------------
     # Print header
     # ------------------------------------------------------------------
-    _pa = f"MXInt{prefill_attn_width}(bs={prefill_attn_block_size})"
-    _pf = f"MXInt{prefill_ffn_width}(bs={prefill_ffn_block_size})"
+    _pa = _prefill_precision["display"]
+    _pf = _prefill_precision["ffn_display"]
     if decode_weight_mode == "fp":
         _da = "Linear FP/bypass, attn FP/bypass, old KV no-requant"
         _df = "Linear FP/bypass"
     else:
-        _da = f"MXInt{decode_attn_width}(bs={decode_attn_block_size}, W=quantized)"
-        _df = f"MXInt{decode_ffn_width}(bs={decode_ffn_block_size}, W=quantized)"
+        _da = f"{_decode_precision['display']}, W=quantized"
+        _df = f"{_decode_precision['ffn_display']}, W=quantized"
 
     print("=" * 64)
     print("BFCL Web Search — Phase × Layer-Type Disaggregated Quantization")
@@ -1090,7 +1415,7 @@ def main(
         print(f"  BFCL Alias : {bfcl_model_alias}")
     print(f"  Categories : {bfcl_test_categories}")
     print(f"  Tool mode  : {bfcl_tool_mode}")
-    print(f"  Weights    : {quant_config}")
+    print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     print(f"  Decode W   : {decode_weight_mode}")
     if gptq_dataset:
         print(f"  GPTQ       : dataset={gptq_dataset}, nsamples={gptq_nsamples}, seqlen={gptq_seqlen}, max_layers={gptq_max_layers}")
@@ -1100,7 +1425,7 @@ def main(
     print(f"  {'prefill':10s}  {_pa:>24s}  {_pf:>24s}")
     print(f"  {'decode':10s}  {_da:>24s}  {_df:>24s}")
     print("=" * 64)
-    logger.info("Model Parallel", model_parallel)
+    logger.info("Model Parallel: %s", model_parallel)
 
     # ------------------------------------------------------------------
     # Resolve output directories (persistent if log_dir given)
@@ -1121,7 +1446,8 @@ def main(
         score_dir.mkdir(parents=True)
         save_args(log_dir, locals().copy())
         import shutil
-        shutil.copy(quant_config, log_dir / "quant_config.toml")
+        if not quant_config_is_none:
+            shutil.copy(quant_config, log_dir / "quant_config.toml")
 
     transformers.set_seed(0)
 
@@ -1146,60 +1472,88 @@ def main(
     # ------------------------------------------------------------------
     # Weight quantization
     # ------------------------------------------------------------------
-    from chop.passes.module.transforms import quantize_module_transform_pass
-
-    pass_args = load_quant_config(quant_config)
-    resolved_gptq_config = _inject_gptq_config(
-        pass_args,
-        model_name=model_name,
-        device_id=device_id,
-        dataset=gptq_dataset,
-        nsamples=gptq_nsamples,
-        seqlen=gptq_seqlen,
-        fmt=gptq_format,
-        weight_width=gptq_weight_width,
-        weight_block_size=gptq_weight_block_size,
-        cali_batch_size=gptq_cali_batch_size,
-        max_layers=gptq_max_layers,
-    )
-    if resolved_gptq_config:
-        logger.info(
-            "GPTQ enabled: dataset=%s nsamples=%s seqlen=%s format=%s max_layers=%s",
-            resolved_gptq_config.get("dataset"),
-            resolved_gptq_config.get("nsamples"),
-            resolved_gptq_config.get("seqlen"),
-            resolved_gptq_config.get("format"),
-            resolved_gptq_config.get("max_layers"),
-        )
-
-    n_linear = sum(
-        1 for _, m in model.named_modules()
-        if isinstance(m, torch.nn.Linear)
-    )
-    logger.info("Quantizing %d linear layers...", n_linear)
-    t0 = time.time()
-    model, _ = quantize_module_transform_pass(model, pass_args)
-    logger.info("Quantization complete in %.1fs", time.time() - t0)
-
-    if model_parallel:
-        model = move_to_gpu(model, model_parallel)
+    resolved_gptq_config = None
+    if quant_config_is_none:
+        logger.info("True FP baseline requested: skipping quantize_module_transform_pass and phase switching.")
+        if model_parallel:
+            model = move_to_gpu(model, model_parallel)
+        else:
+            model.to(device_id)
+        switch = None
     else:
-        model.to(device_id)
+        from chop.passes.module.transforms import quantize_module_transform_pass
 
-    # ------------------------------------------------------------------
-    # Enable disaggregated quantization hook
-    # ------------------------------------------------------------------
-    switch_kwargs = {}
-    if attn_keywords:
-        switch_kwargs["attn_keywords"] = tuple(attn_keywords)
-    if ffn_keywords:
-        switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
-    if decode_weight_mode == "fp":
-        switch_kwargs["model_name"] = model_name
+        pass_args = load_quant_config(quant_config)
+        if _codesign_tokens_enabled:
+            apply_llama_dse_quant_config(
+                pass_args,
+                act_precision=precision_metadata["prefill"]["ACT_ELEMENT_WIDTH"],
+                kv_precision=precision_metadata["prefill"]["KV_ELEMENT_WIDTH"],
+                fp_setting=precision_metadata["prefill"]["FP_SETTING"],
+                mx_block_size=dse_mx_block_size,
+                weight_precision=_resolved_dse_weight_precision,
+                weight_block_size=_resolved_dse_weight_block_size,
+            )
+        resolved_gptq_config = _inject_gptq_config(
+            pass_args,
+            model_name=model_name,
+            device_id=device_id,
+            dataset=gptq_dataset,
+            nsamples=gptq_nsamples,
+            seqlen=gptq_seqlen,
+            fmt=gptq_format,
+            weight_width=gptq_weight_width,
+            weight_block_size=gptq_weight_block_size,
+            cali_batch_size=gptq_cali_batch_size,
+            max_layers=gptq_max_layers,
+        )
+        if resolved_gptq_config:
+            marked_gptq_configs = _mark_gptq_projection_configs(pass_args)
+            logger.info(
+                "GPTQ enabled: dataset=%s nsamples=%s seqlen=%s format=%s max_layers=%s marked_weight_configs=%s",
+                resolved_gptq_config.get("dataset"),
+                resolved_gptq_config.get("nsamples"),
+                resolved_gptq_config.get("seqlen"),
+                resolved_gptq_config.get("format"),
+                resolved_gptq_config.get("max_layers"),
+                marked_gptq_configs,
+            )
 
-    switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
-    switch.enable()
-    logger.info("\n%s", switch.summary())
+        n_linear = sum(
+            1 for _, m in model.named_modules()
+            if isinstance(m, torch.nn.Linear)
+        )
+        logger.info("Quantizing %d linear layers...", n_linear)
+        t0 = time.time()
+        model, _ = quantize_module_transform_pass(model, pass_args)
+        if _codesign_tokens_enabled:
+            unified_counts = apply_unified_mx_wrappers(model)
+            logger.info(
+                "Installed unified MX wrappers: %d Linear, %d LlamaAttention",
+                unified_counts.get("linear", 0),
+                unified_counts.get("attention", 0),
+            )
+        logger.info("Quantization complete in %.1fs", time.time() - t0)
+
+        if model_parallel:
+            model = move_to_gpu(model, model_parallel)
+        else:
+            model.to(device_id)
+
+        # ------------------------------------------------------------------
+        # Enable disaggregated quantization hook
+        # ------------------------------------------------------------------
+        switch_kwargs = {}
+        if attn_keywords:
+            switch_kwargs["attn_keywords"] = tuple(attn_keywords)
+        if ffn_keywords:
+            switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
+        if decode_weight_mode == "fp":
+            switch_kwargs["model_name"] = model_name
+
+        switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
+        switch.enable()
+        logger.info("\n%s", switch.summary())
 
     # ------------------------------------------------------------------
     # Start the OpenAI-compatible server (hook fires on every request)
@@ -1239,7 +1593,8 @@ def main(
         partial_eval    = limit is not None,
     )
 
-    switch.disable()
+    if switch is not None:
+        switch.disable()
 
     # ------------------------------------------------------------------
     # Print results
@@ -1275,6 +1630,7 @@ def main(
     scores["bfcl_categories"] = bfcl_test_categories
     scores["bfcl_tool_mode"] = bfcl_tool_mode
     scores["decode_weight_mode"] = decode_weight_mode
+    scores["precision_metadata"] = precision_metadata
     if resolved_gptq_config:
         scores["gptq"] = {
             "dataset": resolved_gptq_config.get("dataset"),

@@ -20,3 +20,6 @@ calib/*
 
 # Local BFCL CLI project root/results.
 .bfcl/
+# Experiment outputs.
+runs/
+

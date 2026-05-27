@@ -46,6 +46,9 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+from functools import partial
+
+from chop.nn.quantizers._minifloat_mx import MinifloatMeta, minifloat_quantizer_sim
 
 
 # ---------------------------------------------------------------------------
@@ -53,12 +56,13 @@ from torch import nn
 # ---------------------------------------------------------------------------
 
 def _find_mx_layers(model: nn.Module):
-    """Return (name, module) for every LinearMXInt / LinearMXFP in the model."""
+    """Return (name, module) for every Linear MX wrapper in the model."""
     from chop.nn.quantized.modules.linear import LinearMXInt, LinearMXFP
+    from quant_eval.eval.unified_mx import LinearMXUnified
 
     layers = []
     for name, module in model.named_modules():
-        if isinstance(module, (LinearMXInt, LinearMXFP)):
+        if isinstance(module, (LinearMXInt, LinearMXFP, LinearMXUnified)):
             layers.append((name, module))
     return layers
 
@@ -133,16 +137,23 @@ def _apply_module_config(module: nn.Module, overrides: dict) -> None:
     ``bypass`` is both a config value and a module attribute read directly by
     LinearMXInt.forward(), so keep them in sync.
     """
+    desired_bypass = bool(overrides.get("bypass", False))
+    module.config["bypass"] = desired_bypass
+    if hasattr(module, "bypass"):
+        module.bypass = desired_bypass
+
+    if "data_in_width" in overrides:
+        module.config.pop("data_in_exponent_width", None)
+        module.config.pop("data_in_frac_width", None)
+    if "data_in_exponent_width" in overrides or "data_in_frac_width" in overrides:
+        module.config.pop("data_in_width", None)
+
     for key, value in overrides.items():
-        if key == "weight_mode":
+        if key in ("weight_mode", "kv_cache", "softmax", "rope"):
             continue
         if key == "bypass":
-            module.config["bypass"] = bool(value)
-            if hasattr(module, "bypass"):
-                module.bypass = bool(value)
             continue
-        if key in module.config:
-            module.config[key] = value
+        module.config[key] = value
 
 
 def _apply_config(mx_layers: list, overrides: dict) -> None:
@@ -166,6 +177,80 @@ def set_phase(model: nn.Module, phase_configs: dict, phase: str) -> None:
     overrides = phase_configs.get(phase, {})
     _apply_config(mx_layers, overrides)
 
+
+
+
+# ---------------------------------------------------------------------------
+# Quantized nonlinear wrapper support
+# ---------------------------------------------------------------------------
+
+def _find_quant_mlp_wrappers(model: nn.Module):
+    """Return Llama/Qwen MLP wrappers with minifloat SiLU q_config."""
+    wrappers = []
+    for name, module in model.named_modules():
+        if hasattr(module, "q_config") and module.__class__.__name__.endswith(("MLPMXInt", "MLPMXFP")):
+            wrappers.append((name, module))
+    return wrappers
+
+
+def _find_minifloat_rmsnorm_wrappers(model: nn.Module):
+    """Return Llama/Qwen RMSNorm minifloat wrappers."""
+    wrappers = []
+    for name, module in model.named_modules():
+        if hasattr(module, "q_config") and module.__class__.__name__.endswith("RMSNormMinifloat"):
+            wrappers.append((name, module))
+    return wrappers
+
+
+def _rebuild_rmsnorm_minifloat_quantizers(module: nn.Module) -> None:
+    """Recreate RMSNorm minifloat quantizer closures after q_config changes.
+
+    LlamaRMSNormMinifloat builds x_quantizer/w_quantizer in __init__, so phase
+    switching cannot just mutate q_config.  This mirrors that init logic.
+    """
+    cfg = getattr(module, "q_config", {}) or {}
+    module.bypass = bool(cfg.get("bypass", False))
+    module.weight_bypass = bool(cfg.get("weight_bypass", False))
+    module.data_in_bypass = bool(cfg.get("data_in_bypass", False))
+
+    if not module.bypass and not module.weight_bypass:
+        module.w_quantizer = partial(
+            minifloat_quantizer_sim,
+            minifloat_meta=MinifloatMeta(
+                exp_bits=cfg["weight_exponent_width"],
+                frac_bits=cfg["weight_frac_width"],
+                is_finite=cfg.get("weight_is_finite", True),
+                round_mode=cfg.get("weight_round_mode", "rn"),
+            ),
+        )
+    else:
+        module.w_quantizer = None
+
+    if not module.bypass and not module.data_in_bypass:
+        module.x_quantizer = partial(
+            minifloat_quantizer_sim,
+            minifloat_meta=MinifloatMeta(
+                exp_bits=cfg["data_in_exponent_width"],
+                frac_bits=cfg["data_in_frac_width"],
+                is_finite=cfg.get("data_in_is_finite", True),
+                round_mode=cfg.get("data_in_round_mode", "rn"),
+            ),
+        )
+    else:
+        module.x_quantizer = None
+
+
+def _apply_nonlinear_config(module: nn.Module, overrides: dict) -> None:
+    if not overrides:
+        return
+    if not hasattr(module, "q_config"):
+        return
+    module.q_config.pop("bypass", None)
+    module.q_config.update({k: v for k, v in overrides.items() if k != "weight_mode"})
+    if hasattr(module, "bypass"):
+        module.bypass = bool(module.q_config.get("bypass", False))
+    if module.__class__.__name__.endswith("RMSNormMinifloat"):
+        _rebuild_rmsnorm_minifloat_quantizers(module)
 
 # ---------------------------------------------------------------------------
 # Layer-type classification helpers
@@ -434,10 +519,11 @@ class PhaseLayerAutoSwitch:
             id(module): name for name, module in self._all_mx_layers
         }
 
-        # Collect quantized attention wrappers (Glm4MoeAttentionMXInt,
-        # Qwen3AttentionMXInt, ...) by duck-typing. These are mutated on
-        # phase transition alongside the LinearMXInt layers.
+        # Collect quantized attention/nonlinear wrappers by duck-typing.
+        # These are mutated on phase transition alongside the LinearMX layers.
         self.attn_wrappers = _find_quant_attention_wrappers(model)
+        self.mlp_wrappers = _find_quant_mlp_wrappers(model)
+        self.rmsnorm_wrappers = _find_minifloat_rmsnorm_wrappers(model)
         self._original_attn_configs: dict[str, dict[str, object]] = {}
         for name, wrapper in self.attn_wrappers:
             snap: dict[str, object] = {"bypass_attrs": {}}
@@ -449,6 +535,15 @@ class PhaseLayerAutoSwitch:
                 if hasattr(wrapper, attr_name):
                     snap["bypass_attrs"][attr_name] = bool(getattr(wrapper, attr_name))
             self._original_attn_configs[name] = snap
+
+        self._original_mlp_configs: dict[str, dict] = {
+            name: dict(getattr(module, "q_config", {}) or {})
+            for name, module in self.mlp_wrappers
+        }
+        self._original_rmsnorm_configs: dict[str, dict] = {
+            name: dict(getattr(module, "q_config", {}) or {})
+            for name, module in self.rmsnorm_wrappers
+        }
 
         # Pre-classify every module and collect its owned MX layers.
         # "Owned" = the MX layers that are direct or nested children of
@@ -664,44 +759,60 @@ class PhaseLayerAutoSwitch:
         # the attention forward reads qk_bypass/av_bypass/... directly.
         attn_overrides = phase_overrides.get("attn") or {}
         if attn_overrides:
-            w  = attn_overrides.get("data_in_width")
-            bs = attn_overrides.get("data_in_block_size")
             bypass = attn_overrides.get("bypass")
             for _, wrapper in self.attn_wrappers:
                 for attr_name in _ATTN_CONFIG_ATTRS:
                     target = getattr(wrapper, attr_name, None)
                     if not isinstance(target, dict):
                         continue
-                    if w is not None and attr_name in (
-                        "qk_config",
-                        "av_config",
-                        "kv_cache_config",
-                    ):
-                        target["data_in_width"] = w
-                    if bs is not None and attr_name in (
-                        "qk_config",
-                        "av_config",
-                        "kv_cache_config",
-                    ):
-                        target["data_in_block_size"] = bs
+                    if attr_name in ("qk_config", "av_config"):
+                        target.clear()
+                        for key, value in attn_overrides.items():
+                            if key in ("kv_cache", "softmax", "rope", "weight_mode"):
+                                continue
+                            target[key] = value
+                    elif attr_name == "kv_cache_config":
+                        sub_cfg = attn_overrides.get("kv_cache", {})
+                        if sub_cfg:
+                            target.clear()
+                            target.update(sub_cfg)
+                    elif attr_name == "softmax_config":
+                        sub_cfg = attn_overrides.get("softmax", {})
+                        if sub_cfg:
+                            target.clear()
+                            target.update(sub_cfg)
+                    elif attr_name == "rope_config":
+                        sub_cfg = attn_overrides.get("rope", {})
+                        if sub_cfg:
+                            target.clear()
+                            target.update(sub_cfg)
                     if bypass is not None:
                         target["bypass"] = bool(bypass)
-                if bypass is not None:
-                    _set_attention_bypass_attrs(wrapper, bool(bypass))
+                _set_attention_bypass_attrs(wrapper, bool(bypass) if bypass is not None else False)
+
+        mlp_overrides = phase_overrides.get("mlp") or {}
+        if mlp_overrides:
+            for _, wrapper in self.mlp_wrappers:
+                _apply_nonlinear_config(wrapper, mlp_overrides)
+
+        rms_overrides = phase_overrides.get("rms_norm") or {}
+        if rms_overrides:
+            for _, wrapper in self.rmsnorm_wrappers:
+                _apply_nonlinear_config(wrapper, rms_overrides)
 
         # ── Stage 2: prime LinearMXInt weight_width in config ─────────
         for info in self._submodule_info.values():
             lt_overrides = phase_overrides.get(info["layer_type"]) or {}
             if _normalize_weight_mode(lt_overrides) == "fp":
                 continue
-            w  = lt_overrides.get("data_in_width")
-            bs = lt_overrides.get("data_in_block_size")
-            if w is None:
+            weight_keys = {
+                "weight_width", "weight_exponent_width", "weight_frac_width", "weight_block_size"
+            }
+            explicit_weight_overrides = {k: v for k, v in lt_overrides.items() if k in weight_keys}
+            if not explicit_weight_overrides:
                 continue
             for mx in info["owned_mx"]:
-                mx.config["weight_width"] = w
-                if bs is not None:
-                    mx.config["weight_block_size"] = bs
+                mx.config.update(explicit_weight_overrides)
 
         # ── Stage 3: disk-backed weight reload / restore ──────────────
         if self._shard_map is not None or self._fp_weight_active:
@@ -773,7 +884,10 @@ class PhaseLayerAutoSwitch:
         for info in self._submodule_info.values():
             lt_overrides = phase_overrides.get(info["layer_type"]) or {}
             mode = _normalize_weight_mode(lt_overrides)
-            needs_weight = mode == "fp" or "data_in_width" in lt_overrides
+            needs_weight = mode == "fp" or any(
+                k in lt_overrides
+                for k in ("weight_width", "weight_exponent_width", "weight_frac_width")
+            )
             if not needs_weight:
                 continue
             for mx in info["owned_mx"]:
@@ -863,7 +977,7 @@ class PhaseLayerAutoSwitch:
             # not a recovery to FP; already-quantized prefill KV remains lossy.
             return
 
-        from chop.nn.quantizers import mxint_quantizer
+        from quant_eval.eval.unified_mx import quantize_mx
 
         # Duck-type HF DynamicCache / StaticCache: both expose key_cache and
         # value_cache as list[Tensor], one entry per layer.
@@ -872,9 +986,14 @@ class PhaseLayerAutoSwitch:
         if not isinstance(key_cache, list) or not isinstance(value_cache, list):
             return
 
-        w  = attn_overrides.get("data_in_width")
-        bs = attn_overrides.get("data_in_block_size")
-        if w is None or bs is None:
+        kv_cfg = attn_overrides.get("kv_cache") or attn_overrides
+        bs = kv_cfg.get("data_in_block_size")
+        mxint_width = kv_cfg.get("data_in_width")
+        mxfp_exp = kv_cfg.get("data_in_exponent_width")
+        mxfp_frac = kv_cfg.get("data_in_frac_width")
+        if bs is None:
+            return
+        if mxint_width is None and (mxfp_exp is None or mxfp_frac is None):
             return
 
         n = min(len(key_cache), len(value_cache))
@@ -889,12 +1008,8 @@ class PhaseLayerAutoSwitch:
                 continue
             # K/V shapes: [B, num_kv_heads, seq_len, head_dim]
             # block_dim=-1 matches kv_cache_mxint (head_dim blocking).
-            key_cache[layer_idx] = mxint_quantizer(
-                k, block_size=bs, element_bits=w, block_dim=-1,
-            )
-            value_cache[layer_idx] = mxint_quantizer(
-                v, block_size=bs, element_bits=w, block_dim=-1,
-            )
+            key_cache[layer_idx] = quantize_mx(k, kv_cfg, block_dim=-1, prefix="data_in")
+            value_cache[layer_idx] = quantize_mx(v, kv_cfg, block_dim=-1, prefix="data_in")
 
     # ------------------------------------------------------------------
     # Public API
@@ -929,8 +1044,10 @@ class PhaseLayerAutoSwitch:
             overrides = self.phase_configs.get("prefill", {}).get(info["layer_type"])
             if overrides:
                 _apply_config([(None, m) for m in info["owned_mx"]], overrides)
-        if self._phase_requests_fp_weight("prefill"):
-            self._reload_weights_for_phase("prefill")
+        # Also initialise attention, MLP, and RMSNorm wrapper configs.  The
+        # per-submodule hooks above only touch Linear MX children during
+        # forward; nonlinear wrapper state must be set once up front.
+        self._on_phase_transition("prefill", None)
 
         return self
 
@@ -977,28 +1094,70 @@ class PhaseLayerAutoSwitch:
                     if hasattr(wrapper, attr_name):
                         setattr(wrapper, attr_name, bool(original_value))
 
+        for name, wrapper in self.mlp_wrappers:
+            wrapper.q_config.clear()
+            wrapper.q_config.update(self._original_mlp_configs.get(name, {}))
+            if hasattr(wrapper, "bypass"):
+                wrapper.bypass = bool(wrapper.q_config.get("bypass", False))
+
+        for name, wrapper in self.rmsnorm_wrappers:
+            wrapper.q_config.clear()
+            wrapper.q_config.update(self._original_rmsnorm_configs.get(name, {}))
+            _rebuild_rmsnorm_minifloat_quantizers(wrapper)
+
         self._phase[0] = "prefill"
 
     def summary(self) -> str:
-        """Human-readable table of the active (phase, layer_type) → config mapping."""
+        """Human-readable table of the active phase config mapping."""
+        def _fmt_mx(cfg: dict) -> str:
+            if not cfg:
+                return "(unchanged)"
+            if cfg.get("bypass", False):
+                return f"bypass  weight={_normalize_weight_mode(cfg)}"
+            if cfg.get("canonical"):
+                base = f"{cfg['canonical']}(B{cfg.get('data_in_block_size', '?')})"
+            elif "data_in_width" in cfg:
+                base = f"MXINT_{cfg['data_in_width']}(B{cfg.get('data_in_block_size', '?')})"
+            elif "data_in_exponent_width" in cfg:
+                base = (
+                    f"MXFP_E{cfg['data_in_exponent_width']}M{cfg['data_in_frac_width']}"
+                    f"(B{cfg.get('data_in_block_size', '?')})"
+                )
+            else:
+                base = str(cfg)
+            kv_cfg = cfg.get("kv_cache")
+            if isinstance(kv_cfg, dict) and kv_cfg:
+                kv_name = kv_cfg.get("canonical")
+                if kv_name is None and "data_in_width" in kv_cfg:
+                    kv_name = f"MXINT_{kv_cfg['data_in_width']}"
+                elif kv_name is None and "data_in_exponent_width" in kv_cfg:
+                    kv_name = f"MXFP_E{kv_cfg['data_in_exponent_width']}M{kv_cfg['data_in_frac_width']}"
+                if kv_name:
+                    base = f"ACT={base}, KV={kv_name}(B{kv_cfg.get('data_in_block_size', '?')})"
+            return f"{base}  weight={_normalize_weight_mode(cfg)}"
+
+        def _fmt_fp(cfg: dict) -> str:
+            if not cfg:
+                return "(unchanged)"
+            if cfg.get("bypass", False):
+                return "bypass"
+            if "data_in_exponent_width" in cfg:
+                return f"FP_E{cfg['data_in_exponent_width']}M{cfg['data_in_frac_width']}"
+            return str(cfg)
+
         lines = ["PhaseLayerAutoSwitch config:"]
-        lines.append(f"  {'phase':10s}  {'layer':6s}  config")
-        lines.append("  " + "-" * 44)
+        lines.append(f"  {'phase':10s}  {'component':8s}  config")
+        lines.append("  " + "-" * 58)
         for phase in ("prefill", "decode"):
-            for layer_type in ("attn", "ffn"):
-                cfg = self.phase_configs.get(phase, {}).get(layer_type)
-                if cfg is None:
-                    lines.append(f"  {phase:10s}  {layer_type:6s}  (unchanged)")
+            by_component = self.phase_configs.get(phase, {})
+            for component in ("attn", "ffn", "mlp", "rms_norm"):
+                cfg = by_component.get(component)
+                if component in ("attn", "ffn"):
+                    text = _fmt_mx(cfg or {})
                 else:
-                    width = cfg.get("data_in_width", "?")
-                    bsz   = cfg.get("data_in_block_size", "?")
-                    mode  = _normalize_weight_mode(cfg)
-                    bypass = bool(cfg.get("bypass", False))
-                    bypass_note = "  bypass" if bypass else ""
-                    lines.append(
-                        f"  {phase:10s}  {layer_type:6s}  "
-                        f"MXInt{width}  block_size={bsz}  weight={mode}{bypass_note}"
-                    )
+                    text = _fmt_fp(cfg or {})
+                lines.append(f"  {phase:10s}  {component:8s}  {text}")
+
         n_attn = sum(
             1 for info in self._submodule_info.values()
             if info["layer_type"] == "attn" and info["owned_mx"]
@@ -1007,7 +1166,10 @@ class PhaseLayerAutoSwitch:
             1 for info in self._submodule_info.values()
             if info["layer_type"] == "ffn"  and info["owned_mx"]
         )
-        lines.append(f"\n  Hooked submodules: {n_attn} attn, {n_ffn} ffn")
+        lines.append(
+            f"\n  Hooked submodules: {n_attn} attn, {n_ffn} ffn; "
+            f"nonlinear wrappers: {len(self.mlp_wrappers)} mlp, {len(self.rmsnorm_wrappers)} rms_norm"
+        )
         return "\n".join(lines)
 
     def __enter__(self):
