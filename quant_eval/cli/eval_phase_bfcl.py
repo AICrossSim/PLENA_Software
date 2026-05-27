@@ -31,6 +31,7 @@ Example:
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -75,6 +76,150 @@ BFCL_TOOL_MODES = ("auto", "return", "execute")
 # ── OpenAI-compatible server defaults ─────────────────────────────────────────
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8915
+
+_CUDA_RESERVE_MB = 1024 * 1024
+
+
+class _FixedCudaMemoryReserve:
+    """Hold a fixed CUDA allocation during low-memory phases of eval.
+
+    This guard makes GPTQ's low-memory phase keep a fixed amount of GPU memory
+    occupied, then releases it immediately before BFCL generation.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: str,
+        reserve_mb: int,
+        wait_sec: int,
+        poll_sec: float,
+        chunk_mb: int,
+        enabled: bool,
+    ):
+        self.device = torch.device(device)
+        self.reserve_mb = int(reserve_mb or 0)
+        self.wait_sec = int(wait_sec)
+        self.poll_sec = float(poll_sec)
+        self.chunk_mb = int(chunk_mb)
+        self.enabled = bool(enabled and self.reserve_mb > 0)
+        self._buffers: list[torch.Tensor] = []
+        self._reserved_mb = 0
+        self._total_mb = 0
+        self._free_before_mb = 0
+
+        if self.enabled:
+            if self.device.type != "cuda":
+                raise ValueError(
+                    "GPU memory reservation requires a CUDA device; "
+                    f"got {device!r}. Disable it with --gpu_memory_reserve_disable true."
+                )
+            if self.chunk_mb <= 0:
+                raise ValueError("gpu_memory_reserve_chunk_mb must be > 0.")
+            if self.wait_sec < 0:
+                raise ValueError("gpu_memory_reserve_wait_sec must be >= 0.")
+            if self.poll_sec <= 0:
+                raise ValueError("gpu_memory_reserve_poll_sec must be > 0.")
+
+    def _device_index(self) -> int:
+        if self.device.index is None:
+            return torch.cuda.current_device()
+        return self.device.index
+
+    def _memory_info_mb(self) -> tuple[int, int]:
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self._device_index())
+        return free_bytes // _CUDA_RESERVE_MB, total_bytes // _CUDA_RESERVE_MB
+
+    def acquire(self) -> None:
+        if not self.enabled:
+            logger.info("GPU reserve disabled.")
+            return
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU reserve requested but torch.cuda is not available.")
+
+        torch.cuda.set_device(self._device_index())
+        start = time.monotonic()
+        last_error = "unknown allocation failure"
+        while True:
+            free_mb, total_mb = self._memory_info_mb()
+            self._free_before_mb = int(free_mb)
+            self._total_mb = int(total_mb)
+            if free_mb >= self.reserve_mb:
+                try:
+                    remaining_mb = self.reserve_mb
+                    while remaining_mb > 0:
+                        alloc_mb = min(self.chunk_mb, remaining_mb)
+                        self._buffers.append(
+                            torch.empty(
+                                alloc_mb * _CUDA_RESERVE_MB,
+                                dtype=torch.uint8,
+                                device=self.device,
+                            )
+                        )
+                        self._reserved_mb += alloc_mb
+                        remaining_mb -= alloc_mb
+                    logger.info(
+                        "GPU reserve acquired: total=%dMB free_before=%dMB reserved=%dMB",
+                        self._total_mb,
+                        self._free_before_mb,
+                        self._reserved_mb,
+                    )
+                    print(
+                        "GPU reserve acquired: "
+                        f"total={self._total_mb}MB "
+                        f"free_before={self._free_before_mb}MB "
+                        f"reserved={self._reserved_mb}MB"
+                    )
+                    return
+                except RuntimeError as exc:
+                    last_error = str(exc)
+                    self.release(log=False)
+                    torch.cuda.empty_cache()
+            else:
+                last_error = (
+                    f"free={free_mb}MB is below requested reserve={self.reserve_mb}MB "
+                    f"on total={total_mb}MB GPU"
+                )
+
+            if time.monotonic() - start >= self.wait_sec:
+                raise RuntimeError(
+                    "Timed out acquiring GPU reserve after "
+                    f"{self.wait_sec}s: {last_error}. Lower --gpu_memory_reserve_mb, "
+                    "choose a freer GPU, or disable reservation."
+                )
+            logger.info(
+                "Waiting for GPU reserve: reserve=%dMB free=%dMB total=%dMB retry_in=%.1fs",
+                self.reserve_mb,
+                free_mb,
+                total_mb,
+                self.poll_sec,
+            )
+            time.sleep(self.poll_sec)
+
+    def release(self, *, log: bool = True) -> None:
+        if not self._buffers and self._reserved_mb == 0:
+            return
+        released_mb = self._reserved_mb
+        self._buffers.clear()
+        self._reserved_mb = 0
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if log:
+            logger.info("GPU reserve released before BFCL generate: released=%dMB", released_mb)
+            print(f"GPU reserve released before BFCL generate: released={released_mb}MB")
+
+    def summary(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "reserve_mb": self.reserve_mb,
+            "reserved_mb": self._reserved_mb,
+            "total_mb": self._total_mb,
+            "free_before_mb": self._free_before_mb,
+            "chunk_mb": self.chunk_mb,
+            "wait_sec": self.wait_sec,
+            "poll_sec": self.poll_sec,
+        }
+
 
 def _execute_tool(tool_call: dict) -> str:
     """Execute duckduckgo_search or fetch_url_content and return result as string."""
@@ -1123,6 +1268,12 @@ def main(
     server_host:          str   = DEFAULT_HOST,
     server_port:          int   = DEFAULT_PORT,
     bfcl_tool_mode:       str   = "auto",
+    # ── GPU reservation guard ───────────────────────────────────────────────
+    gpu_memory_reserve_mb: int = 20000,
+    gpu_memory_reserve_wait_sec: int = 600,
+    gpu_memory_reserve_poll_sec: float = 5.0,
+    gpu_memory_reserve_chunk_mb: int = 512,
+    gpu_memory_reserve_disable: bool = False,
     # ── GPTQ calibration/weight quantization ───────────────────────────────
     gptq_dataset:          str | None = None,
     gptq_nsamples:         int = 32,
@@ -1188,6 +1339,12 @@ def main(
             ``"return"`` returns model tool calls directly for BFCL function-call
             categories such as ``multiple``; ``"execute"`` preserves agentic
             web-search behavior.
+        gpu_memory_reserve_mb: Fixed CUDA memory reservation held during GPTQ and
+            quantization, then released before BFCL generation. ``0`` disables it.
+        gpu_memory_reserve_wait_sec: Seconds to wait for enough free memory.
+        gpu_memory_reserve_poll_sec: Poll interval while waiting for memory.
+        gpu_memory_reserve_chunk_mb: Chunk size for the reservation tensors.
+        gpu_memory_reserve_disable: Disable the reservation guard entirely.
         gptq_dataset: Optional GPTQ calibration dataset. Plain paths are treated
             as ``file:<path>`` for the GPTQ loader. When set, CLI GPTQ values
             override any ``[gptq]`` block in ``quant_config``.
@@ -1232,6 +1389,16 @@ def main(
             f"got {decode_weight_mode!r}."
         )
     device_id = _normalize_device_id(device_id)
+    gpu_memory_reserve_enabled = (
+        not gpu_memory_reserve_disable
+        and gpu_memory_reserve_mb is not None
+        and int(gpu_memory_reserve_mb) > 0
+    )
+    if gpu_memory_reserve_enabled and model_parallel:
+        raise ValueError(
+            "GPU memory reservation currently supports only single-GPU eval; "
+            "disable it with --gpu_memory_reserve_disable true for model_parallel runs."
+        )
     quant_config_is_none = quant_config is None or str(quant_config).strip().lower() in {"", "none", "fp", "false"}
     if quant_config_is_none:
         quant_config = "none"
@@ -1420,6 +1587,15 @@ def main(
     if gptq_dataset:
         print(f"  GPTQ       : dataset={gptq_dataset}, nsamples={gptq_nsamples}, seqlen={gptq_seqlen}, max_layers={gptq_max_layers}")
     print(f"  Server     : http://{server_host}:{server_port}")
+    if gpu_memory_reserve_enabled:
+        print(
+            "  GPU reserve: "
+            f"reserve={int(gpu_memory_reserve_mb)}MB, "
+            f"wait={gpu_memory_reserve_wait_sec}s, "
+            f"chunk={gpu_memory_reserve_chunk_mb}MB"
+        )
+    else:
+        print("  GPU reserve: disabled")
     print()
     print(f"  {'':10s}  {'attn':>24s}  {'ffn':>24s}")
     print(f"  {'prefill':10s}  {_pa:>24s}  {_pf:>24s}")
@@ -1469,184 +1645,202 @@ def main(
     )
     model.eval()
 
-    # ------------------------------------------------------------------
-    # Weight quantization
-    # ------------------------------------------------------------------
-    resolved_gptq_config = None
-    if quant_config_is_none:
-        logger.info("True FP baseline requested: skipping quantize_module_transform_pass and phase switching.")
-        if model_parallel:
-            model = move_to_gpu(model, model_parallel)
-        else:
-            model.to(device_id)
-        switch = None
-    else:
-        from chop.passes.module.transforms import quantize_module_transform_pass
+    gpu_memory_reserve = _FixedCudaMemoryReserve(
+        device=device_id,
+        reserve_mb=int(gpu_memory_reserve_mb or 0),
+        wait_sec=gpu_memory_reserve_wait_sec,
+        poll_sec=gpu_memory_reserve_poll_sec,
+        chunk_mb=gpu_memory_reserve_chunk_mb,
+        enabled=gpu_memory_reserve_enabled,
+    )
+    gpu_memory_reserve.acquire()
+    atexit.register(gpu_memory_reserve.release)
 
-        pass_args = load_quant_config(quant_config)
-        if _codesign_tokens_enabled:
-            apply_llama_dse_quant_config(
+    try:
+        # ------------------------------------------------------------------
+        # Weight quantization
+        # ------------------------------------------------------------------
+        resolved_gptq_config = None
+        if quant_config_is_none:
+            logger.info("True FP baseline requested: skipping quantize_module_transform_pass and phase switching.")
+            if model_parallel:
+                model = move_to_gpu(model, model_parallel)
+            else:
+                model.to(device_id)
+            switch = None
+        else:
+            from chop.passes.module.transforms import quantize_module_transform_pass
+
+            pass_args = load_quant_config(quant_config)
+            if _codesign_tokens_enabled:
+                apply_llama_dse_quant_config(
+                    pass_args,
+                    act_precision=precision_metadata["prefill"]["ACT_ELEMENT_WIDTH"],
+                    kv_precision=precision_metadata["prefill"]["KV_ELEMENT_WIDTH"],
+                    fp_setting=precision_metadata["prefill"]["FP_SETTING"],
+                    mx_block_size=dse_mx_block_size,
+                    weight_precision=_resolved_dse_weight_precision,
+                    weight_block_size=_resolved_dse_weight_block_size,
+                )
+            resolved_gptq_config = _inject_gptq_config(
                 pass_args,
-                act_precision=precision_metadata["prefill"]["ACT_ELEMENT_WIDTH"],
-                kv_precision=precision_metadata["prefill"]["KV_ELEMENT_WIDTH"],
-                fp_setting=precision_metadata["prefill"]["FP_SETTING"],
-                mx_block_size=dse_mx_block_size,
-                weight_precision=_resolved_dse_weight_precision,
-                weight_block_size=_resolved_dse_weight_block_size,
+                model_name=model_name,
+                device_id=device_id,
+                dataset=gptq_dataset,
+                nsamples=gptq_nsamples,
+                seqlen=gptq_seqlen,
+                fmt=gptq_format,
+                weight_width=gptq_weight_width,
+                weight_block_size=gptq_weight_block_size,
+                cali_batch_size=gptq_cali_batch_size,
+                max_layers=gptq_max_layers,
             )
-        resolved_gptq_config = _inject_gptq_config(
-            pass_args,
-            model_name=model_name,
-            device_id=device_id,
-            dataset=gptq_dataset,
-            nsamples=gptq_nsamples,
-            seqlen=gptq_seqlen,
-            fmt=gptq_format,
-            weight_width=gptq_weight_width,
-            weight_block_size=gptq_weight_block_size,
-            cali_batch_size=gptq_cali_batch_size,
-            max_layers=gptq_max_layers,
+            if resolved_gptq_config:
+                marked_gptq_configs = _mark_gptq_projection_configs(pass_args)
+                logger.info(
+                    "GPTQ enabled: dataset=%s nsamples=%s seqlen=%s format=%s max_layers=%s marked_weight_configs=%s",
+                    resolved_gptq_config.get("dataset"),
+                    resolved_gptq_config.get("nsamples"),
+                    resolved_gptq_config.get("seqlen"),
+                    resolved_gptq_config.get("format"),
+                    resolved_gptq_config.get("max_layers"),
+                    marked_gptq_configs,
+                )
+
+            n_linear = sum(
+                1 for _, m in model.named_modules()
+                if isinstance(m, torch.nn.Linear)
+            )
+            logger.info("Quantizing %d linear layers...", n_linear)
+            t0 = time.time()
+            model, _ = quantize_module_transform_pass(model, pass_args)
+            if _codesign_tokens_enabled:
+                unified_counts = apply_unified_mx_wrappers(model)
+                logger.info(
+                    "Installed unified MX wrappers: %d Linear, %d LlamaAttention",
+                    unified_counts.get("linear", 0),
+                    unified_counts.get("attention", 0),
+                )
+            logger.info("Quantization complete in %.1fs", time.time() - t0)
+
+            if model_parallel:
+                model = move_to_gpu(model, model_parallel)
+            else:
+                model.to(device_id)
+
+            # ------------------------------------------------------------------
+            # Enable disaggregated quantization hook
+            # ------------------------------------------------------------------
+            switch_kwargs = {}
+            if attn_keywords:
+                switch_kwargs["attn_keywords"] = tuple(attn_keywords)
+            if ffn_keywords:
+                switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
+            if decode_weight_mode == "fp":
+                switch_kwargs["model_name"] = model_name
+
+            switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
+            switch.enable()
+            logger.info("\n%s", switch.summary())
+
+        # ------------------------------------------------------------------
+        # Start the OpenAI-compatible server (hook fires on every request)
+        # ------------------------------------------------------------------
+        device_str = device_id if not model_parallel else "cuda"
+        app = _build_server_app(model, tokenizer, device_str, tool_mode=bfcl_tool_mode)
+        _start_server(app, server_host, server_port)
+
+        # Release the guard immediately before BFCL generation, where the model
+        # needs the reserved memory for KV/cache and decoding allocations.
+        gpu_memory_reserve.release()
+
+        # ------------------------------------------------------------------
+        # Step 1: bfcl generate  (calls the local server)
+        # ------------------------------------------------------------------
+        print("\n[1/2] Generating BFCL responses via local server...")
+        gen_rc = _run_bfcl_generate(
+            model_name      = model_name,
+            test_categories = bfcl_test_categories,
+            host            = server_host,
+            port            = server_port,
+            result_dir      = result_dir,
+            num_threads     = bfcl_num_threads,
+            limit           = limit,
+            model_alias     = bfcl_model_alias,
         )
+        if gen_rc != 0:
+            logger.error("bfcl generate exited with code %d", gen_rc)
+
+    #     # ------------------------------------------------------------------
+    #     # Step 2: bfcl evaluate  (pure scoring, no model needed)
+    #     # ------------------------------------------------------------------
+        print("[2/2] Evaluating BFCL responses...")
+        eval_rc, scores = _run_bfcl_evaluate(
+            model_name      = model_name,
+            test_categories = bfcl_test_categories,
+            result_dir      = result_dir,
+            score_dir       = score_dir,
+            model_alias     = bfcl_model_alias,
+            partial_eval    = limit is not None,
+        )
+
+        if switch is not None:
+            switch.disable()
+
+        # ------------------------------------------------------------------
+        # Print results
+        # ------------------------------------------------------------------
+        print("\n" + "=" * 64)
+        print("Results:")
+        print("=" * 64)
+        print(f"\n  {'':10s}  {'attn':>24s}  {'ffn':>24s}")
+        print(f"  {'prefill':10s}  {_pa:>24s}  {_pf:>24s}")
+        print(f"  {'decode':10s}  {_da:>24s}  {_df:>24s}")
+        print()
+
+        per_cat = scores.pop("per_category", {})
+        for cat, cat_scores in per_cat.items():
+            print(f"  {cat}:")
+            if isinstance(cat_scores, dict):
+                for metric, value in cat_scores.items():
+                    if isinstance(value, (int, float)):
+                        print(f"    {metric}: {value:.4f}")
+                    else:
+                        print(f"    {metric}: {value}")
+            else:
+                print(f"    {cat_scores}")
+
+        if scores:
+            print("\n  Overall (from data_overall.csv):")
+            for k, v in scores.items():
+                print(f"    {k}: {v}")
+
+        # Restore per_category before saving.
+        scores["per_category"] = per_cat
+        scores["phase_layer_configs"] = phase_configs
+        scores["bfcl_categories"] = bfcl_test_categories
+        scores["bfcl_tool_mode"] = bfcl_tool_mode
+        scores["decode_weight_mode"] = decode_weight_mode
+        scores["precision_metadata"] = precision_metadata
+        scores["gpu_memory_reserve"] = gpu_memory_reserve.summary()
         if resolved_gptq_config:
-            marked_gptq_configs = _mark_gptq_projection_configs(pass_args)
-            logger.info(
-                "GPTQ enabled: dataset=%s nsamples=%s seqlen=%s format=%s max_layers=%s marked_weight_configs=%s",
-                resolved_gptq_config.get("dataset"),
-                resolved_gptq_config.get("nsamples"),
-                resolved_gptq_config.get("seqlen"),
-                resolved_gptq_config.get("format"),
-                resolved_gptq_config.get("max_layers"),
-                marked_gptq_configs,
-            )
+            scores["gptq"] = {
+                "dataset": resolved_gptq_config.get("dataset"),
+                "nsamples": resolved_gptq_config.get("nsamples"),
+                "seqlen": resolved_gptq_config.get("seqlen"),
+                "format": resolved_gptq_config.get("format"),
+                "weight_config": resolved_gptq_config.get("weight_config"),
+                "cali_batch_size": resolved_gptq_config.get("cali_batch_size"),
+                "max_layers": resolved_gptq_config.get("max_layers"),
+            }
 
-        n_linear = sum(
-            1 for _, m in model.named_modules()
-            if isinstance(m, torch.nn.Linear)
-        )
-        logger.info("Quantizing %d linear layers...", n_linear)
-        t0 = time.time()
-        model, _ = quantize_module_transform_pass(model, pass_args)
-        if _codesign_tokens_enabled:
-            unified_counts = apply_unified_mx_wrappers(model)
-            logger.info(
-                "Installed unified MX wrappers: %d Linear, %d LlamaAttention",
-                unified_counts.get("linear", 0),
-                unified_counts.get("attention", 0),
-            )
-        logger.info("Quantization complete in %.1fs", time.time() - t0)
+        if log_dir:
+            save_results(log_dir, scores)
 
-        if model_parallel:
-            model = move_to_gpu(model, model_parallel)
-        else:
-            model.to(device_id)
-
-        # ------------------------------------------------------------------
-        # Enable disaggregated quantization hook
-        # ------------------------------------------------------------------
-        switch_kwargs = {}
-        if attn_keywords:
-            switch_kwargs["attn_keywords"] = tuple(attn_keywords)
-        if ffn_keywords:
-            switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
-        if decode_weight_mode == "fp":
-            switch_kwargs["model_name"] = model_name
-
-        switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
-        switch.enable()
-        logger.info("\n%s", switch.summary())
-
-    # ------------------------------------------------------------------
-    # Start the OpenAI-compatible server (hook fires on every request)
-    # ------------------------------------------------------------------
-    device_str = device_id if not model_parallel else "cuda"
-    app = _build_server_app(model, tokenizer, device_str, tool_mode=bfcl_tool_mode)
-    _start_server(app, server_host, server_port)
-
-
-    # ------------------------------------------------------------------
-    # Step 1: bfcl generate  (calls the local server)
-    # ------------------------------------------------------------------
-    print("\n[1/2] Generating BFCL responses via local server...")
-    gen_rc = _run_bfcl_generate(
-        model_name      = model_name,
-        test_categories = bfcl_test_categories,
-        host            = server_host,
-        port            = server_port,
-        result_dir      = result_dir,
-        num_threads     = bfcl_num_threads,
-        limit           = limit,
-        model_alias     = bfcl_model_alias,
-    )
-    if gen_rc != 0:
-        logger.error("bfcl generate exited with code %d", gen_rc)
-
-#     # ------------------------------------------------------------------
-#     # Step 2: bfcl evaluate  (pure scoring, no model needed)
-#     # ------------------------------------------------------------------
-    print("[2/2] Evaluating BFCL responses...")
-    eval_rc, scores = _run_bfcl_evaluate(
-        model_name      = model_name,
-        test_categories = bfcl_test_categories,
-        result_dir      = result_dir,
-        score_dir       = score_dir,
-        model_alias     = bfcl_model_alias,
-        partial_eval    = limit is not None,
-    )
-
-    if switch is not None:
-        switch.disable()
-
-    # ------------------------------------------------------------------
-    # Print results
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 64)
-    print("Results:")
-    print("=" * 64)
-    print(f"\n  {'':10s}  {'attn':>24s}  {'ffn':>24s}")
-    print(f"  {'prefill':10s}  {_pa:>24s}  {_pf:>24s}")
-    print(f"  {'decode':10s}  {_da:>24s}  {_df:>24s}")
-    print()
-
-    per_cat = scores.pop("per_category", {})
-    for cat, cat_scores in per_cat.items():
-        print(f"  {cat}:")
-        if isinstance(cat_scores, dict):
-            for metric, value in cat_scores.items():
-                if isinstance(value, (int, float)):
-                    print(f"    {metric}: {value:.4f}")
-                else:
-                    print(f"    {metric}: {value}")
-        else:
-            print(f"    {cat_scores}")
-
-    if scores:
-        print("\n  Overall (from data_overall.csv):")
-        for k, v in scores.items():
-            print(f"    {k}: {v}")
-
-    # Restore per_category before saving.
-    scores["per_category"] = per_cat
-    scores["phase_layer_configs"] = phase_configs
-    scores["bfcl_categories"] = bfcl_test_categories
-    scores["bfcl_tool_mode"] = bfcl_tool_mode
-    scores["decode_weight_mode"] = decode_weight_mode
-    scores["precision_metadata"] = precision_metadata
-    if resolved_gptq_config:
-        scores["gptq"] = {
-            "dataset": resolved_gptq_config.get("dataset"),
-            "nsamples": resolved_gptq_config.get("nsamples"),
-            "seqlen": resolved_gptq_config.get("seqlen"),
-            "format": resolved_gptq_config.get("format"),
-            "weight_config": resolved_gptq_config.get("weight_config"),
-            "cali_batch_size": resolved_gptq_config.get("cali_batch_size"),
-            "max_layers": resolved_gptq_config.get("max_layers"),
-        }
-
-    if log_dir:
-        save_results(log_dir, scores)
-
-    _tmpdir_ctx.cleanup()
-    return scores
+        _tmpdir_ctx.cleanup()
+        return scores
+    finally:
+        gpu_memory_reserve.release(log=False)
 
 
 if __name__ == "__main__":
