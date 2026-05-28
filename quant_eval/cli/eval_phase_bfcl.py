@@ -32,6 +32,7 @@ Example:
 from __future__ import annotations
 
 import atexit
+import gc
 import hashlib
 import json
 import os
@@ -202,13 +203,43 @@ class _FixedCudaMemoryReserve:
         if not self._buffers and self._reserved_mb == 0:
             return
         released_mb = self._reserved_mb
+        free_before_mb, total_mb = (0, 0)
+        free_after_mb = 0
+
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            torch.cuda.set_device(self._device_index())
+            torch.cuda.synchronize(self._device_index())
+            free_before_mb, total_mb = self._memory_info_mb()
+
         self._buffers.clear()
         self._reserved_mb = 0
-        if torch.cuda.is_available():
+        gc.collect()
+
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            # Make reserve release visible to subsequent BFCL generate requests
+            # before the server starts handling decode allocations. Without the
+            # synchronizes, PyTorch/CUDA allocator bookkeeping can transiently
+            # overlap the reservation with the first generation memory peak.
+            torch.cuda.synchronize(self._device_index())
             torch.cuda.empty_cache()
+            torch.cuda.synchronize(self._device_index())
+            free_after_mb, total_mb = self._memory_info_mb()
+
         if log:
-            logger.info("GPU reserve released before BFCL generate: released=%dMB", released_mb)
-            print(f"GPU reserve released before BFCL generate: released={released_mb}MB")
+            logger.info(
+                "GPU reserve released before BFCL generate: released=%dMB free_before=%dMB free_after=%dMB total=%dMB",
+                released_mb,
+                free_before_mb,
+                free_after_mb,
+                total_mb,
+            )
+            print(
+                "GPU reserve released before BFCL generate: "
+                f"released={released_mb}MB "
+                f"free_before={free_before_mb}MB "
+                f"free_after={free_after_mb}MB "
+                f"total={total_mb}MB"
+            )
 
     def summary(self) -> dict:
         return {
@@ -1985,6 +2016,12 @@ def main(
         # ------------------------------------------------------------------
         # Start the OpenAI-compatible server (hook fires on every request)
         # ------------------------------------------------------------------
+        # Release the guard before starting the local server. This avoids a
+        # transient overlap between reserve release and the first BFCL request's
+        # decode/KV allocations, and the release routine logs free memory before
+        # and after CUDA allocator synchronization.
+        gpu_memory_reserve.release()
+
         device_str = device_id if not model_parallel else "cuda"
         app = _build_server_app(
             model,
@@ -1994,10 +2031,6 @@ def main(
             max_new_tokens=bfcl_max_new_tokens,
         )
         _start_server(app, server_host, server_port)
-
-        # Release the guard immediately before BFCL generation, where the model
-        # needs the reserved memory for KV/cache and decoding allocations.
-        gpu_memory_reserve.release()
 
         # ------------------------------------------------------------------
         # Step 1: bfcl generate  (calls the local server)
