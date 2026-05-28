@@ -306,7 +306,7 @@ def _execute_tool(tool_call: dict) -> str:
 #  Minimal OpenAI-compatible chat-completion server
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute"):
+def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute", max_new_tokens: int | None = 256):
     """
     Return a FastAPI application that exposes POST /v1/chat/completions.
 
@@ -325,6 +325,14 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute")
 
     if tool_mode not in ("return", "execute"):
         raise ValueError(f"tool_mode must be 'return' or 'execute', got {tool_mode!r}.")
+    if max_new_tokens is not None and int(max_new_tokens) <= 0:
+        raise ValueError(f"max_new_tokens must be positive or None, got {max_new_tokens!r}.")
+
+    def _cap_max_new_tokens(requested: int | None) -> int:
+        requested_toks = 1024 if requested is None else int(requested)
+        if max_new_tokens is None:
+            return requested_toks
+        return min(requested_toks, int(max_new_tokens))
 
     app = FastAPI(title="quant-model-server")
 
@@ -335,7 +343,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute")
         messages     = list(body.get("messages", []))  # make a mutable copy
         tools        = body.get("tools", None)
         temperature  = body.get("temperature", 0.0)
-        max_new_toks = body.get("max_tokens", 1024)
+        max_new_toks = _cap_max_new_tokens(body.get("max_tokens", 1024))
 
         MAX_TURNS = 15  # prevent infinite agentic loops
 
@@ -492,7 +500,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute")
 
         tools        = body.get("tools", None)
         temperature  = body.get("temperature", 0.0)
-        max_new_toks = body.get("max_tokens", 1024)
+        max_new_toks = _cap_max_new_tokens(body.get("max_tokens", 1024))
 
         MAX_TURNS = 15  # prevent infinite agentic loops
 
@@ -926,18 +934,31 @@ def _start_server(app, host: str, port: int) -> threading.Thread:
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
 
-    # Wait for the server to accept connections (up to 60 s).
+    # Wait for *this* uvicorn instance to start. A stale process can already
+    # be bound to the requested port; merely getting an HTTP response would
+    # then route BFCL to the wrong model server and corrupt scores.
     import httpx
     deadline = time.time() + 60
+    last_error = None
     while time.time() < deadline:
-        try:
-            httpx.get(f"http://{host}:{port}/v1/models", timeout=1)
-            logger.info("Server ready at http://%s:%d", host, port)
-            return thread
-        except Exception:
-            time.sleep(0.5)
+        if not thread.is_alive():
+            raise RuntimeError(
+                f"Server thread exited before binding http://{host}:{port}. "
+                "The port is likely already in use."
+            )
+        if getattr(server, "started", False):
+            try:
+                httpx.get(f"http://{host}:{port}/v1/models", timeout=1)
+                logger.info("Server ready at http://%s:%d", host, port)
+                return thread
+            except Exception as exc:
+                last_error = exc
+        time.sleep(0.5)
 
-    raise RuntimeError(f"Server at http://{host}:{port} did not start in time.")
+    raise RuntimeError(
+        f"Server at http://{host}:{port} did not start in time."
+        + (f" Last error: {last_error}" if last_error else "")
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1268,6 +1289,7 @@ def main(
     server_host:          str   = DEFAULT_HOST,
     server_port:          int   = DEFAULT_PORT,
     bfcl_tool_mode:       str   = "auto",
+    bfcl_max_new_tokens:  int | None = 256,
     # ── GPU reservation guard ───────────────────────────────────────────────
     gpu_memory_reserve_mb: int = 20000,
     gpu_memory_reserve_wait_sec: int = 600,
@@ -1339,6 +1361,8 @@ def main(
             ``"return"`` returns model tool calls directly for BFCL function-call
             categories such as ``multiple``; ``"execute"`` preserves agentic
             web-search behavior.
+        bfcl_max_new_tokens: Local cap applied to BFCL-requested ``max_tokens``
+            before calling ``model.generate``. ``None`` disables the cap.
         gpu_memory_reserve_mb: Fixed CUDA memory reservation held during GPTQ and
             quantization, then released before BFCL generation. ``0`` disables it.
         gpu_memory_reserve_wait_sec: Seconds to wait for enough free memory.
@@ -1582,6 +1606,7 @@ def main(
         print(f"  BFCL Alias : {bfcl_model_alias}")
     print(f"  Categories : {bfcl_test_categories}")
     print(f"  Tool mode  : {bfcl_tool_mode}")
+    print(f"  Max new tok: {bfcl_max_new_tokens if bfcl_max_new_tokens is not None else 'uncapped'}")
     print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     print(f"  Decode W   : {decode_weight_mode}")
     if gptq_dataset:
@@ -1747,7 +1772,13 @@ def main(
         # Start the OpenAI-compatible server (hook fires on every request)
         # ------------------------------------------------------------------
         device_str = device_id if not model_parallel else "cuda"
-        app = _build_server_app(model, tokenizer, device_str, tool_mode=bfcl_tool_mode)
+        app = _build_server_app(
+            model,
+            tokenizer,
+            device_str,
+            tool_mode=bfcl_tool_mode,
+            max_new_tokens=bfcl_max_new_tokens,
+        )
         _start_server(app, server_host, server_port)
 
         # Release the guard immediately before BFCL generation, where the model
@@ -1820,6 +1851,7 @@ def main(
         scores["phase_layer_configs"] = phase_configs
         scores["bfcl_categories"] = bfcl_test_categories
         scores["bfcl_tool_mode"] = bfcl_tool_mode
+        scores["bfcl_max_new_tokens"] = bfcl_max_new_tokens
         scores["decode_weight_mode"] = decode_weight_mode
         scores["precision_metadata"] = precision_metadata
         scores["gpu_memory_reserve"] = gpu_memory_reserve.summary()
