@@ -22,6 +22,8 @@ gptq:
   weight_block_size: 32
   cali_batch_size: 1
   max_layers: null
+  cache_dir: prefill_DSE/gptq_cache
+  cache_mode: auto
 
 runtime:
   decode_weight_mode: fp

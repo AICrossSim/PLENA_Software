@@ -43,6 +43,10 @@ RESULT_FIELDS = [
     "gpu",
     "server_port",
     "returncode",
+    "gptq_cache_mode",
+    "gptq_cache_key",
+    "gptq_cache_hit",
+    "gptq_cache_path",
     "log_dir",
     "error_message",
     "proxy_cost",
@@ -241,6 +245,18 @@ def _extract_results_json_metrics(path: Path | None) -> tuple[Any, Any, Any, int
     return accuracy, correct, total, raw_count, format_errors
 
 
+
+def _extract_gptq_cache_metadata(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    cache = data.get("gptq_cache", {})
+    return cache if isinstance(cache, dict) else {}
+
+
 def _extract_accuracy(score_dir: Path | None) -> tuple[Any, Any, Any]:
     if score_dir is None:
         return "", "", ""
@@ -333,6 +349,10 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         "--fp_setting_prefill", trial.fp_setting,
         "--log_dir", str(trial_dir),
     ]
+    if gptq.get("cache_dir"):
+        cmd += ["--gptq_cache_dir", str(gptq.get("cache_dir"))]
+    if gptq.get("cache_mode"):
+        cmd += ["--gptq_cache_mode", str(gptq.get("cache_mode"))]
     if limit is not None:
         cmd += ["--limit", str(limit)]
     if gptq_max_layers is not None:
@@ -343,6 +363,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
 def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, port: int, args: argparse.Namespace) -> dict[str, Any]:
     trial_dir.mkdir(parents=True, exist_ok=True)
     cmd = _base_command(cfg, trial, trial_dir, port, args)
+    gptq = cfg.get("gptq", {})
     runtime = cfg.get("runtime", {})
     timeout = int(args.trial_timeout_sec or runtime.get("trial_timeout_sec", 7200))
     env = os.environ.copy()
@@ -380,6 +401,7 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
     score_dir = _find_score_dir(trial_dir)
     result_dir = _find_results_dir(trial_dir)
     eval_results_json = _find_eval_results_json(trial_dir)
+    gptq_cache_meta = _extract_gptq_cache_metadata(eval_results_json)
     accuracy, correct, total, raw_count, format_errors = _extract_results_json_metrics(eval_results_json)
     if accuracy == "":
         accuracy, correct, total = _extract_accuracy(score_dir)
@@ -407,6 +429,10 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
         "gpu": gpu,
         "server_port": port,
         "returncode": returncode if returncode is not None else "",
+        "gptq_cache_mode": gptq_cache_meta.get("mode", gptq.get("cache_mode", "")),
+        "gptq_cache_key": gptq_cache_meta.get("key", ""),
+        "gptq_cache_hit": gptq_cache_meta.get("hit", ""),
+        "gptq_cache_path": gptq_cache_meta.get("path", ""),
         "log_dir": str(trial_dir),
         "error_message": error,
         "proxy_cost": pc,

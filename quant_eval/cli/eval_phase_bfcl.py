@@ -32,8 +32,10 @@ Example:
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1147,6 +1149,184 @@ def _inject_gptq_config(
 
 
 
+_GPTQ_CACHE_MODES = {"off", "auto", "refresh", "require"}
+_GPTQ_CACHE_MODEL_NAME = "quantized_model"
+
+
+def _stable_json_hash(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha1(encoded).hexdigest()[:16]
+
+
+def _gptq_cache_fingerprint(gptq_config: dict, total_layers: int) -> dict:
+    """Return only fields that can affect GPTQ-produced weights."""
+    max_layers = gptq_config.get("max_layers", None)
+    expected_count = total_layers if max_layers is None else min(int(max_layers), total_layers)
+    return {
+        "model_name": gptq_config.get("model_name"),
+        "dataset": gptq_config.get("dataset"),
+        "nsamples": gptq_config.get("nsamples"),
+        "seqlen": gptq_config.get("seqlen"),
+        "format": gptq_config.get("format"),
+        "weight_config": gptq_config.get("weight_config", {}),
+        "quantile_search": gptq_config.get("quantile_search", True),
+        "clip_search_y": gptq_config.get("clip_search_y", False),
+        "cali_batch_size": gptq_config.get("cali_batch_size", 32),
+        "max_layers": max_layers,
+        "expected_layers": list(range(expected_count)),
+        "total_layers": total_layers,
+    }
+
+
+class _GptqWeightCache:
+    """Load-only GPTQ cache for DSE sweeps that do not vary weight config.
+
+    Chop's built-in GPTQ checkpoint_dir is a resume mechanism. This wrapper adds
+    stricter semantics: a complete matching cache is loaded and GPTQ is skipped;
+    otherwise one process creates a fresh cache under a fingerprint-specific lock.
+    """
+
+    def __init__(self, *, cache_dir: str | Path, mode: str, gptq_config: dict, total_layers: int):
+        mode = str(mode or "off").lower()
+        if mode not in _GPTQ_CACHE_MODES:
+            raise ValueError(f"gptq_cache_mode must be one of {_GPTQ_CACHE_MODES}, got {mode!r}.")
+        self.mode = mode
+        self.root = Path(cache_dir).expanduser().resolve()
+        self.fingerprint = _gptq_cache_fingerprint(gptq_config, total_layers)
+        self.key = _stable_json_hash(self.fingerprint)
+        self.cache_path = self.root / self.key
+        self.lock_path = self.root / f"{self.key}.lock"
+        self.expected_layers = list(self.fingerprint["expected_layers"])
+        self.hit = False
+        self.loaded_layers = 0
+        self._lock_acquired = False
+        self._wait_sec = 7200
+        self._poll_sec = 5.0
+
+    def summary(self) -> dict:
+        return {
+            "mode": self.mode,
+            "key": self.key,
+            "hit": self.hit,
+            "path": str(self.cache_path),
+            "loaded_layers": self.loaded_layers,
+            "expected_layers": self.expected_layers,
+        }
+
+    def _metadata_path(self) -> Path:
+        return self.cache_path / "metadata.json"
+
+    def _layer_path(self, layer_idx: int) -> Path:
+        return self.cache_path / f"{_GPTQ_CACHE_MODEL_NAME}_layer_{layer_idx}.safetensors"
+
+    def _is_complete(self) -> bool:
+        meta_path = self._metadata_path()
+        if not meta_path.exists():
+            return False
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not meta.get("complete"):
+            return False
+        if meta.get("cache_key") != self.key:
+            return False
+        if meta.get("fingerprint") != self.fingerprint:
+            return False
+        if meta.get("expected_layers") != self.expected_layers:
+            return False
+        return all(self._layer_path(i).exists() for i in self.expected_layers)
+
+    def _acquire_lock(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        deadline = time.time() + self._wait_sec
+        while True:
+            try:
+                os.mkdir(self.lock_path)
+                self._lock_acquired = True
+                return
+            except FileExistsError:
+                logger.info("Waiting for GPTQ cache lock: key=%s", self.key)
+                if time.time() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for GPTQ cache lock {self.lock_path}")
+                time.sleep(self._poll_sec)
+
+    def release(self) -> None:
+        if self._lock_acquired:
+            shutil.rmtree(self.lock_path, ignore_errors=True)
+            self._lock_acquired = False
+
+    def load(self, model) -> int:
+        from safetensors.torch import load_file
+
+        for layer_idx in self.expected_layers:
+            layer_state = load_file(str(self._layer_path(layer_idx)))
+            model_state = {
+                f"model.layers.{layer_idx}.{name}": value
+                for name, value in layer_state.items()
+            }
+            model.load_state_dict(model_state, strict=False)
+        self.hit = True
+        self.loaded_layers = len(self.expected_layers)
+        logger.info(
+            "GPTQ cache hit: loaded %d cached layers, skipping GPTQ (key=%s)",
+            self.loaded_layers,
+            self.key,
+        )
+        return self.loaded_layers
+
+    def prepare(self, model) -> bool:
+        if self.mode == "off":
+            return False
+        if self.mode != "refresh" and self._is_complete():
+            self.load(model)
+            return True
+
+        self._acquire_lock()
+        try:
+            if self.mode != "refresh" and self._is_complete():
+                self.load(model)
+                self.release()
+                return True
+            if self.mode == "require":
+                raise FileNotFoundError(
+                    f"GPTQ cache miss for key={self.key} at {self.cache_path}; "
+                    "run with gptq_cache_mode=auto or refresh to populate it."
+                )
+            if self.mode == "refresh":
+                logger.info("GPTQ cache refresh requested: key=%s", self.key)
+            else:
+                logger.info("GPTQ cache miss: key=%s, running GPTQ once", self.key)
+            shutil.rmtree(self.cache_path, ignore_errors=True)
+            self.cache_path.mkdir(parents=True, exist_ok=True)
+            return False
+        except Exception:
+            self.release()
+            raise
+
+    def finalize(self) -> None:
+        missing = [i for i in self.expected_layers if not self._layer_path(i).exists()]
+        if missing:
+            raise RuntimeError(f"GPTQ cache incomplete for key={self.key}; missing layers={missing}")
+        meta = {
+            "complete": True,
+            "cache_key": self.key,
+            "fingerprint": self.fingerprint,
+            "expected_layers": self.expected_layers,
+            "created_time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "model_name": _GPTQ_CACHE_MODEL_NAME,
+        }
+        self._metadata_path().write_text(json.dumps(meta, indent=2, sort_keys=True), encoding="utf-8")
+        self.hit = False
+        self.loaded_layers = 0
+        logger.info(
+            "GPTQ cache populated: key=%s layers=%d path=%s",
+            self.key,
+            len(self.expected_layers),
+            self.cache_path,
+        )
+
+
 def _run_bfcl_generate(
     model_name: str,
     test_categories: Sequence[str],
@@ -1305,6 +1485,8 @@ def main(
     gptq_weight_block_size:int = 32,
     gptq_cali_batch_size:  int = 1,
     gptq_max_layers:       int | None = None,
+    gptq_cache_dir:        str | None = None,
+    gptq_cache_mode:       str = "off",
     # ── Legacy width controls; overridden by precision tokens below ───────
     prefill_attn_width:      int = 4,
     prefill_ffn_width:       int = 4,
@@ -1379,6 +1561,8 @@ def main(
         gptq_weight_block_size: GPTQ quantized weight block size.
         gptq_cali_batch_size: GPTQ calibration batch size.
         gptq_max_layers: Optional layer cap for quick smoke tests.
+        gptq_cache_dir: Optional directory for load-only GPTQ weight cache.
+        gptq_cache_mode: One of off/auto/refresh/require.
         prefill_attn_width/prefill_ffn_width/decode_attn_width/decode_ffn_width:
             Legacy MXInt width controls. These are ignored for any phase where
             codesign-style precision tokens are provided.
@@ -1611,6 +1795,7 @@ def main(
     print(f"  Decode W   : {decode_weight_mode}")
     if gptq_dataset:
         print(f"  GPTQ       : dataset={gptq_dataset}, nsamples={gptq_nsamples}, seqlen={gptq_seqlen}, max_layers={gptq_max_layers}")
+        print(f"  GPTQ cache : mode={gptq_cache_mode}, dir={gptq_cache_dir or 'none'}")
     print(f"  Server     : http://{server_host}:{server_port}")
     if gpu_memory_reserve_enabled:
         print(
@@ -1686,6 +1871,7 @@ def main(
         # Weight quantization
         # ------------------------------------------------------------------
         resolved_gptq_config = None
+        gptq_cache_info = {"mode": str(gptq_cache_mode or "off").lower(), "hit": False}
         if quant_config_is_none:
             logger.info("True FP baseline requested: skipping quantize_module_transform_pass and phase switching.")
             if model_parallel:
@@ -1720,6 +1906,8 @@ def main(
                 cali_batch_size=gptq_cali_batch_size,
                 max_layers=gptq_max_layers,
             )
+            gptq_cache = None
+            gptq_cache_info = {"mode": str(gptq_cache_mode or "off").lower(), "hit": False}
             if resolved_gptq_config:
                 marked_gptq_configs = _mark_gptq_projection_configs(pass_args)
                 logger.info(
@@ -1731,6 +1919,21 @@ def main(
                     resolved_gptq_config.get("max_layers"),
                     marked_gptq_configs,
                 )
+                if str(gptq_cache_mode or "off").lower() != "off":
+                    if not gptq_cache_dir:
+                        raise ValueError("gptq_cache_dir must be set when gptq_cache_mode is not 'off'.")
+                    gptq_cache = _GptqWeightCache(
+                        cache_dir=gptq_cache_dir,
+                        mode=gptq_cache_mode,
+                        gptq_config=resolved_gptq_config,
+                        total_layers=len(model.model.layers),
+                    )
+                    cache_hit = gptq_cache.prepare(model)
+                    gptq_cache_info = gptq_cache.summary()
+                    if cache_hit:
+                        pass_args.pop("gptq", None)
+                    else:
+                        resolved_gptq_config["checkpoint_dir"] = str(gptq_cache.cache_path)
 
             n_linear = sum(
                 1 for _, m in model.named_modules()
@@ -1738,15 +1941,26 @@ def main(
             )
             logger.info("Quantizing %d linear layers...", n_linear)
             t0 = time.time()
-            model, _ = quantize_module_transform_pass(model, pass_args)
-            if _codesign_tokens_enabled:
-                unified_counts = apply_unified_mx_wrappers(model)
-                logger.info(
-                    "Installed unified MX wrappers: %d Linear, %d LlamaAttention",
-                    unified_counts.get("linear", 0),
-                    unified_counts.get("attention", 0),
-                )
-            logger.info("Quantization complete in %.1fs", time.time() - t0)
+            try:
+                model, _ = quantize_module_transform_pass(model, pass_args)
+                if gptq_cache is not None and not gptq_cache.hit:
+                    gptq_cache.finalize()
+                    gptq_cache_info = gptq_cache.summary()
+                    # The cache lock only protects GPTQ cache population.
+                    # Runtime wrapper installation is trial-local and can run
+                    # concurrently on other workers once metadata is complete.
+                    gptq_cache.release()
+                if _codesign_tokens_enabled:
+                    unified_counts = apply_unified_mx_wrappers(model)
+                    logger.info(
+                        "Installed unified MX wrappers: %d Linear, %d LlamaAttention",
+                        unified_counts.get("linear", 0),
+                        unified_counts.get("attention", 0),
+                    )
+                logger.info("Quantization complete in %.1fs", time.time() - t0)
+            finally:
+                if gptq_cache is not None:
+                    gptq_cache.release()
 
             if model_parallel:
                 model = move_to_gpu(model, model_parallel)
@@ -1865,6 +2079,7 @@ def main(
                 "cali_batch_size": resolved_gptq_config.get("cali_batch_size"),
                 "max_layers": resolved_gptq_config.get("max_layers"),
             }
+            scores["gptq_cache"] = gptq_cache_info
 
         if log_dir:
             save_results(log_dir, scores)
