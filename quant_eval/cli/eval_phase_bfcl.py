@@ -1993,6 +1993,12 @@ def main(
                 if gptq_cache is not None:
                     gptq_cache.release()
 
+            # Release the guard before any final device move or phase-switch
+            # setup. Those steps can allocate temporary tensors (for example
+            # during module.to()), so holding the fixed reserve here can leave
+            # too little headroom and OOM before BFCL generation even starts.
+            gpu_memory_reserve.release()
+
             if model_parallel:
                 model = move_to_gpu(model, model_parallel)
             else:
@@ -2016,12 +2022,6 @@ def main(
         # ------------------------------------------------------------------
         # Start the OpenAI-compatible server (hook fires on every request)
         # ------------------------------------------------------------------
-        # Release the guard before starting the local server. This avoids a
-        # transient overlap between reserve release and the first BFCL request's
-        # decode/KV allocations, and the release routine logs free memory before
-        # and after CUDA allocator synchronization.
-        gpu_memory_reserve.release()
-
         device_str = device_id if not model_parallel else "cuda"
         app = _build_server_app(
             model,

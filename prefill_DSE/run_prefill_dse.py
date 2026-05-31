@@ -159,14 +159,43 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
 
 
-def _append_csv(path: Path, row: dict[str, Any], lock: threading.Lock) -> None:
+def _upsert_csv(path: Path, row: dict[str, Any], lock: threading.Lock) -> None:
+    """Write one trial result, replacing an existing row for the same trial.
+
+    Retry runs should update the canonical result for a design point instead of
+    appending a second row after the old failed entry.  Keep first-seen order so
+    the CSV remains aligned with the deterministic design-space order, but make
+    the row content reflect the latest completed attempt.
+    """
+    clean_row = {k: row.get(k, "") for k in RESULT_FIELDS}
+    trial_id = str(clean_row.get("trial_id", ""))
+    if not trial_id:
+        raise ValueError("Cannot write DSE result row without trial_id")
+
     with lock:
-        exists = path.exists()
-        with path.open("a", newline="", encoding="utf-8") as f:
+        rows: list[dict[str, Any]] = []
+        replaced = False
+        if path.exists():
+            with path.open(newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for existing in reader:
+                    if existing.get("trial_id") == trial_id:
+                        if not replaced:
+                            rows.append(clean_row)
+                            replaced = True
+                        # Drop duplicate stale rows for the same trial.
+                    else:
+                        rows.append({k: existing.get(k, "") for k in RESULT_FIELDS})
+        if not replaced:
+            rows.append(clean_row)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with tmp.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
-            if not exists:
-                writer.writeheader()
-            writer.writerow({k: row.get(k, "") for k in RESULT_FIELDS})
+            writer.writeheader()
+            writer.writerows(rows)
+        tmp.replace(path)
 
 
 def _write_design_space(path: Path, trials: list[Trial]) -> None:
@@ -493,7 +522,7 @@ def _worker(worker_idx: int, gpu: str, cfg: dict[str, Any], q: queue.Queue, args
         port = _claim_port(server_host, preferred_port, active_ports, port_lock)
         try:
             row = _run_trial(cfg, trial, trial_dir, gpu, port, args)
-            _append_csv(results_csv, row, csv_lock)
+            _upsert_csv(results_csv, row, csv_lock)
         finally:
             with port_lock:
                 active_ports.discard(port)
