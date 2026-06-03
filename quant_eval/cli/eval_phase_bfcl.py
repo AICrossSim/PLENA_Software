@@ -99,6 +99,7 @@ class _FixedCudaMemoryReserve:
         poll_sec: float,
         chunk_mb: int,
         enabled: bool,
+        release_label: str = "before BFCL generate",
     ):
         self.device = torch.device(device)
         self.reserve_mb = int(reserve_mb or 0)
@@ -106,6 +107,7 @@ class _FixedCudaMemoryReserve:
         self.poll_sec = float(poll_sec)
         self.chunk_mb = int(chunk_mb)
         self.enabled = bool(enabled and self.reserve_mb > 0)
+        self.release_label = release_label
         self._buffers: list[torch.Tensor] = []
         self._reserved_mb = 0
         self._total_mb = 0
@@ -227,14 +229,15 @@ class _FixedCudaMemoryReserve:
 
         if log:
             logger.info(
-                "GPU reserve released before BFCL generate: released=%dMB free_before=%dMB free_after=%dMB total=%dMB",
+                "GPU reserve released %s: released=%dMB free_before=%dMB free_after=%dMB total=%dMB",
+                self.release_label,
                 released_mb,
                 free_before_mb,
                 free_after_mb,
                 total_mb,
             )
             print(
-                "GPU reserve released before BFCL generate: "
+                f"GPU reserve released {self.release_label}: "
                 f"released={released_mb}MB "
                 f"free_before={free_before_mb}MB "
                 f"free_after={free_after_mb}MB "

@@ -22,4 +22,5 @@ calib/*
 .bfcl/
 # Experiment outputs.
 runs/
-
+# Statistical analysis
+statistics/
