@@ -293,6 +293,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
         "--model_name", str(model["model_name"]),
         "--dtype", str(model.get("dtype", "bfloat16")),
         "--quant_config", str(model.get("quant_config", "quant_eval/configs/llama_mxint4.toml")),
+        "--model_family", str(model.get("model_family", "llama")),
         "--device_id", "cuda:0",
         "--dataset", str(args.dataset or ppl.get("dataset", "wikitext")),
         "--subset", str(args.subset if args.subset is not None else ppl.get("subset", "wikitext-2-raw-v1")),

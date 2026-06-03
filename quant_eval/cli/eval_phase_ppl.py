@@ -26,7 +26,7 @@ from quant_eval.eval import evaluate_perplexity
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.eval.unified_mx import apply_unified_mx_wrappers
 from quant_eval.precision import (
-    apply_llama_dse_quant_config,
+    apply_dse_quant_config,
     fp_data_config,
     mx_data_config,
     parse_fp_setting,
@@ -114,14 +114,15 @@ def _resolve_phase_precision(
 
 
 def main(
-    model_name: str = "Qwen/Qwen3-8B-FC",
+    model_name: str = "Qwen/Qwen3-8B",
     dataset: str = "wikitext",
     subset: str | None = "wikitext-2-raw-v1",
     split: str = "test",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
-    quant_config: str | None = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: str | None = "quant_eval/configs/qwen3_mxint16.toml",
     model_parallel: bool = False,
+    model_family: str = "qwen3",
     seqlen: int = 1024,
     max_samples: int | None = 64,
     # GPU reservation guard. Held during cache/wrapper setup and released before PPL forward.
@@ -166,6 +167,7 @@ def main(
     log_dir: Union[str, None] = None,
 ):
     device_id = _normalize_device_id(device_id)
+    model_family = model_family.lower()
     gpu_memory_reserve_enabled = (
         not gpu_memory_reserve_disable
         and gpu_memory_reserve_mb is not None
@@ -248,6 +250,7 @@ def main(
     print("=" * 64)
     print(f"  Model     : {model_name}")
     print(f"  Dataset   : {dataset}/{subset or '-'} split={split}")
+    print(f"  Family    : {model_family}")
     print(f"  Seqlen    : {seqlen}, max_samples={max_samples if max_samples is not None else 'all'}")
     print(f"  Weights   : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     if gptq_dataset:
@@ -309,7 +312,7 @@ def main(
 
         pass_args = load_quant_config(str(quant_config))
         if codesign_tokens_enabled:
-            apply_llama_dse_quant_config(
+            apply_dse_quant_config(
                 pass_args,
                 act_precision=precision_metadata["prefill"]["ACT_ELEMENT_WIDTH"],
                 kv_precision=precision_metadata["prefill"]["KV_ELEMENT_WIDTH"],
@@ -317,6 +320,7 @@ def main(
                 mx_block_size=dse_mx_block_size,
                 weight_precision=precision_metadata["dse_weight_precision"],
                 weight_block_size=precision_metadata["dse_weight_block_size"],
+                model_family=model_family,
             )
         resolved_gptq_config = _inject_gptq_config(
             pass_args,
@@ -408,6 +412,7 @@ def main(
         "max_samples": max_samples,
         "phase_layer_configs": phase_configs,
         "precision_metadata": precision_metadata,
+        "model_family": model_family,
         "decode_weight_mode": decode_weight_mode,
         "gptq_cache": gptq_cache_info,
         "gpu_memory_reserve": gpu_memory_reserve.summary(),

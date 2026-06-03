@@ -158,7 +158,10 @@ def fp_weight_config(spec: PrecisionSpec) -> dict:
     }
 
 
-def apply_llama_dse_quant_config(
+SUPPORTED_MODEL_FAMILIES = {"llama", "qwen3"}
+
+
+def apply_dse_quant_config(
     pass_args: dict,
     *,
     act_precision: str,
@@ -167,13 +170,19 @@ def apply_llama_dse_quant_config(
     mx_block_size: int = 16,
     weight_precision: str = "MXINT_4",
     weight_block_size: int | None = None,
+    model_family: str = "llama",
 ) -> dict[str, str]:
-    """Patch pass_args with Llama wrapper configs for one DSE precision point.
+    """Patch pass_args with model-family DSE configs for one precision point.
 
-    This mutates and returns ``pass_args``.  It keeps GPTQ/weight precision
-    separate from ACT/KV/FP_SETTING by default: projection weights use
-    ``weight_precision`` unless GPTQ later overwrites them.
+    Llama and Qwen3 use the same HF submodule names for the projection, MLP,
+    and RMSNorm paths that this eval stack quantizes.  Keep the model family
+    explicit so future architectures can fail fast instead of silently applying
+    Llama assumptions.
     """
+    model_family = model_family.lower()
+    if model_family not in SUPPORTED_MODEL_FAMILIES:
+        raise ValueError(f"Unsupported model_family={model_family!r}; expected one of {sorted(SUPPORTED_MODEL_FAMILIES)}.")
+
     weight_block_size = mx_block_size if weight_block_size is None else weight_block_size
     act = parse_mx_precision(act_precision)
     kv = parse_mx_precision(kv_precision)
@@ -233,4 +242,11 @@ def apply_llama_dse_quant_config(
         "MX_BLOCK_SIZE": str(mx_block_size),
         "WEIGHT_PRECISION": weight.canonical,
         "WEIGHT_BLOCK_SIZE": str(weight_block_size),
+        "MODEL_FAMILY": model_family,
     }
+
+
+def apply_llama_dse_quant_config(pass_args: dict, **kwargs) -> dict[str, str]:
+    """Backward-compatible alias for legacy callers."""
+    kwargs.setdefault("model_family", "llama")
+    return apply_dse_quant_config(pass_args, **kwargs)

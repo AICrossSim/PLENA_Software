@@ -59,7 +59,7 @@ from quant_eval.utils import (
 )
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.quantize import load_quant_config
-from quant_eval.precision import apply_llama_dse_quant_config, parse_fp_setting, parse_mx_precision, mx_data_config, fp_data_config
+from quant_eval.precision import apply_dse_quant_config, parse_fp_setting, parse_mx_precision, mx_data_config, fp_data_config
 from quant_eval.eval.unified_mx import apply_unified_mx_wrappers
 from quant_eval.bfcl_adapters import BFCL_ADAPTER_NAMES, resolve_bfcl_adapter
 
@@ -1494,15 +1494,16 @@ def _run_bfcl_evaluate(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main(
-    model_name:  str = "Qwen/Qwen3-8B-FC",
+    model_name:  str = "Qwen/Qwen3-8B",
     device_id:   str = "cuda:0",
     dtype:       str = "bfloat16",
-    quant_config: str = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: str = "quant_eval/configs/qwen3_mxint16.toml",
     model_parallel: bool = False,
     # ── BFCL settings ──────────────────────────────────────────────────────
     bfcl_test_categories: Union[list[str], str, None] = None,
-    bfcl_model_alias:     str | None = None,
+    bfcl_model_alias:     str | None = "Qwen/Qwen3-8B-FC",
     bfcl_adapter:        str = "auto",
+    model_family:        str = "qwen3",
     bfcl_num_threads:     int   = 1,
     server_host:          str   = DEFAULT_HOST,
     server_port:          int   = DEFAULT_PORT,
@@ -1577,6 +1578,8 @@ def main(
         bfcl_adapter: Response adapter for BFCL handler protocol. ``auto`` maps
             Qwen3 aliases to official Qwen FC ``<tool_call>`` output and Llama
             aliases to the legacy Llama 3.1 payload normalizer.
+        model_family: Quantized model family for DSE config generation. Supported
+            values are ``qwen3`` and ``llama``.
         bfcl_num_threads: Parallel inference threads for ``bfcl generate``.
         server_host: Host for the local OpenAI-compatible server.
         server_port: Port for the local OpenAI-compatible server.
@@ -1633,6 +1636,7 @@ def main(
     bfcl_tool_mode = _resolve_bfcl_tool_mode(bfcl_test_categories, bfcl_tool_mode)
     bfcl_adapter_obj = resolve_bfcl_adapter(bfcl_adapter, model_name=model_name, model_alias=bfcl_model_alias)
     resolved_bfcl_adapter = bfcl_adapter_obj.name
+    model_family = model_family.lower()
     decode_weight_mode = decode_weight_mode.lower()
     if decode_weight_mode not in ("quantized", "fp"):
         raise ValueError(
@@ -1834,6 +1838,7 @@ def main(
     print(f"  Categories : {bfcl_test_categories}")
     print(f"  Tool mode  : {bfcl_tool_mode}")
     print(f"  Adapter    : {resolved_bfcl_adapter} (requested={bfcl_adapter})")
+    print(f"  Family     : {model_family}")
     print(f"  Max new tok: {bfcl_max_new_tokens if bfcl_max_new_tokens is not None else 'uncapped'}")
     print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     print(f"  Decode W   : {decode_weight_mode}")
@@ -1928,7 +1933,7 @@ def main(
 
             pass_args = load_quant_config(quant_config)
             if _codesign_tokens_enabled:
-                apply_llama_dse_quant_config(
+                apply_dse_quant_config(
                     pass_args,
                     act_precision=precision_metadata["prefill"]["ACT_ELEMENT_WIDTH"],
                     kv_precision=precision_metadata["prefill"]["KV_ELEMENT_WIDTH"],
@@ -1936,6 +1941,7 @@ def main(
                     mx_block_size=dse_mx_block_size,
                     weight_precision=_resolved_dse_weight_precision,
                     weight_block_size=_resolved_dse_weight_block_size,
+                    model_family=model_family,
                 )
             resolved_gptq_config = _inject_gptq_config(
                 pass_args,
@@ -2114,6 +2120,7 @@ def main(
         scores["bfcl_tool_mode"] = bfcl_tool_mode
         scores["bfcl_adapter"] = resolved_bfcl_adapter
         scores["bfcl_adapter_requested"] = bfcl_adapter
+        scores["model_family"] = model_family
         scores["bfcl_max_new_tokens"] = bfcl_max_new_tokens
         scores["decode_weight_mode"] = decode_weight_mode
         scores["precision_metadata"] = precision_metadata
