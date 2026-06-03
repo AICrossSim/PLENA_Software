@@ -362,7 +362,10 @@ def main(
                 gptq_cache.finalize()
                 gptq_cache_info = gptq_cache.summary()
             if codesign_tokens_enabled:
-                counts = apply_unified_mx_wrappers(model)
+                counts = apply_unified_mx_wrappers(
+                    model,
+                    qwen3_attention_config=prefill["attn"] if model_family == "qwen3" else None,
+                )
                 logger.info("Installed unified MX wrappers: %s", counts)
             logger.info("Quantization setup complete in %.1fs", time.time() - t0)
         finally:
