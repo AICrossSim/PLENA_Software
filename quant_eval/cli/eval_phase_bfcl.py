@@ -61,6 +61,7 @@ from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.quantize import load_quant_config
 from quant_eval.precision import apply_llama_dse_quant_config, parse_fp_setting, parse_mx_precision, mx_data_config, fp_data_config
 from quant_eval.eval.unified_mx import apply_unified_mx_wrappers
+from quant_eval.bfcl_adapters import BFCL_ADAPTER_NAMES, resolve_bfcl_adapter
 
 from fastapi import FastAPI, Request
 
@@ -342,7 +343,7 @@ def _execute_tool(tool_call: dict) -> str:
 #  Minimal OpenAI-compatible chat-completion server
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute", max_new_tokens: int | None = 256):
+def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute", max_new_tokens: int | None = 256, bfcl_adapter=None):
     """
     Return a FastAPI application that exposes POST /v1/chat/completions.
 
@@ -361,6 +362,8 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
 
     if tool_mode not in ("return", "execute"):
         raise ValueError(f"tool_mode must be 'return' or 'execute', got {tool_mode!r}.")
+    if bfcl_adapter is None:
+        bfcl_adapter = resolve_bfcl_adapter("raw", getattr(tokenizer, "name_or_path", None), None)
     if max_new_tokens is not None and int(max_new_tokens) <= 0:
         raise ValueError(f"max_new_tokens must be positive or None, got {max_new_tokens!r}.")
 
@@ -427,7 +430,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
 
             logger.debug("Prompt tokens: %s", raw_text[:200])
             # ── Parse tool calls ───────────────────────────────────────
-            tool_calls, content = _parse_tool_calls(raw_text)
+            tool_calls, content = bfcl_adapter.parse_tool_calls(raw_text)
             content = content or ""
 
             # ── No tool calls → final answer, return immediately ───────
@@ -568,7 +571,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
             total_completion_tokens += int(generated_ids.shape[-1])
 
             # ── Parse tool calls ───────────────────────────────────────
-            tool_calls, content = _parse_tool_calls(raw_text)
+            tool_calls, content = bfcl_adapter.parse_tool_calls(raw_text)
             content = content or ""
             print(tool_calls)
 
@@ -577,7 +580,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 print(f"✅ Final answer reached at turn {turn + 1}")
                 response_text = raw_text
                 if tool_mode == "return":
-                    response_text = _normalize_bfcl_return_text(raw_text)
+                    response_text = bfcl_adapter.normalize_return_text(raw_text)
                 response = {
                     "id":      f"cmpl-{int(time.time()*1000)}",
                     "object":  "text_completion",
@@ -603,7 +606,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
             # (<|python_tag|>...<|eom_id|>); strip those before BFCL evaluates.
             if tool_mode == "return":
                 print(f"↩️ Returning completion tool calls at turn {turn + 1}: {[tc['function']['name'] for tc in tool_calls]}")
-                response_text = _bfcl_return_text_from_tool_calls(tool_calls)
+                response_text = bfcl_adapter.return_text_from_tool_calls(tool_calls, raw_text=raw_text)
                 response = {
                     "id":      f"cmpl-{int(time.time()*1000)}",
                     "object":  "text_completion",
@@ -1499,6 +1502,7 @@ def main(
     # ── BFCL settings ──────────────────────────────────────────────────────
     bfcl_test_categories: Union[list[str], str, None] = None,
     bfcl_model_alias:     str | None = None,
+    bfcl_adapter:        str = "auto",
     bfcl_num_threads:     int   = 1,
     server_host:          str   = DEFAULT_HOST,
     server_port:          int   = DEFAULT_PORT,
@@ -1570,6 +1574,9 @@ def main(
             or comma-separated categories.
         bfcl_model_alias: BFCL result-file model alias. If set, this exact
             value is used for ``bfcl generate/evaluate --model``.
+        bfcl_adapter: Response adapter for BFCL handler protocol. ``auto`` maps
+            Qwen3 aliases to official Qwen FC ``<tool_call>`` output and Llama
+            aliases to the legacy Llama 3.1 payload normalizer.
         bfcl_num_threads: Parallel inference threads for ``bfcl generate``.
         server_host: Host for the local OpenAI-compatible server.
         server_port: Port for the local OpenAI-compatible server.
@@ -1624,6 +1631,8 @@ def main(
     """
     bfcl_test_categories = _normalize_bfcl_categories(bfcl_test_categories)
     bfcl_tool_mode = _resolve_bfcl_tool_mode(bfcl_test_categories, bfcl_tool_mode)
+    bfcl_adapter_obj = resolve_bfcl_adapter(bfcl_adapter, model_name=model_name, model_alias=bfcl_model_alias)
+    resolved_bfcl_adapter = bfcl_adapter_obj.name
     decode_weight_mode = decode_weight_mode.lower()
     if decode_weight_mode not in ("quantized", "fp"):
         raise ValueError(
@@ -1824,6 +1833,7 @@ def main(
         print(f"  BFCL Alias : {bfcl_model_alias}")
     print(f"  Categories : {bfcl_test_categories}")
     print(f"  Tool mode  : {bfcl_tool_mode}")
+    print(f"  Adapter    : {resolved_bfcl_adapter} (requested={bfcl_adapter})")
     print(f"  Max new tok: {bfcl_max_new_tokens if bfcl_max_new_tokens is not None else 'uncapped'}")
     print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     print(f"  Decode W   : {decode_weight_mode}")
@@ -2032,6 +2042,7 @@ def main(
             device_str,
             tool_mode=bfcl_tool_mode,
             max_new_tokens=bfcl_max_new_tokens,
+            bfcl_adapter=bfcl_adapter_obj,
         )
         _start_server(app, server_host, server_port)
 
@@ -2101,6 +2112,8 @@ def main(
         scores["phase_layer_configs"] = phase_configs
         scores["bfcl_categories"] = bfcl_test_categories
         scores["bfcl_tool_mode"] = bfcl_tool_mode
+        scores["bfcl_adapter"] = resolved_bfcl_adapter
+        scores["bfcl_adapter_requested"] = bfcl_adapter
         scores["bfcl_max_new_tokens"] = bfcl_max_new_tokens
         scores["decode_weight_mode"] = decode_weight_mode
         scores["precision_metadata"] = precision_metadata
