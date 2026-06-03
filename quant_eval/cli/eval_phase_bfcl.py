@@ -2001,11 +2001,16 @@ def main(
                     # concurrently on other workers once metadata is complete.
                     gptq_cache.release()
                 if _codesign_tokens_enabled:
-                    unified_counts = apply_unified_mx_wrappers(model)
+                    unified_counts = apply_unified_mx_wrappers(
+                        model,
+                        qwen3_attention_config=_prefill_precision["attn"] if model_family == "qwen3" else None,
+                    )
                     logger.info(
-                        "Installed unified MX wrappers: %d Linear, %d LlamaAttention",
+                        "Installed unified MX wrappers: %d Linear, %d attention (llama=%d, qwen3=%d)",
                         unified_counts.get("linear", 0),
                         unified_counts.get("attention", 0),
+                        unified_counts.get("llama_attention", 0),
+                        unified_counts.get("qwen3_attention", 0),
                     )
                 logger.info("Quantization complete in %.1fs", time.time() - t0)
             finally:

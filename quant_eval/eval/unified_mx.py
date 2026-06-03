@@ -22,6 +22,12 @@ from transformers.models.llama.modeling_llama import (
     eager_attention_forward as _hf_eager_attention_forward,
     repeat_kv,
 )
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3Attention,
+    apply_rotary_pos_emb as qwen3_apply_rotary_pos_emb,
+    eager_attention_forward as _qwen3_eager_attention_forward,
+    repeat_kv as qwen3_repeat_kv,
+)
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from chop.nn.quantizers import mxint_quantizer, mxfp_quantizer
@@ -138,6 +144,62 @@ def _eager_attention_forward_unified(
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
+
+
+def _eager_qwen3_attention_forward_unified(
+    module,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Optional[Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    qk_bypass: bool = False,
+    qk_config: dict | None = None,
+    av_bypass: bool = False,
+    av_config: dict | None = None,
+    softmax_bypass: bool = False,
+    softmax_config: dict | None = None,
+    **kwargs,
+):
+    key_states = qwen3_repeat_kv(key, module.num_key_value_groups)
+    value_states = qwen3_repeat_kv(value, module.num_key_value_groups)
+
+    if not qk_bypass:
+        query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+
+    if not softmax_bypass:
+        attn_weights = softmax_minifloat(attn_weights, softmax_config, dim=-1)
+    else:
+        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
+
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+
+    if not av_bypass:
+        attn_weights = quantize_mx(attn_weights, av_config, block_dim=-1, prefix="data_in")
+
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+
+
+def _phase_attn_config_to_q_config(config: dict | None) -> dict:
+    cfg = deepcopy(config or {})
+    kv = deepcopy(cfg.pop("kv_cache", {}))
+    softmax = deepcopy(cfg.pop("softmax", {}))
+    rope = deepcopy(cfg.pop("rope", {}))
+    act_cfg = deepcopy(cfg)
+    return {
+        "qk_matmul": deepcopy(act_cfg),
+        "av_matmul": deepcopy(act_cfg),
+        "kv_cache": kv,
+        "softmax": softmax,
+        "rope": rope,
+    }
 
 
 class LinearMXUnified(nn.Linear):
@@ -300,6 +362,110 @@ class LlamaAttentionMXUnified(LlamaAttention):
         return attn_output, attn_weights
 
 
+class Qwen3AttentionMXUnified(Qwen3Attention):
+    """Qwen3 attention wrapper with independent ACT/KV MX families."""
+
+    def __init__(self, config, layer_idx, q_config: dict | None = None):
+        super().__init__(config, layer_idx)
+        q_config = q_config or {}
+        self.qk_config = q_config.get("qk_matmul", {})
+        self.av_config = q_config.get("av_matmul", {})
+        self.rope_config = q_config.get("rope", {})
+        self.softmax_config = q_config.get("softmax", {})
+        self.kv_cache_config = q_config.get("kv_cache", {})
+        self.qk_bypass = bool(self.qk_config.get("bypass", False))
+        self.av_bypass = bool(self.av_config.get("bypass", False))
+        self.rope_bypass = bool(self.rope_config.get("bypass", False))
+        self.softmax_bypass = bool(self.softmax_config.get("bypass", False))
+        self.kv_cache_bypass = bool(self.kv_cache_config.get("bypass", False))
+
+    @classmethod
+    def from_attention(cls, attention: Qwen3Attention, q_config: dict | None = None) -> "Qwen3AttentionMXUnified":
+        cfg = q_config or {
+            "qk_matmul": deepcopy(getattr(attention, "qk_config", {})),
+            "av_matmul": deepcopy(getattr(attention, "av_config", {})),
+            "kv_cache": deepcopy(getattr(attention, "kv_cache_config", {})),
+            "softmax": deepcopy(getattr(attention, "softmax_config", {})),
+            "rope": deepcopy(getattr(attention, "rope_config", {})),
+        }
+        new = cls(attention.config, attention.layer_idx, cfg)
+        device, dtype = next(attention.parameters()).device, next(attention.parameters()).dtype
+        new = new.to(device=device, dtype=dtype)
+        new.q_proj = attention.q_proj
+        new.k_proj = attention.k_proj
+        new.v_proj = attention.v_proj
+        new.o_proj = attention.o_proj
+        new.q_norm = attention.q_norm
+        new.k_norm = attention.k_norm
+        return new
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        position_embeddings: Tuple[Tensor, Tensor],
+        attention_mask: Optional[Tensor],
+        past_key_values: Optional[Cache] = None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        if not self.rope_bypass:
+            query_states, key_states = rope_minifloat(query_states, key_states, cos, sin, self.rope_config)
+        else:
+            query_states, key_states = qwen3_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            if not self.kv_cache_bypass:
+                key_states = quantize_mx(key_states, self.kv_cache_config, block_dim=-1, prefix="data_in")
+                value_states = quantize_mx(value_states, self.kv_cache_config, block_dim=-1, prefix="data_in")
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        if self.qk_bypass and self.av_bypass and self.softmax_bypass:
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation,
+                _qwen3_eager_attention_forward,
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+        else:
+            attn_output, attn_weights = _eager_qwen3_attention_forward_unified(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                qk_bypass=self.qk_bypass,
+                qk_config=self.qk_config,
+                av_bypass=self.av_bypass,
+                av_config=self.av_config,
+                softmax_bypass=self.softmax_bypass,
+                softmax_config=self.softmax_config,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 def _patch_rms_norm_dtype_preservation() -> bool:
     """Keep Chop RMSNorm minifloat outputs in the input dtype.
 
@@ -338,12 +504,18 @@ def _replace_child(root: nn.Module, name: str, new_module: nn.Module) -> None:
         setattr(parent, leaf, new_module)
 
 
-def apply_unified_mx_wrappers(model: nn.Module) -> dict[str, int]:
-    """Replace Chop MXInt/MXFP Llama/Linear wrappers with unified wrappers."""
+def apply_unified_mx_wrappers(model: nn.Module, qwen3_attention_config: dict | None = None) -> dict[str, int]:
+    """Replace Chop/Transformers MX modules with unified runtime wrappers."""
     from chop.nn.quantized.modules.linear import LinearMXInt, LinearMXFP
     from chop.nn.quantized.modules.llama.attention import LlamaAttentionMXInt, LlamaAttentionMXFP
 
-    counts = {"linear": 0, "attention": 0, "rms_norm_dtype_patch": 0}
+    try:
+        from chop.nn.quantized.modules.qwen3.attention import Qwen3AttentionMXInt, Qwen3AttentionMXFP
+        qwen3_chop_attention_types = (Qwen3AttentionMXInt, Qwen3AttentionMXFP)
+    except Exception:  # pragma: no cover - optional package shape
+        qwen3_chop_attention_types = ()
+
+    counts = {"linear": 0, "llama_attention": 0, "qwen3_attention": 0, "rms_norm_dtype_patch": 0}
     counts["rms_norm_dtype_patch"] = int(_patch_rms_norm_dtype_preservation())
 
     # Replace leaves first so attention replacement preserves unified projections.
@@ -355,6 +527,14 @@ def apply_unified_mx_wrappers(model: nn.Module) -> dict[str, int]:
     for name, module in list(model.named_modules()):
         if isinstance(module, (LlamaAttentionMXInt, LlamaAttentionMXFP)):
             _replace_child(model, name, LlamaAttentionMXUnified.from_attention(module))
-            counts["attention"] += 1
+            counts["llama_attention"] += 1
+        elif qwen3_chop_attention_types and isinstance(module, qwen3_chop_attention_types):
+            _replace_child(model, name, Qwen3AttentionMXUnified.from_attention(module))
+            counts["qwen3_attention"] += 1
+        elif qwen3_attention_config is not None and isinstance(module, Qwen3Attention):
+            q_config = _phase_attn_config_to_q_config(qwen3_attention_config)
+            _replace_child(model, name, Qwen3AttentionMXUnified.from_attention(module, q_config))
+            counts["qwen3_attention"] += 1
 
+    counts["attention"] = counts["llama_attention"] + counts["qwen3_attention"]
     return counts

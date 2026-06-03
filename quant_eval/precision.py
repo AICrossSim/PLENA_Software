@@ -200,16 +200,24 @@ def apply_dse_quant_config(
     mlp_proj_selector = r"model\.layers\.\d+\.mlp\.(gate|up|down)_proj"
     rms_selector = r"model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)$|model\.norm$"
 
-    pass_args[attn_selector] = {
-        "config": {
-            "name": mx_module_name(act),
-            "qk_matmul": mx_data_config(act, mx_block_size),
-            "av_matmul": mx_data_config(act, mx_block_size),
-            "kv_cache": mx_data_config(kv, mx_block_size),
-            "softmax": fp_data_config(fp),
-            "rope": fp_data_config(fp),
+    # Plain Qwen3 block instantiation is currently missing in Chop's
+    # module_modify_helper.  Remove any block-level selectors from TOML and let
+    # quant_eval install eval-side attention wrappers after Linear replacement.
+    # Llama keeps using Chop block wrappers here for backward compatibility.
+    pass_args.pop(attn_selector, None)
+    pass_args.pop(mlp_selector, None)
+    pass_args.pop(rms_selector, None)
+    if model_family == "llama":
+        pass_args[attn_selector] = {
+            "config": {
+                "name": mx_module_name(act),
+                "qk_matmul": mx_data_config(act, mx_block_size),
+                "av_matmul": mx_data_config(act, mx_block_size),
+                "kv_cache": mx_data_config(kv, mx_block_size),
+                "softmax": fp_data_config(fp),
+                "rope": fp_data_config(fp),
+            }
         }
-    }
 
     linear_cfg = {
         "name": mx_module_name(weight),
@@ -220,20 +228,21 @@ def apply_dse_quant_config(
     pass_args[attn_proj_selector] = {"config": linear_with_bias_cfg}
     pass_args[mlp_proj_selector] = {"config": linear_cfg}
 
-    pass_args[mlp_selector] = {
-        "config": {
-            "name": mx_module_name(act),
-            **fp_data_config(fp),
+    if model_family == "llama":
+        pass_args[mlp_selector] = {
+            "config": {
+                "name": mx_module_name(act),
+                **fp_data_config(fp),
+            }
         }
-    }
 
-    pass_args[rms_selector] = {
-        "config": {
-            "name": "minifloat",
-            **fp_data_config(fp),
-            **fp_weight_config(fp),
+        pass_args[rms_selector] = {
+            "config": {
+                "name": "minifloat",
+                **fp_data_config(fp),
+                **fp_weight_config(fp),
+            }
         }
-    }
 
     return {
         "ACT_ELEMENT_WIDTH": act.canonical,
