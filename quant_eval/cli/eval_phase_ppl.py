@@ -60,6 +60,8 @@ def _resolve_phase_precision(
     legacy_attn: dict,
     legacy_ffn: dict,
     dse_mx_block_size: int,
+    model_family: str = "llama",
+    enable_qwen_default_precision: bool = False,
 ) -> dict:
     provided = {"ACT_ELEMENT_WIDTH": act, "KV_ELEMENT_WIDTH": kv, "FP_SETTING": fp}
     if any(v is not None for v in provided.values()) and not all(v is not None for v in provided.values()):
@@ -70,19 +72,23 @@ def _resolve_phase_precision(
         )
 
     if act is None and kv is None and fp is None:
-        return {
-            "attn": dict(legacy_attn),
-            "ffn": dict(legacy_ffn),
-            "mlp": {},
-            "rms_norm": {},
-            "display": f"MXInt{legacy_attn['data_in_width']}(bs={legacy_attn['data_in_block_size']})",
-            "ffn_display": f"MXInt{legacy_ffn['data_in_width']}(bs={legacy_ffn['data_in_block_size']})",
-            "metadata": {
-                "ACT_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
-                "KV_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
-                "FP_SETTING": None,
-            },
-        }
+        if model_family == "qwen3" and enable_qwen_default_precision:
+            act, kv, fp = "MXINT_8", "MXINT_8", "FP_E8M5"
+        else:
+            attn_cfg = dict(legacy_attn)
+            return {
+                "attn": attn_cfg,
+                "ffn": dict(legacy_ffn),
+                "mlp": {},
+                "rms_norm": {},
+                "display": f"MXInt{legacy_attn['data_in_width']}(bs={legacy_attn['data_in_block_size']})",
+                "ffn_display": f"MXInt{legacy_ffn['data_in_width']}(bs={legacy_ffn['data_in_block_size']})",
+                "metadata": {
+                    "ACT_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
+                    "KV_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
+                    "FP_SETTING": None,
+                },
+            }
 
     act_spec = parse_mx_precision(act or "MXINT_4")
     kv_spec = parse_mx_precision(kv or act_spec.canonical)
@@ -208,6 +214,8 @@ def main(
         legacy_attn=_legacy_mx_config(prefill_attn_width, prefill_attn_block_size),
         legacy_ffn=_legacy_mx_config(prefill_ffn_width, prefill_ffn_block_size),
         dse_mx_block_size=dse_mx_block_size,
+        model_family=model_family,
+        enable_qwen_default_precision=(model_family == "qwen3" and not quant_config_is_none),
     )
     decode = _resolve_phase_precision(
         phase="decode",
@@ -217,6 +225,8 @@ def main(
         legacy_attn=_legacy_mx_config(decode_attn_width, decode_attn_block_size),
         legacy_ffn=_legacy_mx_config(decode_ffn_width, decode_ffn_block_size),
         dse_mx_block_size=dse_mx_block_size,
+        model_family=model_family,
+        enable_qwen_default_precision=(model_family == "qwen3" and not quant_config_is_none),
     )
     phase_configs = {
         "prefill": {
@@ -239,7 +249,8 @@ def main(
         "dse_weight_precision": dse_weight_precision or (f"MXINT_{gptq_weight_width}" if gptq_dataset else "MXINT_8"),
         "dse_weight_block_size": dse_weight_block_size if dse_weight_block_size is not None else (gptq_weight_block_size if gptq_dataset else None),
     }
-    codesign_tokens_enabled = any(v is not None for v in (
+    qwen3_default_precision_enabled = model_family == "qwen3" and not quant_config_is_none
+    codesign_tokens_enabled = qwen3_default_precision_enabled or any(v is not None for v in (
         act_element_width_prefill, act_element_width_decode,
         kv_element_width_prefill, kv_element_width_decode,
         fp_setting_prefill, fp_setting_decode,
@@ -361,10 +372,12 @@ def main(
             if gptq_cache is not None and not gptq_cache.hit:
                 gptq_cache.finalize()
                 gptq_cache_info = gptq_cache.summary()
-            if codesign_tokens_enabled:
+            if codesign_tokens_enabled or model_family == "qwen3":
                 counts = apply_unified_mx_wrappers(
                     model,
                     qwen3_attention_config=prefill["attn"] if model_family == "qwen3" else None,
+                    qwen3_mlp_config=prefill["mlp"] if model_family == "qwen3" and prefill["mlp"] else None,
+                    qwen3_rms_norm_config=prefill["rms_norm"] if model_family == "qwen3" and prefill["rms_norm"] else None,
                 )
                 logger.info("Installed unified MX wrappers: %s", counts)
             logger.info("Quantization setup complete in %.1fs", time.time() - t0)

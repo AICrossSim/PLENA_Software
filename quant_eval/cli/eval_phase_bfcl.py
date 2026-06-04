@@ -343,7 +343,7 @@ def _execute_tool(tool_call: dict) -> str:
 #  Minimal OpenAI-compatible chat-completion server
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute", max_new_tokens: int | None = 256, bfcl_adapter=None):
+def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute", max_new_tokens: int | None = 2048, bfcl_adapter=None):
     """
     Return a FastAPI application that exposes POST /v1/chat/completions.
 
@@ -1508,7 +1508,7 @@ def main(
     server_host:          str   = DEFAULT_HOST,
     server_port:          int   = DEFAULT_PORT,
     bfcl_tool_mode:       str   = "auto",
-    bfcl_max_new_tokens:  int | None = 256,
+    bfcl_max_new_tokens:  int | None = 2048,
     # ── GPU reservation guard ───────────────────────────────────────────────
     gpu_memory_reserve_mb: int = 20000,
     gpu_memory_reserve_wait_sec: int = 600,
@@ -1712,19 +1712,28 @@ def main(
             )
 
         if act is None and kv is None and fp is None:
-            return {
-                "attn": dict(legacy_attn),
-                "ffn": dict(legacy_ffn),
-                "mlp": {},
-                "rms_norm": {},
-                "display": f"MXInt{legacy_attn['data_in_width']}(bs={legacy_attn['data_in_block_size']})",
-                "ffn_display": f"MXInt{legacy_ffn['data_in_width']}(bs={legacy_ffn['data_in_block_size']})",
-                "metadata": {
-                    "ACT_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
-                    "KV_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
-                    "FP_SETTING": None,
-                },
-            }
+            if model_family == "qwen3" and not quant_config_is_none:
+                # Qwen-first default: use the same full nonlinear precision
+                # semantics as explicit DSE points, but choose a conservative
+                # high-precision tuple.  This keeps RoPE/softmax, MLP SiLU, and
+                # RMSNorm input/weight under FP_SETTING instead of silently
+                # bypassing them in the default Qwen path.
+                act, kv, fp = "MXINT_8", "MXINT_8", "FP_E8M5"
+            else:
+                attn_cfg = dict(legacy_attn)
+                return {
+                    "attn": attn_cfg,
+                    "ffn": dict(legacy_ffn),
+                    "mlp": {},
+                    "rms_norm": {},
+                    "display": f"MXInt{legacy_attn['data_in_width']}(bs={legacy_attn['data_in_block_size']})",
+                    "ffn_display": f"MXInt{legacy_ffn['data_in_width']}(bs={legacy_ffn['data_in_block_size']})",
+                    "metadata": {
+                        "ACT_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
+                        "KV_ELEMENT_WIDTH": f"MXINT_{legacy_attn['data_in_width']}",
+                        "FP_SETTING": None,
+                    },
+                }
 
         act_spec = parse_mx_precision(act or "MXINT_4")
         kv_spec = parse_mx_precision(kv or act_spec.canonical)
@@ -1803,7 +1812,8 @@ def main(
         "dse_weight_block_size": _resolved_dse_weight_block_size,
     }
 
-    _codesign_tokens_enabled = any(v is not None for v in (
+    _qwen3_default_precision_enabled = model_family == "qwen3" and not quant_config_is_none
+    _codesign_tokens_enabled = _qwen3_default_precision_enabled or any(v is not None for v in (
         act_element_width_prefill, act_element_width_decode,
         kv_element_width_prefill, kv_element_width_decode,
         fp_setting_prefill, fp_setting_decode,
@@ -2000,17 +2010,21 @@ def main(
                     # Runtime wrapper installation is trial-local and can run
                     # concurrently on other workers once metadata is complete.
                     gptq_cache.release()
-                if _codesign_tokens_enabled:
+                if _codesign_tokens_enabled or model_family == "qwen3":
                     unified_counts = apply_unified_mx_wrappers(
                         model,
                         qwen3_attention_config=_prefill_precision["attn"] if model_family == "qwen3" else None,
+                        qwen3_mlp_config=_prefill_precision["mlp"] if model_family == "qwen3" and _prefill_precision["mlp"] else None,
+                        qwen3_rms_norm_config=_prefill_precision["rms_norm"] if model_family == "qwen3" and _prefill_precision["rms_norm"] else None,
                     )
                     logger.info(
-                        "Installed unified MX wrappers: %d Linear, %d attention (llama=%d, qwen3=%d)",
+                        "Installed unified MX wrappers: %d Linear, %d attention (llama=%d, qwen3=%d), qwen3_mlp=%d, qwen3_rms_norm=%d",
                         unified_counts.get("linear", 0),
                         unified_counts.get("attention", 0),
                         unified_counts.get("llama_attention", 0),
                         unified_counts.get("qwen3_attention", 0),
+                        unified_counts.get("qwen3_mlp", 0),
+                        unified_counts.get("qwen3_rms_norm", 0),
                     )
                 logger.info("Quantization complete in %.1fs", time.time() - t0)
             finally:

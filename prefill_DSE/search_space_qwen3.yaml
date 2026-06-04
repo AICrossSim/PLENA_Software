@@ -13,7 +13,7 @@ bfcl:
   test_categories: multiple
   tool_mode: return
   num_threads: 1
-  max_new_tokens: 256
+  max_new_tokens: 2048
   limit: null
 
 gptq:

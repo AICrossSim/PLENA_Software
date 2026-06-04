@@ -27,7 +27,7 @@ import yaml
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "search_space.yaml"
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "search_space_qwen3.yaml"
 RESULT_FIELDS = [
     "trial_id",
     "act",
@@ -362,7 +362,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         "--bfcl_test_categories", str(bfcl.get("test_categories", "multiple")),
         "--bfcl_tool_mode", str(bfcl.get("tool_mode", "return")),
         "--bfcl_num_threads", str(bfcl.get("num_threads", 1)),
-        "--bfcl_max_new_tokens", str(bfcl.get("max_new_tokens", 256)),
+        "--bfcl_max_new_tokens", str(bfcl.get("max_new_tokens", 2048)),
         "--server_port", str(port),
         "--gptq_dataset", str(gptq["dataset"]),
         "--gptq_nsamples", str(gptq.get("nsamples", 32)),

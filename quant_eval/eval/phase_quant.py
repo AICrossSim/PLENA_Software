@@ -111,10 +111,31 @@ _VALID_WEIGHT_MODES = {"quantized", "fp"}
 
 
 def _set_attention_bypass_attrs(wrapper: nn.Module, bypass: bool) -> None:
-    """Synchronise attention wrapper bypass attrs read by forward()."""
+    """Set all attention wrapper bypass attrs to the same value."""
     for attr_name in _ATTN_BYPASS_ATTRS:
         if hasattr(wrapper, attr_name):
             setattr(wrapper, attr_name, bool(bypass))
+
+
+def _sync_attention_bypass_attrs(wrapper: nn.Module) -> None:
+    """Synchronise each bypass attr from its own config dict.
+
+    This preserves legacy configs where only softmax/rope are bypassed, while
+    still allowing a top-level phase ``bypass=True`` to force all attention
+    internals down the FP path.
+    """
+    config_attr_by_bypass = {
+        "qk_bypass": "qk_config",
+        "av_bypass": "av_config",
+        "kv_cache_bypass": "kv_cache_config",
+        "softmax_bypass": "softmax_config",
+        "rope_bypass": "rope_config",
+    }
+    for bypass_attr, config_attr in config_attr_by_bypass.items():
+        if not hasattr(wrapper, bypass_attr):
+            continue
+        cfg = getattr(wrapper, config_attr, None)
+        setattr(wrapper, bypass_attr, bool(cfg.get("bypass", False)) if isinstance(cfg, dict) else False)
 
 
 def _normalize_weight_mode(overrides: dict | None) -> str:
@@ -188,7 +209,7 @@ def _find_quant_mlp_wrappers(model: nn.Module):
     """Return Llama/Qwen MLP wrappers with minifloat SiLU q_config."""
     wrappers = []
     for name, module in model.named_modules():
-        if hasattr(module, "q_config") and module.__class__.__name__.endswith(("MLPMXInt", "MLPMXFP")):
+        if hasattr(module, "q_config") and module.__class__.__name__.endswith(("MLPMXInt", "MLPMXFP", "MLPMXUnified")):
             wrappers.append((name, module))
     return wrappers
 
@@ -197,7 +218,7 @@ def _find_minifloat_rmsnorm_wrappers(model: nn.Module):
     """Return Llama/Qwen RMSNorm minifloat wrappers."""
     wrappers = []
     for name, module in model.named_modules():
-        if hasattr(module, "q_config") and module.__class__.__name__.endswith("RMSNormMinifloat"):
+        if hasattr(module, "q_config") and module.__class__.__name__.endswith(("RMSNormMinifloat", "RMSNormMinifloatUnified")):
             wrappers.append((name, module))
     return wrappers
 
@@ -249,7 +270,7 @@ def _apply_nonlinear_config(module: nn.Module, overrides: dict) -> None:
     module.q_config.update({k: v for k, v in overrides.items() if k != "weight_mode"})
     if hasattr(module, "bypass"):
         module.bypass = bool(module.q_config.get("bypass", False))
-    if module.__class__.__name__.endswith("RMSNormMinifloat"):
+    if module.__class__.__name__.endswith(("RMSNormMinifloat", "RMSNormMinifloatUnified")):
         _rebuild_rmsnorm_minifloat_quantizers(module)
 
 # ---------------------------------------------------------------------------
@@ -788,7 +809,10 @@ class PhaseLayerAutoSwitch:
                             target.update(sub_cfg)
                     if bypass is not None:
                         target["bypass"] = bool(bypass)
-                _set_attention_bypass_attrs(wrapper, bool(bypass) if bypass is not None else False)
+                if bypass is not None:
+                    _set_attention_bypass_attrs(wrapper, bool(bypass))
+                else:
+                    _sync_attention_bypass_attrs(wrapper)
 
         mlp_overrides = phase_overrides.get("mlp") or {}
         if mlp_overrides:

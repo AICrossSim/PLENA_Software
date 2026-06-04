@@ -27,7 +27,7 @@ import yaml
 from tqdm import tqdm
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "search_space.yaml"
+DEFAULT_CONFIG = Path(__file__).resolve().parent / "search_space_qwen3.yaml"
 RESULT_FIELDS = [
     "trial_id",
     "act",

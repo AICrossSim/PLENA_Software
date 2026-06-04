@@ -10,6 +10,7 @@ module replacement flow for weight preparation.
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import partial
 from typing import Optional, Tuple
 
 import torch
@@ -24,6 +25,8 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Attention,
+    Qwen3MLP,
+    Qwen3RMSNorm,
     apply_rotary_pos_emb as qwen3_apply_rotary_pos_emb,
     eager_attention_forward as _qwen3_eager_attention_forward,
     repeat_kv as qwen3_repeat_kv,
@@ -31,8 +34,10 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from chop.nn.quantizers import mxint_quantizer, mxfp_quantizer
+from chop.nn.quantizers._minifloat_mx import MinifloatMeta, minifloat_quantizer_sim
 from chop.nn.quantized.functional.rope import rope_minifloat
 from chop.nn.quantized.functional.softmax import softmax_minifloat
+from chop.nn.quantized.functional.silu import silu_minifloat
 
 
 def _infer_mx_family(config: dict | None, prefix: str = "data_in") -> str | None:
@@ -466,6 +471,105 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
         return attn_output, attn_weights
 
 
+class Qwen3MLPMXUnified(Qwen3MLP):
+    """Qwen3 MLP wrapper whose SiLU precision is driven by FP_SETTING.
+
+    Projection Linears are already replaced by ``LinearMXUnified`` before this
+    wrapper is installed, so this class only owns the nonlinear SiLU path.  This
+    mirrors Chop's Qwen3MLPMXInt/MXFP behavior while keeping the implementation
+    in quant_eval instead of patching the installed Chop package.
+    """
+
+    def __init__(self, config, layer_idx=None, q_config: dict | None = None):
+        super().__init__(config)
+        self.layer_idx = layer_idx
+        self.q_config = q_config or {}
+        self.bypass = bool(self.q_config.get("bypass", False))
+
+    @classmethod
+    def from_mlp(cls, mlp: Qwen3MLP, q_config: dict | None = None) -> "Qwen3MLPMXUnified":
+        cfg = deepcopy(q_config if q_config is not None else getattr(mlp, "q_config", {}))
+        layer_idx = getattr(mlp, "layer_idx", None)
+        new = cls(mlp.config, layer_idx=layer_idx, q_config=cfg)
+        device, dtype = next(mlp.parameters()).device, next(mlp.parameters()).dtype
+        new = new.to(device=device, dtype=dtype)
+        # Preserve already-replaced projection modules and the configured HF act_fn.
+        new.gate_proj = mlp.gate_proj
+        new.up_proj = mlp.up_proj
+        new.down_proj = mlp.down_proj
+        new.act_fn = mlp.act_fn
+        return new
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.bypass:
+            return super().forward(x)
+        x = silu_minifloat(self.gate_proj(x), self.q_config) * self.up_proj(x)
+        return self.down_proj(x)
+
+
+def _build_minifloat_quantizer(q_config: dict, *, prefix: str):
+    return partial(
+        minifloat_quantizer_sim,
+        minifloat_meta=MinifloatMeta(
+            exp_bits=q_config[f"{prefix}_exponent_width"],
+            frac_bits=q_config[f"{prefix}_frac_width"],
+            is_finite=q_config.get(f"{prefix}_is_finite", True),
+            round_mode=q_config.get(f"{prefix}_round_mode", "rn"),
+        ),
+    )
+
+
+class Qwen3RMSNormMinifloatUnified(Qwen3RMSNorm):
+    """Qwen3 RMSNorm wrapper controlled by FP_SETTING.
+
+    Covers ordinary decoder RMSNorms, final model.norm, and Qwen3 attention
+    q_norm/k_norm.  The forward path intentionally mirrors Chop's
+    Qwen3RMSNormMinifloat while preserving the input dtype at the output.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, layer_idx=None, q_config: dict | None = None):
+        super().__init__(hidden_size=hidden_size, eps=eps)
+        self.layer_idx = layer_idx
+        self.q_config = q_config or {}
+        self._sync_quantizers_from_config()
+
+    @classmethod
+    def from_rms_norm(
+        cls,
+        rms_norm: Qwen3RMSNorm,
+        q_config: dict | None = None,
+    ) -> "Qwen3RMSNormMinifloatUnified":
+        cfg = deepcopy(q_config if q_config is not None else getattr(rms_norm, "q_config", {}))
+        new = cls(
+            hidden_size=rms_norm.weight.numel(),
+            eps=float(getattr(rms_norm, "variance_epsilon", 1e-6)),
+            layer_idx=getattr(rms_norm, "layer_idx", None),
+            q_config=cfg,
+        )
+        new = new.to(device=rms_norm.weight.device, dtype=rms_norm.weight.dtype)
+        with torch.no_grad():
+            new.weight.copy_(rms_norm.weight.detach())
+        return new
+
+    def _sync_quantizers_from_config(self) -> None:
+        cfg = self.q_config or {}
+        self.bypass = bool(cfg.get("bypass", False))
+        self.weight_bypass = bool(cfg.get("weight_bypass", False))
+        self.data_in_bypass = bool(cfg.get("data_in_bypass", False))
+        self.w_quantizer = None if self.bypass or self.weight_bypass else _build_minifloat_quantizer(cfg, prefix="weight")
+        self.x_quantizer = None if self.bypass or self.data_in_bypass else _build_minifloat_quantizer(cfg, prefix="data_in")
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        input_dtype = hidden_states.dtype
+        if self.x_quantizer is not None:
+            hidden_states = self.x_quantizer(hidden_states)
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        weight = self.w_quantizer(self.weight) if self.w_quantizer is not None else self.weight
+        return weight * hidden_states.to(input_dtype)
+
+
 def _patch_rms_norm_dtype_preservation() -> bool:
     """Keep Chop RMSNorm minifloat outputs in the input dtype.
 
@@ -504,7 +608,12 @@ def _replace_child(root: nn.Module, name: str, new_module: nn.Module) -> None:
         setattr(parent, leaf, new_module)
 
 
-def apply_unified_mx_wrappers(model: nn.Module, qwen3_attention_config: dict | None = None) -> dict[str, int]:
+def apply_unified_mx_wrappers(
+    model: nn.Module,
+    qwen3_attention_config: dict | None = None,
+    qwen3_mlp_config: dict | None = None,
+    qwen3_rms_norm_config: dict | None = None,
+) -> dict[str, int]:
     """Replace Chop/Transformers MX modules with unified runtime wrappers."""
     from chop.nn.quantized.modules.linear import LinearMXInt, LinearMXFP
     from chop.nn.quantized.modules.llama.attention import LlamaAttentionMXInt, LlamaAttentionMXFP
@@ -515,7 +624,14 @@ def apply_unified_mx_wrappers(model: nn.Module, qwen3_attention_config: dict | N
     except Exception:  # pragma: no cover - optional package shape
         qwen3_chop_attention_types = ()
 
-    counts = {"linear": 0, "llama_attention": 0, "qwen3_attention": 0, "rms_norm_dtype_patch": 0}
+    counts = {
+        "linear": 0,
+        "llama_attention": 0,
+        "qwen3_attention": 0,
+        "qwen3_mlp": 0,
+        "qwen3_rms_norm": 0,
+        "rms_norm_dtype_patch": 0,
+    }
     counts["rms_norm_dtype_patch"] = int(_patch_rms_norm_dtype_preservation())
 
     # Replace leaves first so attention replacement preserves unified projections.
@@ -535,6 +651,18 @@ def apply_unified_mx_wrappers(model: nn.Module, qwen3_attention_config: dict | N
             q_config = _phase_attn_config_to_q_config(qwen3_attention_config)
             _replace_child(model, name, Qwen3AttentionMXUnified.from_attention(module, q_config))
             counts["qwen3_attention"] += 1
+
+    if qwen3_mlp_config is not None:
+        for name, module in list(model.named_modules()):
+            if isinstance(module, Qwen3MLP) and not isinstance(module, Qwen3MLPMXUnified):
+                _replace_child(model, name, Qwen3MLPMXUnified.from_mlp(module, qwen3_mlp_config))
+                counts["qwen3_mlp"] += 1
+
+    if qwen3_rms_norm_config is not None:
+        for name, module in list(model.named_modules()):
+            if isinstance(module, Qwen3RMSNorm) and not isinstance(module, Qwen3RMSNormMinifloatUnified):
+                _replace_child(model, name, Qwen3RMSNormMinifloatUnified.from_rms_norm(module, qwen3_rms_norm_config))
+                counts["qwen3_rms_norm"] += 1
 
     counts["attention"] = counts["llama_attention"] + counts["qwen3_attention"]
     return counts
