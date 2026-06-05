@@ -42,11 +42,11 @@ from quant_eval.eval.dllm_v2.eval_dllm import evaluate_dllm
 from quant_eval.quantize import load_quant_config
 
 logger = get_logger(__name__)
-set_logging_verbosity("debug")
+set_logging_verbosity("info")
 
 
 def main(
-    model_name: str = "Efficient-Large-Model/Fast_dLLM_v2_1.5B",
+    model_name: str = "Efficient-Large-Model/Fast_dLLM_v2_7B",
     tasks: Union[str, list[str]] = "gsm8k",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
@@ -59,7 +59,10 @@ def main(
     mask_id: int = 151665,
     bd_size: int = 32,
     small_block_size: int = 8,
-    threshold: float = 1.0,
+    threshold: float = 0.9,
+    use_block_cache: bool = False,
+    temperature: float = 0.0,
+    top_p: float = 0.95,
     show_speed: bool = True,
     log_dir: Union[str, None] = None,
 ):
@@ -89,6 +92,9 @@ def main(
         small_block_size: Inner block size for iterative unmasking within
             each outer block.
         threshold: Confidence threshold for committing unmasked tokens.
+        use_block_cache: Cache intermediate block KV states for faster decoding.
+        temperature: Sampling temperature.
+        top_p: Top-p sampling probability.
         show_speed: Log throughput metrics (tokens/second).
         log_dir: Directory for ``args.json`` and ``results.json``.
 
@@ -101,6 +107,7 @@ def main(
     print(f"Model: {model_name}")
     print(f"Tasks: {tasks}")
     print(f"Block size: {bd_size}, Sub-block: {small_block_size}, Threshold: {threshold}")
+    print(f"Block cache: {use_block_cache}, Temperature: {temperature}, Top-p: {top_p}")
 
     quantize = quant_config is not None
     if quantize:
@@ -137,8 +144,15 @@ def main(
         from chop.passes.module.transforms import quantize_module_transform_pass
 
         pass_args = load_quant_config(quant_config)
+        # Plumb device (+ model_name) into the GPTQ / rotation-search passes the
+        # same way eval_lm does — the MASE passes need these but they don't
+        # belong in the TOML schema. Required for configs 04-06 (GPTQ) and 06
+        # (rotation_search), so all six table9 rows run through this CLI.
         if "gptq" in pass_args:
             pass_args["gptq"]["device"] = device_id
+        if "rotation_search" in pass_args:
+            pass_args["rotation_search"]["device"] = device_id
+            pass_args["rotation_search"].setdefault("model_name", model_name)
 
         n_linear = sum(
             1 for _, m in model.named_modules() if isinstance(m, torch.nn.Linear)
@@ -147,6 +161,20 @@ def main(
         t0 = time.time()
         model, _ = quantize_module_transform_pass(model, pass_args)
         logger.info("Quantization complete in %.1fs", time.time() - t0)
+
+        # Surface which classes the dispatch landed on, so you can confirm the
+        # rotate / GPTQ variants are wired in when the TOML asks for them.
+        from collections import Counter
+
+        cls_count = Counter(
+            type(m).__name__ for _, m in model.named_modules()
+            if "MX" in type(m).__name__
+        )
+        if cls_count:
+            logger.info(
+                "Post-quant module classes:\n%s",
+                "\n".join(f"  {c}: {n}" for c, n in cls_count.most_common()),
+            )
 
     if model_parallel:
         model = move_to_gpu(model, model_parallel)
@@ -173,8 +201,11 @@ def main(
         bd_size=bd_size,
         small_block_size=small_block_size,
         threshold=threshold,
+        use_block_cache=use_block_cache,
+        temperature=temperature,
         show_speed=show_speed,
     )
+
 
     print("\n" + "=" * 60)
     print("Results:")
