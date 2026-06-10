@@ -2,7 +2,7 @@
 # Smoke runs should override limit/gptq_max_layers from CLI instead of changing
 # these defaults.
 model:
-  model_name: /home/yh3525/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218
+  model_name: Qwen/Qwen3-8B
   model_family: qwen3
   bfcl_model_alias: Qwen/Qwen3-8B-FC
   bfcl_adapter: qwen3_fc
@@ -36,7 +36,7 @@ runtime:
   gpu_memory_reserve_chunk_mb: 512
   trial_timeout_sec: 7200
   bfcl_project_root: .bfcl
-  bfcl_env_bin: /home/yh3525/.conda/envs/plena-bfcl/bin
+  bfcl_env_bin: .conda/envs/plena-bfcl/bin
 
 search_space:
   ACT:

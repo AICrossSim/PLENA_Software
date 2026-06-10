@@ -5,6 +5,9 @@ dist/
 build/
 logs/
 .claude/
+.conda/
+.conda-main-bootstrap/
+.venv/
 *.log
 checkpoints/
 results/

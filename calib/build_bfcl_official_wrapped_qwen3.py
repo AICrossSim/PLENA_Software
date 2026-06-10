@@ -61,6 +61,13 @@ def _load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _import_local_bfcl_utils() -> Any:
+    try:
+        import bfcl_eval.utils as bfcl_utils  # type: ignore
+
+        return bfcl_utils
+    except Exception:
+        pass
+
     if not DEFAULT_BFCL_REPO.exists():
         raise FileNotFoundError(f"Local BFCL repo not found: {DEFAULT_BFCL_REPO}")
     sys.path.insert(0, str(DEFAULT_BFCL_REPO))

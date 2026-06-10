@@ -15,9 +15,12 @@ def evaluate_perplexity(
     verbose: bool = False,
 ):
     if subset:
+        if dataset_name == "wikitext":
+            dataset_name = "Salesforce/wikitext"
         test_data = load_dataset(dataset_name, subset, split=split)
     else:
         if dataset_name == "wikitext":
+            dataset_name = "Salesforce/wikitext"
             subset = "wikitext-2-raw-v1"
             test_data = load_dataset(dataset_name, subset, split=split)
         else:

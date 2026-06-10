@@ -346,6 +346,11 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
     runtime = cfg.get("runtime", {})
 
     limit = args.limit if args.limit is not None else bfcl.get("limit")
+    bfcl_max_new_tokens = (
+        args.bfcl_max_new_tokens
+        if args.bfcl_max_new_tokens is not None
+        else bfcl.get("max_new_tokens", 2048)
+    )
     gptq_max_layers = _parse_gptq_max_layers(args.gptq_max_layers, gptq.get("max_layers"))
 
     cmd = [
@@ -362,7 +367,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         "--bfcl_test_categories", str(bfcl.get("test_categories", "multiple")),
         "--bfcl_tool_mode", str(bfcl.get("tool_mode", "return")),
         "--bfcl_num_threads", str(bfcl.get("num_threads", 1)),
-        "--bfcl_max_new_tokens", str(bfcl.get("max_new_tokens", 2048)),
+        "--bfcl_max_new_tokens", str(bfcl_max_new_tokens),
         "--server_port", str(port),
         "--gptq_dataset", str(gptq["dataset"]),
         "--gptq_nsamples", str(gptq.get("nsamples", 32)),
@@ -404,6 +409,9 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
     env["BFCL_PROJECT_ROOT"] = str((REPO_ROOT / runtime.get("bfcl_project_root", ".bfcl")).resolve())
     bfcl_bin = runtime.get("bfcl_env_bin")
     if bfcl_bin:
+        bfcl_bin = Path(str(bfcl_bin))
+        if not bfcl_bin.is_absolute():
+            bfcl_bin = (REPO_ROOT / bfcl_bin).resolve()
         env["PATH"] = f"{bfcl_bin}:{env.get('PATH', '')}"
 
     _write_json(trial_dir / "trial_config.json", {"trial": trial.__dict__, "gpu": gpu, "port": port, "timeout_sec": timeout})
@@ -540,6 +548,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpus", default="0")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--gptq-max-layers", default=None)
+    parser.add_argument("--bfcl-max-new-tokens", type=int, default=None)
     parser.add_argument("--max-trials", type=int, default=None)
     parser.add_argument("--only-trials", default=None)
     parser.add_argument("--retry-failed", action="store_true")
