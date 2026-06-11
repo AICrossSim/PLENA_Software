@@ -40,6 +40,8 @@ class FastDLLMEvalHarness(LM):
         small_block_size: int = 8,
         bd_size: int = 32,
         threshold: float = 0.9,
+        temperature: float = 0.0,
+        top_p: float = 0.95,
     ):
         super().__init__()
 
@@ -55,6 +57,8 @@ class FastDLLMEvalHarness(LM):
         self.small_block_size = small_block_size
         self.bd_size = bd_size
         self.threshold = threshold
+        self.temperature = temperature
+        self.top_p = top_p
 
         self._rank = 0
         self._world_size = 1
@@ -144,6 +148,7 @@ class FastDLLMEvalHarness(LM):
     def generate_until(self, requests):
         output = [None] * len(requests)
         num_tokens = 0
+        ttfts = []
         start_time = time.time()
 
         requests_with_indices = [(i, req) for i, req in enumerate(requests)]
@@ -209,22 +214,31 @@ class FastDLLMEvalHarness(LM):
                     seq_len=torch.tensor(seq_len, device=self.device),
                     use_block_cache=self.use_block_cache,
                     threshold=self.threshold,
+                    temperature=self.temperature,
                 )
+
+            if self.show_speed:
+                ttft = getattr(self.model, "mdm_ttft", None)
+                if ttft is not None:
+                    ttfts.append(ttft)
 
             for batch_pos, (orig_idx, req) in enumerate(batch):
-                generated_answer = self.tokenizer.decode(
-                    generated_ids[batch_pos][seq_len[batch_pos]:],
-                    skip_special_tokens=True,
-                )
+                gen_ids = generated_ids[batch_pos][seq_len[batch_pos]:]
+                generated_answer = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
 
                 if self.show_speed:
-                    num_tokens += (generated_ids[batch_pos][seq_len[batch_pos]:] != self.mask_id).sum()
+                    num_tokens += (gen_ids != self.mask_id).sum()
 
                 output[orig_idx] = generated_answer
 
         if self.show_speed:
             elapsed = time.time() - start_time
-            print(f"Total tokens: {num_tokens}, Time: {elapsed:.2f}s, Tokens/s: {num_tokens / elapsed:.2f}")
+            mean_ttft = sum(ttfts) / len(ttfts) if ttfts else float("nan")
+            print(
+                f"Total tokens: {num_tokens}, Time: {elapsed:.2f}s, "
+                f"Tokens/s: {num_tokens / elapsed:.2f}, "
+                f"TTFT: {mean_ttft * 1000:.1f}ms"
+            )
 
         return output
 
@@ -242,6 +256,8 @@ def evaluate_dllm(
     bd_size: int = 32,
     small_block_size: int = 8,
     threshold: float = 1.0,
+    use_block_cache: bool = False,
+    temperature: float = 0.0,
     show_speed: bool = True,
 ) -> Dict:
     """
@@ -260,6 +276,9 @@ def evaluate_dllm(
         bd_size: Block diffusion size.
         small_block_size: Sub-block size.
         threshold: Unmasking threshold.
+        use_block_cache: Cache intermediate block KV states for faster decoding.
+        temperature: Sampling temperature. 0.0 is deterministic greedy
+            (reference setting); > 0 enables stochastic top-p sampling.
         show_speed: Show throughput metrics.
 
     Returns:
@@ -274,10 +293,11 @@ def evaluate_dllm(
         max_new_tokens=max_new_tokens,
         batch_size=batch_size,
         mask_id=mask_id,
-        use_block_cache=False,
+        use_block_cache=use_block_cache,
         small_block_size=small_block_size,
         bd_size=bd_size,
         threshold=threshold,
+        temperature=temperature,
     )
 
     task_list = [tasks] if isinstance(tasks, str) else tasks

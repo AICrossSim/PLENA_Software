@@ -43,11 +43,11 @@ set_logging_verbosity("debug")
 
 
 def main(
-    model_name: str = "Qwen/Qwen2.5-1.5B",
+    model_name: str = "Efficient-Large-Model/Fast_dLLM_v2_7B",
     dataset: str = "humaneval",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
-    quant_config: Union[str, None] = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: Union[str, None] = None,
     model_parallel: bool = False,
     batch_size: int = 1,
     greedy: bool = False,
@@ -59,6 +59,11 @@ def main(
     parallel: Union[int, None] = None,
     version: str = "default",
     log_dir: Union[str, None] = None,
+    # dLLM specific
+    mask_id: int = 151665,
+    bd_size: int = 32,
+    small_block_size: int = 8,
+    threshold: float = 0.9,
 ):
     """
     Run evalplus (HumanEval+ / MBPP+) on an optionally MX-quantized HF model.
@@ -83,6 +88,10 @@ def main(
             runs serially.
         version: evalplus dataset version (e.g. ``"default"``).
         log_dir: Directory for ``args.json`` and ``results.json``.
+        mask_id: Token ID used as the diffusion mask (for dLLM).
+        bd_size: Outer block-diffusion block size (for dLLM).
+        small_block_size: Inner block size for iterative unmasking (for dLLM).
+        threshold: Confidence threshold for committing tokens (for dLLM).
 
     Returns:
         evalplus results dict — pass@1 (and pass@k when applicable) plus

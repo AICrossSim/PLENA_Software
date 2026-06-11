@@ -5,6 +5,8 @@ Ported from Coprocessor_for_Llama/acc_simulator/eval/dllm/generation_functions.p
 Based on: https://github.com/ML-GSAI/SMDM
 """
 
+import time
+
 import torch
 import types
 from transformers import DynamicCache
@@ -34,6 +36,12 @@ class Fast_dLLM_QwenForCausalLM:
     ):
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
+
+        # Time-to-first-token: wall-clock from generation start to the first
+        # committed (unmasked) token. Reset per call; read by the harness.
+        torch.cuda.synchronize() if input_ids.is_cuda else None
+        _ttft_start = time.time()
+        self.mdm_ttft = None
 
         if min_len > block_size:
             output = self.forward(
@@ -143,6 +151,10 @@ class Fast_dLLM_QwenForCausalLM:
                         unmask_idx = unmask_idx & mask_idx[:, start:end]
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
+
+                        if self.mdm_ttft is None and unmask_idx.any():
+                            torch.cuda.synchronize() if x_t.is_cuda else None
+                            self.mdm_ttft = time.time() - _ttft_start
 
                         finished_row_flags = ((x_1 == stop_token) & unmask_idx).any(dim=1)
                         finished_flag = finished_flag | finished_row_flags

@@ -46,6 +46,11 @@ class PreloadedHFDecoder(DecoderBase):
         tokenizer: PreTrainedTokenizer,
         dataset: str,
         force_base_prompt: bool = False,
+        # dLLM specific
+        mask_id: int = 151665,
+        bd_size: int = 32,
+        small_block_size: int = 8,
+        threshold: float = 0.9,
         **kwargs,
     ):
         super().__init__(name="preloaded-hf", **kwargs)
@@ -54,6 +59,12 @@ class PreloadedHFDecoder(DecoderBase):
         self.device = next(model.parameters()).device
         self.skip_special_tokens = True
         self.force_base_prompt = force_base_prompt
+
+        # dLLM specific
+        self.mask_id = mask_id
+        self.bd_size = bd_size
+        self.small_block_size = small_block_size
+        self.threshold = threshold
 
         if self.is_direct_completion():
             self.eos += extra_eos_for_direct_completion(dataset)
@@ -91,25 +102,51 @@ class PreloadedHFDecoder(DecoderBase):
             kwargs["top_k"] = 20
             kwargs["temperature"] = self.temperature
 
-        stop_sequencer = StopSequencer(
-            self.model, model_type="causal", tokenizer=self.tokenizer
-        )
-        orig_get_stopping_criteria = self.model._get_stopping_criteria
-        model = stop_sequencer.register_stop_texts(
-            stop_texts=self.eos,
-            input_length=input_tokens.size(-1),
-        )
+        if hasattr(self.model, "mdm_sample"):
+            # dLLM sampling
+            batch_size = min(self.batch_size, num_samples)
+            batched_input_ids = input_tokens.repeat(batch_size, 1)
+            seq_len = torch.tensor([input_tokens.size(-1)] * batch_size, device=self.device)
+            
+            outputs = self.model.mdm_sample(
+                batched_input_ids,
+                tokenizer=self.tokenizer,
+                block_size=self.bd_size,
+                small_block_size=self.small_block_size,
+                max_new_tokens=self.max_new_tokens,
+                mask_id=self.mask_id,
+                min_len=int(input_tokens.size(-1)),
+                seq_len=seq_len,
+                use_block_cache=False,
+                threshold=self.threshold,
+                temperature=self.temperature if do_sample else 0.0,
+                top_p=0.95 if do_sample else 1.0,
+            )
+            # mdm_sample returns a dict or list of generated IDs.
+            # Convert to tensor if needed.
+            if isinstance(outputs, dict):
+                outputs = torch.stack([outputs[i] for i in range(len(outputs))])
+        else:
+            # Standard autoregressive sampling
+            stop_sequencer = StopSequencer(
+                self.model, model_type="causal", tokenizer=self.tokenizer
+            )
+            orig_get_stopping_criteria = self.model._get_stopping_criteria
+            model = stop_sequencer.register_stop_texts(
+                stop_texts=self.eos,
+                input_length=input_tokens.size(-1),
+            )
 
-        outputs = model.generate(
-            input_tokens,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=do_sample,
-            num_return_sequences=min(self.batch_size, num_samples),
-            pad_token_id=self.tokenizer.eos_token_id,
-            **kwargs,
-        )
-        # Restore original method to prevent nested wrapping accumulation.
-        self.model._get_stopping_criteria = orig_get_stopping_criteria
+            outputs = model.generate(
+                input_tokens,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=do_sample,
+                num_return_sequences=min(self.batch_size, num_samples),
+                pad_token_id=self.tokenizer.eos_token_id,
+                **kwargs,
+            )
+            # Restore original method to prevent nested wrapping accumulation.
+            self.model._get_stopping_criteria = orig_get_stopping_criteria
 
         gen_strs = self.tokenizer.batch_decode(
             outputs[:, input_tokens.size(-1) :],
@@ -139,6 +176,11 @@ def evaluate_with_evalplus(
     base_only: bool = False,
     version: str = "default",
     overwrite: bool = False,
+    # dLLM specific
+    mask_id: int = 151665,
+    bd_size: int = 32,
+    small_block_size: int = 8,
+    threshold: float = 0.9,
 ) -> Dict:
     """Generate code and evaluate with evalplus.
 
@@ -155,6 +197,10 @@ def evaluate_with_evalplus(
         base_only: Only run base tests (skip plus tests).
         version: Dataset version.
         overwrite: If True, regenerate even if a previous jsonl exists.
+        mask_id: Mask token ID for dLLM.
+        bd_size: Block diffusion size.
+        small_block_size: Sub-block size.
+        threshold: Unmasking threshold.
 
     Returns:
         Dictionary with evaluation results.
@@ -184,6 +230,10 @@ def evaluate_with_evalplus(
         max_new_tokens=max_new_tokens,
         instruction_prefix=instruction_prefix,
         response_prefix=response_prefix,
+        mask_id=mask_id,
+        bd_size=bd_size,
+        small_block_size=small_block_size,
+        threshold=threshold,
     )
 
     if output_dir is None:

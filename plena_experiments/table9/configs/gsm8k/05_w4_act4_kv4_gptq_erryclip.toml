@@ -6,15 +6,15 @@
 by = "regex_name"
 
 [gptq]
-model_name        = "Qwen/Qwen3-8B"
-dataset           = "file:calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt"
+model_name        = "Efficient-Large-Model/Fast_dLLM_v2_7B"
+dataset           = "file:calib/Fast_dLLM_v2_7B_gsm8k_n64_s1024.pt"
 nsamples          = 64
 seqlen            = 1024
 format            = "mxint"
 quantile_search   = true
 clip_search_y     = true       # ← the only diff from 04
 cali_batch_size   = 32
-checkpoint_dir    = "/data/models/cx922/plena_camera/gsm8k_05_w4_act4_kv4_gptq_erryclip"
+checkpoint_dir    = "/data/models/gm1425/plena_gptq/fastdllm_gsm8k_05_w4_act4_kv4_gptq_erryclip"
 
 [gptq.weight_config]
 weight_block_size = 16
