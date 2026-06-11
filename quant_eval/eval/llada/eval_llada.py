@@ -46,7 +46,11 @@ import json
 import time
 import logging
 
-from quant_eval.eval.dllm_v2.dllm_generation import setup_dllm_generation
+from quant_eval.eval.llada.llada_generation import (
+    generate,
+    generate_with_prefix_cache,
+    generate_with_dual_cache,
+)
 from quant_eval.quantize import load_quant_config
 from quant_eval.utils import get_logger, move_to_gpu, set_logging_verbosity, setup_model
 
@@ -116,12 +120,18 @@ class LLaDAEvalHarness(LM):
         self.accelerator = None
         self.model_path = model_path
 
+        # Quantization requires eager attention. LLaDA's custom modeling also
+        # only supports eager (it has no SDPA path); only the Qwen-based
+        # Fast-dLLM v2 checkpoints can use SDPA for the unquantized baseline.
+        attn_implementation = (
+            "sdpa" if (is_fast_dllm and quant_config is None) else "eager"
+        )
         self.tokenizer, self.model = setup_model(
             model_path,
             model_parallel=False,
             dtype=torch.bfloat16,
             device=device,
-            attn_implementation="eager" if quant_config is not None else "sdpa",
+            attn_implementation=attn_implementation,
         )
         self.model.eval()
         detected_mask_id = getattr(self.tokenizer, "mask_token_id", None)
@@ -150,8 +160,6 @@ class LLaDAEvalHarness(LM):
         if self.device.type == "cuda":
             self.model = self.model.to(self.device)
 
-        setup_dllm_generation(self.model)
-
         self._rank = 0
         self._world_size = 1
 
@@ -172,7 +180,7 @@ class LLaDAEvalHarness(LM):
         self.show_speed = show_speed
         self.factor = None
         self.is_instruct = True if "instruct" in model_path.lower() else False
-        self.dual_cache = False
+        self.dual_cache = dual_cache
 
     @property
     def tokenizer_name(self):
@@ -337,9 +345,21 @@ class LLaDAEvalHarness(LM):
     def generate_until(self, requests):
         output = [None] * len(requests)
         num_tokens = 0
-        start_time = time.time()
+        ttfts = []
 
-        requests_with_indices = [(i, req) for i, req in enumerate(requests)]
+        # Padding token for left-padding ragged prompts within a batch. LLaDA's
+        # diffusion samplers treat columns [0:prompt_len] as fixed context and
+        # unmask the appended region, so prompts are left-padded to align their
+        # right edge.
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_id is None:
+            pad_id = 126081  # LLaDA EOS/pad fallback
+
+        # Group requests into fixed-size batches, sorted by prompt length to
+        # minimise intra-batch padding.
+        requests_with_indices = list(enumerate(requests))
         requests_with_indices.sort(key=lambda x: len(x[1].args[0]))
 
         batched_requests = []
@@ -352,15 +372,14 @@ class LLaDAEvalHarness(LM):
         if current_batch:
             batched_requests.append(current_batch)
 
+        start_time = time.time()
+
         for batch in tqdm(batched_requests, desc="Generating..."):
-            batched_input_ids = []
+            tokenized = []
             max_len = 0
-            min_len = 1e9
-            seq_len = []
 
             for orig_idx, req in batch:
                 question = req.args[0]
-                logger.debug(f"DEBUG: Input question: {repr(question)}")
 
                 if req.task_name.startswith("minerva_math"):
                     question = question.replace(
@@ -373,65 +392,96 @@ class LLaDAEvalHarness(LM):
                         "Please reason step by step, and put your final answer within \\boxed{{}}.\nAnswer:",
                     )
 
-                model_inputs = self.tokenizer([question], return_tensors="pt").to(
-                    self.device
-                )
-                batched_input_ids.append(model_inputs["input_ids"])
-                max_len = max(max_len, model_inputs["input_ids"].shape[1])
-                min_len = min(min_len, model_inputs["input_ids"].shape[1])
-                seq_len.append(model_inputs["input_ids"].shape[1])
+                if self.is_instruct:
+                    question = self.tokenizer.apply_chat_template(
+                        [{"role": "user", "content": question}],
+                        add_generation_prompt=True,
+                        tokenize=False,
+                    )
 
-            batched_input_ids = [
-                torch.cat(
-                    [
-                        input_ids,
-                        torch.full(
-                            (1, max_len - input_ids.shape[1]),
-                            self.mask_id,
-                            dtype=torch.long,
-                            device=self.device,
-                        ),
-                    ],
-                    dim=1,
-                )
-                for input_ids in batched_input_ids
-            ]
-            batched_input_ids = torch.cat(batched_input_ids, dim=0)
+                ids = self.tokenizer(question)["input_ids"]
+                tokenized.append(ids)
+                max_len = max(max_len, len(ids))
+
+            input_ids = torch.cat(
+                [
+                    torch.cat(
+                        [
+                            torch.full(
+                                (1, max_len - len(ids)),
+                                pad_id,
+                                dtype=torch.long,
+                                device=self.device,
+                            ),
+                            torch.tensor(
+                                ids, dtype=torch.long, device=self.device
+                            ).unsqueeze(0),
+                        ],
+                        dim=1,
+                    )
+                    for ids in tokenized
+                ],
+                dim=0,
+            )
 
             with torch.no_grad():
-                generated_ids = self.model.mdm_sample(
-                    batched_input_ids,
-                    tokenizer=self.tokenizer,
-                    block_size=self.block_length,
-                    small_block_size=self.block_length // 4,
-                    max_new_tokens=self.gen_length,
-                    mask_id=self.mask_id,
-                    min_len=int(min_len),
-                    seq_len=torch.tensor(seq_len, device=self.device),
-                    use_block_cache=self.use_cache,
-                    threshold=self.threshold,
-                )
+                if self.use_cache and self.dual_cache:
+                    generated_ids, nfe, ttft = generate_with_dual_cache(
+                        self.model, input_ids, steps=self.steps,
+                        gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0.0, remasking=self.remasking,
+                        mask_id=self.mask_id, threshold=self.threshold,
+                        factor=self.factor,
+                    )
+                elif self.use_cache:
+                    generated_ids, nfe, ttft = generate_with_prefix_cache(
+                        self.model, input_ids, steps=self.steps,
+                        gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0.0, remasking=self.remasking,
+                        mask_id=self.mask_id, threshold=self.threshold,
+                        factor=self.factor,
+                    )
+                else:
+                    generated_ids, nfe, ttft = generate(
+                        self.model, input_ids, steps=self.steps,
+                        gen_length=self.gen_length, block_length=self.block_length,
+                        temperature=0.0, remasking=self.remasking,
+                        mask_id=self.mask_id, threshold=self.threshold,
+                        factor=self.factor,
+                    )
+
+            if self.show_speed and ttft is not None:
+                ttfts.append(ttft)
 
             for batch_pos, (orig_idx, req) in enumerate(batch):
+                gen_ids = generated_ids[batch_pos][max_len:]
                 generated_answer = self.tokenizer.decode(
-                    generated_ids[batch_pos][seq_len[batch_pos] :],
-                    skip_special_tokens=False,
+                    gen_ids, skip_special_tokens=True
                 )
+
+                # Honour task stop sequences when provided.
+                until = []
+                if len(req.args) > 1 and isinstance(req.args[1], dict):
+                    until = req.args[1].get("until", []) or []
+                for stop_seq in until:
+                    if stop_seq and stop_seq in generated_answer:
+                        generated_answer = generated_answer.split(stop_seq)[0]
 
                 logger.info(f"Q: {req.args[0][:60].strip()}...")
                 logger.info(f"A: {generated_answer}\n" + "-" * 50)
 
                 if self.show_speed:
-                    num_tokens += (
-                        generated_ids[batch_pos][seq_len[batch_pos] :] != self.mask_id
-                    ).sum()
+                    num_tokens += int((gen_ids != pad_id).sum())
 
                 output[orig_idx] = generated_answer
 
         if self.show_speed:
             elapsed = time.time() - start_time
+            mean_ttft = sum(ttfts) / len(ttfts) if ttfts else float("nan")
             print(
-                f"Total tokens: {num_tokens}, Time: {elapsed:.2f}s, Tokens/s: {num_tokens / elapsed:.2f}"
+                f"Total tokens: {num_tokens}, Time: {elapsed:.2f}s, "
+                f"Tokens/s: {num_tokens / elapsed:.2f}, "
+                f"TTFT: {mean_ttft * 1000:.1f}ms"
             )
 
         return output

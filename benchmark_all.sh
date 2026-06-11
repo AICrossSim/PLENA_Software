@@ -13,19 +13,43 @@ MODELS=(
     "Efficient-Large-Model/Fast_dLLM_v2_7B"
 )
 
-BLOCK_LENGTHS=(8 16 32)
-BATCH_SIZES=(16 32)
+# Sweep dimensions are env-overridable (space-separated) so the sweep can be
+# sharded across GPUs, e.g.:
+#   GPU=1 BENCH_BL="8"  BENCH_BS="64 128" RESULTS_FILE=logs/benchmarks/gpu1.jsonl bash benchmark_all.sh
+# Larger batches (64/128) saturate compute on the eager-quantized configs;
+# memory is dominated by the ~15GB of weights and barely grows with batch.
+BLOCK_LENGTHS=(${BENCH_BL:-8 16 32})
+BATCH_SIZES=(${BENCH_BS:-16 32})
 
+# Active sweep: configs 1-3 run with no external prerequisites.
+#   01 fp16          — baseline (no quant_config)
+#   02 w4 RTN        — weight-only INT4 (Linear quant)
+#   03 w4+act4+kv4   — adds self_attn module quant (qk/av/kv-cache INT4).
+#                      Needs the Fast_dLLM_QwenAttentionMXInt support added to
+#                      chop (chop/nn/quantized/modules/fast_dllm_qwen).
+#
+# Configs 04-06 are GPTQ and are DEFERRED — they require, in addition to the
+# chop support above:
+#   - calib/Qwen_Qwen3-8B_gsm8k_n64_s1024.pt  (Step 0 calibrate; see
+#     plena_experiments/table9/README.md), which needs Qwen/Qwen3-8B (online).
+#   - a writable gptq.checkpoint_dir (the TOMLs point at /data/models/cx922,
+#     owned by another user — override to a local path before enabling).
+#   - config 06 additionally reuses config 05's rotation-search checkpoint.
+# Move them into CONFIGS once those prerequisites are in place.
 CONFIGS=(
-    "plena_experiments/table9/configs/gsm8k/01_fp16.toml"
-    "plena_experiments/table9/configs/gsm8k/02_w4_rtn.toml"
-    "plena_experiments/table9/configs/gsm8k/03_w4_act4_kv4_rtn.toml"
-    "plena_experiments/table9/configs/gsm8k/04_w4_act4_kv4_gptq.toml"
-    "plena_experiments/table9/configs/gsm8k/05_w4_act4_kv4_gptq_erryclip.toml"
+    # "plena_experiments/table9/configs/gsm8k/01_fp16.toml"
+    # "plena_experiments/table9/configs/gsm8k/02_w4_rtn.toml"
+    # "plena_experiments/table9/configs/gsm8k/03_w4_act4_kv4_rtn.toml"
+    # "plena_experiments/table9/configs/gsm8k/04_w4_act4_kv4_gptq.toml"
+    # "plena_experiments/table9/configs/gsm8k/05_w4_act4_kv4_gptq_erryclip.toml"
     "plena_experiments/table9/configs/gsm8k/06_w4_act4_kv4_gptq_erryclip_selrot.toml"
 )
+# Override the config set via BENCH_CONFIGS (space-separated TOML paths).
+if [ -n "${BENCH_CONFIGS:-}" ]; then
+    CONFIGS=(${BENCH_CONFIGS})
+fi
 
-RESULTS_FILE="$LOG_DIR/all_results.jsonl"
+RESULTS_FILE="${RESULTS_FILE:-$LOG_DIR/all_results.jsonl}"
 if [ ! -f "$RESULTS_FILE" ]; then
     echo "[]" > "$RESULTS_FILE"
 fi
@@ -72,7 +96,7 @@ for MODEL in "${MODELS[@]}"; do
                 # Stream to terminal while capturing to a temp file for metric
                 # extraction; the temp file is deleted once results are tabulated.
                 TMP_LOG=$(mktemp)
-                CUDA_VISIBLE_DEVICES=3 $PY -m quant_eval.cli.eval_dllm "${ARGS[@]}" \
+                CUDA_VISIBLE_DEVICES=2 $PY -m quant_eval.cli.eval_dllm "${ARGS[@]}" \
                     2>&1 | tee "$TMP_LOG"
 
                 # gsm8k reports two exact_match scores: "strict-match" (needs a

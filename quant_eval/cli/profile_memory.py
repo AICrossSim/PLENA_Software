@@ -11,7 +11,7 @@ and batch sizes, running a single generation batch per cell and recording:
 
 Each cell is emitted on stdout as a single parseable line, e.g.::
 
-    MEM_RESULT|bd=16|bs=4|footprint_mb=14820.50|peak_mb=15960.20|peak_reserved_mb=16210.00
+    MEM_RESULT|bd=16|bs=4|cache=false|footprint_mb=14820.50|peak_mb=15960.20|peak_reserved_mb=16210.00
 
 ``benchmark_memory.sh`` consumes these lines and merges them into
 ``all_results.jsonl`` by ``run_id``.
@@ -88,7 +88,7 @@ def main(
     max_new_tokens: int = 512,
     threshold: float = 1.0,
     temperature: float = 0.0,
-    use_block_cache: bool = False,
+    block_caches: List[bool] = [False, True],
     mask_id: int = FAST_DLLM_MASK_ID,
 ):
     """
@@ -152,38 +152,40 @@ def main(
 
     for bd in bd_sizes:
         for bs in batch_sizes:
-            batch_ids, seq_len = _build_batch(tokenizer, pool[:bs], mask_id, device)
-            min_len = min(seq_len)
+            for bc in block_caches:
+                batch_ids, seq_len = _build_batch(tokenizer, pool[:bs], mask_id, device)
+                min_len = min(seq_len)
 
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(device)
-            torch.cuda.reset_peak_memory_stats(device)
-
-            try:
-                with torch.no_grad():
-                    model.mdm_sample(
-                        batch_ids,
-                        tokenizer=tokenizer,
-                        block_size=bd,
-                        small_block_size=small_block_size,
-                        max_new_tokens=max_new_tokens,
-                        mask_id=mask_id,
-                        min_len=int(min_len),
-                        seq_len=torch.tensor(seq_len, device=device),
-                        use_block_cache=use_block_cache,
-                        threshold=threshold,
-                        temperature=temperature,
-                    )
-                torch.cuda.synchronize(device)
-                peak_mb = torch.cuda.max_memory_allocated(device) / MB
-                peak_reserved_mb = torch.cuda.max_memory_reserved(device) / MB
-                print(
-                    f"MEM_RESULT|bd={bd}|bs={bs}|footprint_mb={footprint_mb:.2f}"
-                    f"|peak_mb={peak_mb:.2f}|peak_reserved_mb={peak_reserved_mb:.2f}"
-                )
-            except torch.cuda.OutOfMemoryError:
                 torch.cuda.empty_cache()
-                print(f"MEM_OOM|bd={bd}|bs={bs} — skipped (out of memory)")
+                torch.cuda.synchronize(device)
+                torch.cuda.reset_peak_memory_stats(device)
+
+                try:
+                    with torch.no_grad():
+                        model.mdm_sample(
+                            batch_ids,
+                            tokenizer=tokenizer,
+                            block_size=bd,
+                            small_block_size=small_block_size,
+                            max_new_tokens=max_new_tokens,
+                            mask_id=mask_id,
+                            min_len=int(min_len),
+                            seq_len=torch.tensor(seq_len, device=device),
+                            use_block_cache=bc,
+                            threshold=threshold,
+                            temperature=temperature,
+                        )
+                    torch.cuda.synchronize(device)
+                    peak_mb = torch.cuda.max_memory_allocated(device) / MB
+                    peak_reserved_mb = torch.cuda.max_memory_reserved(device) / MB
+                    print(
+                        f"MEM_RESULT|bd={bd}|bs={bs}|cache={str(bc).lower()}"
+                        f"|footprint_mb={footprint_mb:.2f}"
+                        f"|peak_mb={peak_mb:.2f}|peak_reserved_mb={peak_reserved_mb:.2f}"
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    print(f"MEM_OOM|bd={bd}|bs={bs}|cache={str(bc).lower()} — skipped (out of memory)")
 
     print("\n[INFO] Memory profiling complete.")
 

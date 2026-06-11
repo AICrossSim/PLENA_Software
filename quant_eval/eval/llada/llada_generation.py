@@ -15,6 +15,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
+import time
+
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -102,6 +104,8 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
     steps = steps // num_blocks
 
     nfe = 0
+    ttft = None
+    _t0 = time.time()
     for num_block in range(num_blocks):
         block_mask_index = (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id)
         num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
@@ -116,10 +120,15 @@ def generate(model, prompt, steps=128, gen_length=128, block_length=128, tempera
             else:
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, None, factor)
             x[transfer_index] = x0[transfer_index]
+            if ttft is None:
+                # Time-to-first-token: wall time until the first token is committed.
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                ttft = time.time() - _t0
             i += 1
             if (x[:, prompt.shape[1] + num_block * block_length: prompt.shape[1] + (num_block + 1) * block_length] == mask_id).sum() == 0:
                 break
-    return x, nfe
+    return x, nfe, ttft
 
 
 
@@ -148,7 +157,9 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
     steps = steps // num_blocks
 
     nfe = 0
-            
+    ttft = None
+    _t0 = time.time()
+
     for num_block in range(num_blocks):
         current_block_start = prompt.shape[1] + num_block * block_length
         current_block_end = current_block_start + block_length
@@ -166,6 +177,11 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
         else:
             x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
         x[transfer_index] = x0[transfer_index]
+        if ttft is None:
+            # Time-to-first-token: wall time until the first token is committed.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            ttft = time.time() - _t0
 
         new_past_key_values = []
         for i in range(len(past_key_values)):
@@ -196,11 +212,11 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
                 x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index, 
                                                 x[:, current_block_start:], None, factor)
             x[:, current_block_start:][transfer_index] = x0[transfer_index]
-            
+
             i += 1
 
 
-    return x, nfe
+    return x, nfe, ttft
 
 @torch.no_grad()
 def generate_with_dual_cache(
@@ -220,6 +236,8 @@ def generate_with_dual_cache(
     x[:, :Lp] = prompt
 
     nfe = 0
+    ttft = None
+    _t0 = time.time()
 
     for nb in range(num_blocks):
         s = Lp + nb * block_length
@@ -255,6 +273,11 @@ def generate_with_dual_cache(
 
         # In-place update via torch.where (no tensor-slice assignment with mask)
         x = torch.where(transfer_index, x0, x)
+        if ttft is None:
+            # Time-to-first-token: wall time until the first token is committed.
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            ttft = time.time() - _t0
 
         # 2) Semi-autoregressive refinement, fixed number of steps (graph-friendly)
         #    Each iteration runs on the current block with KV-cache and replace_position
@@ -286,7 +309,7 @@ def generate_with_dual_cache(
 
             nfe += 1
 
-    return x, nfe
+    return x, nfe, ttft
 
 
 

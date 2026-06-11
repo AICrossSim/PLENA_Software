@@ -84,7 +84,7 @@ results_path, log_path, model_name, config_name = sys.argv[1:5]
 # Parse memory cells from the profiler log.
 cells = {}  # run_id -> (footprint_mb, peak_mb, peak_reserved_mb, bl, bs)
 pat = re.compile(
-    r"MEM_RESULT\|bd=(\d+)\|bs=(\d+)\|footprint_mb=([\d.]+)"
+    r"MEM_RESULT\|bd=(\d+)\|bs=(\d+)\|cache=(true|false)\|footprint_mb=([\d.]+)"
     r"\|peak_mb=([\d.]+)\|peak_reserved_mb=([\d.]+)"
 )
 with open(log_path) as f:
@@ -92,14 +92,16 @@ with open(log_path) as f:
         m = pat.search(line)
         if not m:
             continue
-        bl, bs = int(m.group(1)), int(m.group(2))
-        run_id = f"{model_name}_{config_name}_BL{bl}_BS{bs}"
+        bl, bs, cache = int(m.group(1)), int(m.group(2)), m.group(3)
+        # run_id must match benchmark_all.sh exactly: ..._BL{bl}_BS{bs}_CACHE{cache}
+        run_id = f"{model_name}_{config_name}_BL{bl}_BS{bs}_CACHE{cache}"
         cells[run_id] = {
             "block_length": bl,
             "batch_size": bs,
-            "model_footprint_mb": round(float(m.group(3)), 2),
-            "peak_memory_mb": round(float(m.group(4)), 2),
-            "peak_reserved_mb": round(float(m.group(5)), 2),
+            "use_block_cache": cache == "true",
+            "model_footprint_mb": round(float(m.group(4)), 2),
+            "peak_memory_mb": round(float(m.group(5)), 2),
+            "peak_reserved_mb": round(float(m.group(6)), 2),
         }
 
 # Read existing lines, updating matching records in place.
@@ -137,6 +139,7 @@ for rid, c in cells.items():
         "config": config_name,
         "block_length": c["block_length"],
         "batch_size": c["batch_size"],
+        "use_block_cache": c["use_block_cache"],
         "model_footprint_mb": c["model_footprint_mb"],
         "peak_memory_mb": c["peak_memory_mb"],
         "peak_reserved_mb": c["peak_reserved_mb"],
