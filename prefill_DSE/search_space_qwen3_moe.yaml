@@ -1,0 +1,65 @@
+# Default smoke/full-run Prefill DSE configuration for Qwen3-MoE BFCL/PPL.
+# Router quantization is intentionally disabled in this first MoE path.
+model:
+  model_name: Qwen/Qwen3-30B-A3B-Instruct-2507
+  model_family: qwen3_moe
+  bfcl_model_alias: Qwen/Qwen3-30B-A3B-Instruct-2507-FC
+  bfcl_adapter: qwen3_fc
+  dtype: bfloat16
+  quant_config: quant_eval/configs/qwen3_moe_mxint16.toml
+
+bfcl:
+  test_categories: multiple
+  tool_mode: return
+  num_threads: 1
+  max_new_tokens: 2048
+  limit: null
+
+gptq:
+  dataset: calib/qwen3_moe_30b_a3b_bfcl_official_wrapped_s1024_n32.pt
+  nsamples: 32
+  seqlen: 1024
+  format: mxint
+  weight_width: 8
+  weight_block_size: 32
+  cali_batch_size: 1
+  max_layers: null
+  cache_dir: prefill_DSE/gptq_cache_qwen3_moe
+  cache_mode: auto
+
+runtime:
+  decode_weight_mode: fp
+  gpu_memory_reserve_mb: 18000
+  gpu_memory_reserve_wait_sec: 600
+  gpu_memory_reserve_poll_sec: 5.0
+  gpu_memory_reserve_chunk_mb: 512
+  trial_timeout_sec: 7200
+  bfcl_project_root: .bfcl
+  bfcl_env_bin: .conda/envs/plena-bfcl/bin
+
+search_space:
+  ACT:
+    - MXINT_2
+    - MXINT_3
+    - MXINT_4
+    - MXINT_8
+    - MXFP_E1M2
+    - MXFP_E2M1
+    - MXFP_E4M3
+    - MXFP_E5M2
+  KV:
+    - MXINT_2
+    - MXINT_3
+    - MXINT_4
+    - MXINT_8
+    - MXFP_E1M2
+    - MXFP_E2M1
+    - MXFP_E4M3
+    - MXFP_E5M2
+  FP_SETTING:
+    - FP_E3M2
+    - FP_E2M3
+    - FP_E6M5
+    - FP_E5M6
+    - FP_E4M7
+    - FP_E8M5

@@ -1236,6 +1236,8 @@ class _GptqWeightCache:
         self.expected_layers = list(self.fingerprint["expected_layers"])
         self.hit = False
         self.loaded_layers = 0
+        self.partial_layers = 0
+        self.resuming = False
         self._lock_acquired = False
         self._wait_sec = 7200
         self._poll_sec = 5.0
@@ -1247,6 +1249,8 @@ class _GptqWeightCache:
             "hit": self.hit,
             "path": str(self.cache_path),
             "loaded_layers": self.loaded_layers,
+            "partial_layers": self.partial_layers,
+            "resuming": self.resuming,
             "expected_layers": self.expected_layers,
         }
 
@@ -1255,6 +1259,15 @@ class _GptqWeightCache:
 
     def _layer_path(self, layer_idx: int) -> Path:
         return self.cache_path / f"{_GPTQ_CACHE_MODEL_NAME}_layer_{layer_idx}.safetensors"
+
+    def _existing_layers(self) -> list[int]:
+        if not self.cache_path.exists():
+            return []
+        existing = []
+        for layer_idx in self.expected_layers:
+            if self._layer_path(layer_idx).exists():
+                existing.append(layer_idx)
+        return existing
 
     def _is_complete(self) -> bool:
         meta_path = self._metadata_path()
@@ -1332,10 +1345,23 @@ class _GptqWeightCache:
                 )
             if self.mode == "refresh":
                 logger.info("GPTQ cache refresh requested: key=%s", self.key)
+                shutil.rmtree(self.cache_path, ignore_errors=True)
+                self.cache_path.mkdir(parents=True, exist_ok=True)
             else:
-                logger.info("GPTQ cache miss: key=%s, running GPTQ once", self.key)
-            shutil.rmtree(self.cache_path, ignore_errors=True)
-            self.cache_path.mkdir(parents=True, exist_ok=True)
+                existing_layers = self._existing_layers()
+                self.partial_layers = len(existing_layers)
+                self.cache_path.mkdir(parents=True, exist_ok=True)
+                if existing_layers:
+                    self.resuming = True
+                    logger.info(
+                        "GPTQ partial cache found: key=%s layers=%s; "
+                        "resuming via checkpoint_dir=%s",
+                        self.key,
+                        existing_layers,
+                        self.cache_path,
+                    )
+                else:
+                    logger.info("GPTQ cache miss: key=%s, running GPTQ once", self.key)
             return False
         except Exception:
             self.release()
@@ -1637,6 +1663,7 @@ def main(
     bfcl_adapter_obj = resolve_bfcl_adapter(bfcl_adapter, model_name=model_name, model_alias=bfcl_model_alias)
     resolved_bfcl_adapter = bfcl_adapter_obj.name
     model_family = model_family.lower()
+    qwen_model_family = model_family in {"qwen3", "qwen3_moe"}
     decode_weight_mode = decode_weight_mode.lower()
     if decode_weight_mode not in ("quantized", "fp"):
         raise ValueError(
@@ -1712,7 +1739,7 @@ def main(
             )
 
         if act is None and kv is None and fp is None:
-            if model_family == "qwen3" and not quant_config_is_none:
+            if qwen_model_family and not quant_config_is_none:
                 # Qwen-first default: use the same full nonlinear precision
                 # semantics as explicit DSE points, but choose a conservative
                 # high-precision tuple.  This keeps RoPE/softmax, MLP SiLU, and
@@ -1812,7 +1839,7 @@ def main(
         "dse_weight_block_size": _resolved_dse_weight_block_size,
     }
 
-    _qwen3_default_precision_enabled = model_family == "qwen3" and not quant_config_is_none
+    _qwen3_default_precision_enabled = qwen_model_family and not quant_config_is_none
     _codesign_tokens_enabled = _qwen3_default_precision_enabled or any(v is not None for v in (
         act_element_width_prefill, act_element_width_decode,
         kv_element_width_prefill, kv_element_width_decode,
@@ -2010,21 +2037,33 @@ def main(
                     # Runtime wrapper installation is trial-local and can run
                     # concurrently on other workers once metadata is complete.
                     gptq_cache.release()
-                if _codesign_tokens_enabled or model_family == "qwen3":
+                if _codesign_tokens_enabled or qwen_model_family:
+                    _qwen3_moe_experts_config = None
+                    if model_family == "qwen3_moe" and _prefill_precision["mlp"]:
+                        _qwen3_moe_experts_config = {
+                            **_prefill_precision["ffn"],
+                            **_prefill_precision["mlp"],
+                        }
                     unified_counts = apply_unified_mx_wrappers(
                         model,
                         qwen3_attention_config=_prefill_precision["attn"] if model_family == "qwen3" else None,
                         qwen3_mlp_config=_prefill_precision["mlp"] if model_family == "qwen3" and _prefill_precision["mlp"] else None,
                         qwen3_rms_norm_config=_prefill_precision["rms_norm"] if model_family == "qwen3" and _prefill_precision["rms_norm"] else None,
+                        qwen3_moe_attention_config=_prefill_precision["attn"] if model_family == "qwen3_moe" else None,
+                        qwen3_moe_experts_config=_qwen3_moe_experts_config,
+                        qwen3_moe_rms_norm_config=_prefill_precision["rms_norm"] if model_family == "qwen3_moe" and _prefill_precision["rms_norm"] else None,
                     )
                     logger.info(
-                        "Installed unified MX wrappers: %d Linear, %d attention (llama=%d, qwen3=%d), qwen3_mlp=%d, qwen3_rms_norm=%d",
+                        "Installed unified MX wrappers: %d Linear, %d attention (llama=%d, qwen3=%d, qwen3_moe=%d), qwen3_mlp=%d, qwen3_rms_norm=%d, qwen3_moe_experts=%d, qwen3_moe_rms_norm=%d",
                         unified_counts.get("linear", 0),
                         unified_counts.get("attention", 0),
                         unified_counts.get("llama_attention", 0),
                         unified_counts.get("qwen3_attention", 0),
+                        unified_counts.get("qwen3_moe_attention", 0),
                         unified_counts.get("qwen3_mlp", 0),
                         unified_counts.get("qwen3_rms_norm", 0),
+                        unified_counts.get("qwen3_moe_experts", 0),
+                        unified_counts.get("qwen3_moe_rms_norm", 0),
                     )
                 logger.info("Quantization complete in %.1fs", time.time() - t0)
             finally:

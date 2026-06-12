@@ -20,10 +20,14 @@ site/
 !calib/
 calib/*
 !calib/build_bfcl_official_wrapped_llama31.py
+!calib/build_bfcl_official_wrapped_qwen3.py
+!calib/build_token_calib_from_jsonl.py
 
 # Local BFCL CLI project root/results.
 .bfcl/
 # Experiment outputs.
 runs/
+prefill_DSE/runs/
+prefill_DSE/gptq_cache_*/
 # Statistical analysis
 statistics/

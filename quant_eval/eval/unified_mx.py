@@ -31,6 +31,14 @@ from transformers.models.qwen3.modeling_qwen3 import (
     eager_attention_forward as _qwen3_eager_attention_forward,
     repeat_kv as qwen3_repeat_kv,
 )
+from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+    Qwen3MoeAttention,
+    Qwen3MoeExperts,
+    Qwen3MoeRMSNorm,
+    apply_rotary_pos_emb as qwen3_moe_apply_rotary_pos_emb,
+    eager_attention_forward as _qwen3_moe_eager_attention_forward,
+    repeat_kv as qwen3_moe_repeat_kv,
+)
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from chop.nn.quantizers import mxint_quantizer, mxfp_quantizer
@@ -169,6 +177,47 @@ def _eager_qwen3_attention_forward_unified(
 ):
     key_states = qwen3_repeat_kv(key, module.num_key_value_groups)
     value_states = qwen3_repeat_kv(value, module.num_key_value_groups)
+
+    if not qk_bypass:
+        query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+
+    if not softmax_bypass:
+        attn_weights = softmax_minifloat(attn_weights, softmax_config, dim=-1)
+    else:
+        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
+
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+
+    if not av_bypass:
+        attn_weights = quantize_mx(attn_weights, av_config, block_dim=-1, prefix="data_in")
+
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, attn_weights
+
+
+def _eager_qwen3_moe_attention_forward_unified(
+    module,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Optional[Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    qk_bypass: bool = False,
+    qk_config: dict | None = None,
+    av_bypass: bool = False,
+    av_config: dict | None = None,
+    softmax_bypass: bool = False,
+    softmax_config: dict | None = None,
+    **kwargs,
+):
+    key_states = qwen3_moe_repeat_kv(key, module.num_key_value_groups)
+    value_states = qwen3_moe_repeat_kv(value, module.num_key_value_groups)
 
     if not qk_bypass:
         query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
@@ -471,6 +520,110 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
         return attn_output, attn_weights
 
 
+class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
+    """Qwen3-MoE attention wrapper with independent ACT/KV MX families."""
+
+    def __init__(self, config, layer_idx, q_config: dict | None = None):
+        super().__init__(config, layer_idx)
+        q_config = q_config or {}
+        self.qk_config = q_config.get("qk_matmul", {})
+        self.av_config = q_config.get("av_matmul", {})
+        self.rope_config = q_config.get("rope", {})
+        self.softmax_config = q_config.get("softmax", {})
+        self.kv_cache_config = q_config.get("kv_cache", {})
+        self.qk_bypass = bool(self.qk_config.get("bypass", False))
+        self.av_bypass = bool(self.av_config.get("bypass", False))
+        self.rope_bypass = bool(self.rope_config.get("bypass", False))
+        self.softmax_bypass = bool(self.softmax_config.get("bypass", False))
+        self.kv_cache_bypass = bool(self.kv_cache_config.get("bypass", False))
+
+    @classmethod
+    def from_attention(cls, attention: Qwen3MoeAttention, q_config: dict | None = None) -> "Qwen3MoeAttentionMXUnified":
+        cfg = q_config or {
+            "qk_matmul": deepcopy(getattr(attention, "qk_config", {})),
+            "av_matmul": deepcopy(getattr(attention, "av_config", {})),
+            "kv_cache": deepcopy(getattr(attention, "kv_cache_config", {})),
+            "softmax": deepcopy(getattr(attention, "softmax_config", {})),
+            "rope": deepcopy(getattr(attention, "rope_config", {})),
+        }
+        new = cls(attention.config, attention.layer_idx, cfg)
+        device, dtype = next(attention.parameters()).device, next(attention.parameters()).dtype
+        new = new.to(device=device, dtype=dtype)
+        new.q_proj = attention.q_proj
+        new.k_proj = attention.k_proj
+        new.v_proj = attention.v_proj
+        new.o_proj = attention.o_proj
+        new.q_norm = attention.q_norm
+        new.k_norm = attention.k_norm
+        return new
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        position_embeddings: Tuple[Tensor, Tensor],
+        attention_mask: Optional[Tensor],
+        past_key_values: Optional[Cache] = None,
+        **kwargs,
+    ):
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        if not self.rope_bypass:
+            query_states, key_states = rope_minifloat(query_states, key_states, cos, sin, self.rope_config)
+        else:
+            query_states, key_states = qwen3_moe_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            if not self.kv_cache_bypass:
+                key_states = quantize_mx(key_states, self.kv_cache_config, block_dim=-1, prefix="data_in")
+                value_states = quantize_mx(value_states, self.kv_cache_config, block_dim=-1, prefix="data_in")
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        if self.qk_bypass and self.av_bypass and self.softmax_bypass:
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation,
+                _qwen3_moe_eager_attention_forward,
+            )
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+        else:
+            attn_output, attn_weights = _eager_qwen3_moe_attention_forward_unified(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                qk_bypass=self.qk_bypass,
+                qk_config=self.qk_config,
+                av_bypass=self.av_bypass,
+                av_config=self.av_config,
+                softmax_bypass=self.softmax_bypass,
+                softmax_config=self.softmax_config,
+                sliding_window=self.sliding_window,
+                **kwargs,
+            )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
 class Qwen3MLPMXUnified(Qwen3MLP):
     """Qwen3 MLP wrapper whose SiLU precision is driven by FP_SETTING.
 
@@ -507,6 +660,71 @@ class Qwen3MLPMXUnified(Qwen3MLP):
         return self.down_proj(x)
 
 
+class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
+    """Qwen3-MoE expert wrapper for routed ACT and SiLU precision.
+
+    Router, top-k selection, and routing weights live outside
+    ``Qwen3MoeExperts`` and intentionally remain FP.
+    """
+
+    def __init__(self, config, q_config: dict | None = None):
+        super().__init__(config)
+        self.config = config
+        self.q_config = q_config or {}
+        self.bypass = bool(self.q_config.get("bypass", False))
+
+    @classmethod
+    def from_experts(cls, experts: Qwen3MoeExperts, q_config: dict | None = None) -> "Qwen3MoeExpertsMXUnified":
+        cfg = deepcopy(q_config if q_config is not None else getattr(experts, "q_config", {}))
+        config = getattr(experts, "config", None)
+        if config is None:
+            class _Config:
+                pass
+            config = _Config()
+            config.num_experts = experts.num_experts
+            config.hidden_size = experts.hidden_dim
+            config.moe_intermediate_size = experts.intermediate_dim
+            config.hidden_act = getattr(getattr(experts, "act_fn", None), "__name__", "silu")
+        new = cls(config, q_config=cfg)
+        new = new.to(device=experts.gate_up_proj.device, dtype=experts.gate_up_proj.dtype)
+        with torch.no_grad():
+            new.gate_up_proj.copy_(experts.gate_up_proj.detach())
+            new.down_proj.copy_(experts.down_proj.detach())
+        new.act_fn = experts.act_fn
+        return new
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        top_k_index: Tensor,
+        top_k_weights: Tensor,
+    ) -> Tensor:
+        if self.bypass:
+            return super().forward(hidden_states, top_k_index, top_k_weights)
+
+        final_hidden_states = torch.zeros_like(hidden_states)
+        with torch.no_grad():
+            expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts)
+            expert_mask = expert_mask.permute(2, 1, 0)
+            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+
+        for expert_idx in expert_hit:
+            expert_idx = expert_idx[0]
+            if expert_idx == self.num_experts:
+                continue
+            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+            current_state = hidden_states[token_idx]
+            current_state = quantize_mx(current_state, self.q_config, block_dim=-1, prefix="data_in")
+            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = silu_minifloat(gate, self.q_config) * up
+            current_hidden_states = quantize_mx(current_hidden_states, self.q_config, block_dim=-1, prefix="data_in")
+            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
+
+        return final_hidden_states
+
+
 def _build_minifloat_quantizer(q_config: dict, *, prefix: str):
     return partial(
         minifloat_quantizer_sim,
@@ -539,6 +757,52 @@ class Qwen3RMSNormMinifloatUnified(Qwen3RMSNorm):
         rms_norm: Qwen3RMSNorm,
         q_config: dict | None = None,
     ) -> "Qwen3RMSNormMinifloatUnified":
+        cfg = deepcopy(q_config if q_config is not None else getattr(rms_norm, "q_config", {}))
+        new = cls(
+            hidden_size=rms_norm.weight.numel(),
+            eps=float(getattr(rms_norm, "variance_epsilon", 1e-6)),
+            layer_idx=getattr(rms_norm, "layer_idx", None),
+            q_config=cfg,
+        )
+        new = new.to(device=rms_norm.weight.device, dtype=rms_norm.weight.dtype)
+        with torch.no_grad():
+            new.weight.copy_(rms_norm.weight.detach())
+        return new
+
+    def _sync_quantizers_from_config(self) -> None:
+        cfg = self.q_config or {}
+        self.bypass = bool(cfg.get("bypass", False))
+        self.weight_bypass = bool(cfg.get("weight_bypass", False))
+        self.data_in_bypass = bool(cfg.get("data_in_bypass", False))
+        self.w_quantizer = None if self.bypass or self.weight_bypass else _build_minifloat_quantizer(cfg, prefix="weight")
+        self.x_quantizer = None if self.bypass or self.data_in_bypass else _build_minifloat_quantizer(cfg, prefix="data_in")
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        input_dtype = hidden_states.dtype
+        if self.x_quantizer is not None:
+            hidden_states = self.x_quantizer(hidden_states)
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        weight = self.w_quantizer(self.weight) if self.w_quantizer is not None else self.weight
+        return weight * hidden_states.to(input_dtype)
+
+
+class Qwen3MoeRMSNormMinifloatUnified(Qwen3MoeRMSNorm):
+    """Qwen3-MoE RMSNorm wrapper controlled by FP_SETTING."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6, layer_idx=None, q_config: dict | None = None):
+        super().__init__(hidden_size=hidden_size, eps=eps)
+        self.layer_idx = layer_idx
+        self.q_config = q_config or {}
+        self._sync_quantizers_from_config()
+
+    @classmethod
+    def from_rms_norm(
+        cls,
+        rms_norm: Qwen3MoeRMSNorm,
+        q_config: dict | None = None,
+    ) -> "Qwen3MoeRMSNormMinifloatUnified":
         cfg = deepcopy(q_config if q_config is not None else getattr(rms_norm, "q_config", {}))
         new = cls(
             hidden_size=rms_norm.weight.numel(),
@@ -613,6 +877,9 @@ def apply_unified_mx_wrappers(
     qwen3_attention_config: dict | None = None,
     qwen3_mlp_config: dict | None = None,
     qwen3_rms_norm_config: dict | None = None,
+    qwen3_moe_attention_config: dict | None = None,
+    qwen3_moe_experts_config: dict | None = None,
+    qwen3_moe_rms_norm_config: dict | None = None,
 ) -> dict[str, int]:
     """Replace Chop/Transformers MX modules with unified runtime wrappers."""
     from chop.nn.quantized.modules.linear import LinearMXInt, LinearMXFP
@@ -630,6 +897,9 @@ def apply_unified_mx_wrappers(
         "qwen3_attention": 0,
         "qwen3_mlp": 0,
         "qwen3_rms_norm": 0,
+        "qwen3_moe_attention": 0,
+        "qwen3_moe_experts": 0,
+        "qwen3_moe_rms_norm": 0,
         "rms_norm_dtype_patch": 0,
     }
     counts["rms_norm_dtype_patch"] = int(_patch_rms_norm_dtype_preservation())
@@ -651,6 +921,10 @@ def apply_unified_mx_wrappers(
             q_config = _phase_attn_config_to_q_config(qwen3_attention_config)
             _replace_child(model, name, Qwen3AttentionMXUnified.from_attention(module, q_config))
             counts["qwen3_attention"] += 1
+        elif qwen3_moe_attention_config is not None and isinstance(module, Qwen3MoeAttention):
+            q_config = _phase_attn_config_to_q_config(qwen3_moe_attention_config)
+            _replace_child(model, name, Qwen3MoeAttentionMXUnified.from_attention(module, q_config))
+            counts["qwen3_moe_attention"] += 1
 
     if qwen3_mlp_config is not None:
         for name, module in list(model.named_modules()):
@@ -658,11 +932,23 @@ def apply_unified_mx_wrappers(
                 _replace_child(model, name, Qwen3MLPMXUnified.from_mlp(module, qwen3_mlp_config))
                 counts["qwen3_mlp"] += 1
 
+    if qwen3_moe_experts_config is not None:
+        for name, module in list(model.named_modules()):
+            if isinstance(module, Qwen3MoeExperts) and not isinstance(module, Qwen3MoeExpertsMXUnified):
+                _replace_child(model, name, Qwen3MoeExpertsMXUnified.from_experts(module, qwen3_moe_experts_config))
+                counts["qwen3_moe_experts"] += 1
+
     if qwen3_rms_norm_config is not None:
         for name, module in list(model.named_modules()):
             if isinstance(module, Qwen3RMSNorm) and not isinstance(module, Qwen3RMSNormMinifloatUnified):
                 _replace_child(model, name, Qwen3RMSNormMinifloatUnified.from_rms_norm(module, qwen3_rms_norm_config))
                 counts["qwen3_rms_norm"] += 1
 
-    counts["attention"] = counts["llama_attention"] + counts["qwen3_attention"]
+    if qwen3_moe_rms_norm_config is not None:
+        for name, module in list(model.named_modules()):
+            if isinstance(module, Qwen3MoeRMSNorm) and not isinstance(module, Qwen3MoeRMSNormMinifloatUnified):
+                _replace_child(model, name, Qwen3MoeRMSNormMinifloatUnified.from_rms_norm(module, qwen3_moe_rms_norm_config))
+                counts["qwen3_moe_rms_norm"] += 1
+
+    counts["attention"] = counts["llama_attention"] + counts["qwen3_attention"] + counts["qwen3_moe_attention"]
     return counts

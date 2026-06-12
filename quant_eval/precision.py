@@ -158,7 +158,7 @@ def fp_weight_config(spec: PrecisionSpec) -> dict:
     }
 
 
-SUPPORTED_MODEL_FAMILIES = {"llama", "qwen3"}
+SUPPORTED_MODEL_FAMILIES = {"llama", "qwen3", "qwen3_moe"}
 
 
 def apply_dse_quant_config(

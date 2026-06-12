@@ -209,7 +209,12 @@ def _find_quant_mlp_wrappers(model: nn.Module):
     """Return Llama/Qwen MLP wrappers with minifloat SiLU q_config."""
     wrappers = []
     for name, module in model.named_modules():
-        if hasattr(module, "q_config") and module.__class__.__name__.endswith(("MLPMXInt", "MLPMXFP", "MLPMXUnified")):
+        if hasattr(module, "q_config") and module.__class__.__name__.endswith((
+            "MLPMXInt",
+            "MLPMXFP",
+            "MLPMXUnified",
+            "ExpertsMXUnified",
+        )):
             wrappers.append((name, module))
     return wrappers
 

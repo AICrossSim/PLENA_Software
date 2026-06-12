@@ -54,7 +54,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
-mase = { git = "https://github.com/DeepWok/mase.git", branch = "releases/plena-experiments" }
+mase = { git = "https://github.com/DeepWok/mase.git", branch = "yx/qwen3-moe-gptq" }
 
 [tool.uv]
 no-build-isolation-package = ["fast-hadamard-transform"]

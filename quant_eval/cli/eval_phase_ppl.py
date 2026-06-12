@@ -72,7 +72,7 @@ def _resolve_phase_precision(
         )
 
     if act is None and kv is None and fp is None:
-        if model_family == "qwen3" and enable_qwen_default_precision:
+        if model_family in {"qwen3", "qwen3_moe"} and enable_qwen_default_precision:
             act, kv, fp = "MXINT_8", "MXINT_8", "FP_E8M5"
         else:
             attn_cfg = dict(legacy_attn)
@@ -174,6 +174,7 @@ def main(
 ):
     device_id = _normalize_device_id(device_id)
     model_family = model_family.lower()
+    qwen_model_family = model_family in {"qwen3", "qwen3_moe"}
     gpu_memory_reserve_enabled = (
         not gpu_memory_reserve_disable
         and gpu_memory_reserve_mb is not None
@@ -215,7 +216,7 @@ def main(
         legacy_ffn=_legacy_mx_config(prefill_ffn_width, prefill_ffn_block_size),
         dse_mx_block_size=dse_mx_block_size,
         model_family=model_family,
-        enable_qwen_default_precision=(model_family == "qwen3" and not quant_config_is_none),
+        enable_qwen_default_precision=(qwen_model_family and not quant_config_is_none),
     )
     decode = _resolve_phase_precision(
         phase="decode",
@@ -226,7 +227,7 @@ def main(
         legacy_ffn=_legacy_mx_config(decode_ffn_width, decode_ffn_block_size),
         dse_mx_block_size=dse_mx_block_size,
         model_family=model_family,
-        enable_qwen_default_precision=(model_family == "qwen3" and not quant_config_is_none),
+        enable_qwen_default_precision=(qwen_model_family and not quant_config_is_none),
     )
     phase_configs = {
         "prefill": {
@@ -249,7 +250,7 @@ def main(
         "dse_weight_precision": dse_weight_precision or (f"MXINT_{gptq_weight_width}" if gptq_dataset else "MXINT_8"),
         "dse_weight_block_size": dse_weight_block_size if dse_weight_block_size is not None else (gptq_weight_block_size if gptq_dataset else None),
     }
-    qwen3_default_precision_enabled = model_family == "qwen3" and not quant_config_is_none
+    qwen3_default_precision_enabled = qwen_model_family and not quant_config_is_none
     codesign_tokens_enabled = qwen3_default_precision_enabled or any(v is not None for v in (
         act_element_width_prefill, act_element_width_decode,
         kv_element_width_prefill, kv_element_width_decode,
@@ -372,12 +373,18 @@ def main(
             if gptq_cache is not None and not gptq_cache.hit:
                 gptq_cache.finalize()
                 gptq_cache_info = gptq_cache.summary()
-            if codesign_tokens_enabled or model_family == "qwen3":
+            if codesign_tokens_enabled or qwen_model_family:
+                qwen3_moe_experts_config = None
+                if model_family == "qwen3_moe" and prefill["mlp"]:
+                    qwen3_moe_experts_config = {**prefill["ffn"], **prefill["mlp"]}
                 counts = apply_unified_mx_wrappers(
                     model,
                     qwen3_attention_config=prefill["attn"] if model_family == "qwen3" else None,
                     qwen3_mlp_config=prefill["mlp"] if model_family == "qwen3" and prefill["mlp"] else None,
                     qwen3_rms_norm_config=prefill["rms_norm"] if model_family == "qwen3" and prefill["rms_norm"] else None,
+                    qwen3_moe_attention_config=prefill["attn"] if model_family == "qwen3_moe" else None,
+                    qwen3_moe_experts_config=qwen3_moe_experts_config,
+                    qwen3_moe_rms_norm_config=prefill["rms_norm"] if model_family == "qwen3_moe" and prefill["rms_norm"] else None,
                 )
                 logger.info("Installed unified MX wrappers: %s", counts)
             logger.info("Quantization setup complete in %.1fs", time.time() - t0)

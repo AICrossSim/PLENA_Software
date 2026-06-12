@@ -2997,7 +2997,7 @@ wheels = [
 [[package]]
 name = "mase"
 version = "1.0.0"
-source = { git = "https://github.com/DeepWok/mase.git?branch=releases%2Fplena-experiments#cb963b83149e1f00d53c700efd22772237d74ea2" }
+source = { git = "https://github.com/DeepWok/mase.git?branch=yx%2Fqwen3-moe-gptq#8a398e87d973a0974b9a1190c6d0cdc5ef20d0ae" }
 dependencies = [
     { name = "absl-py" },
     { name = "accelerate" },
@@ -5409,7 +5409,7 @@ requires-dist = [
     { name = "jsonargparse" },
     { name = "lm-eval", specifier = ">=0.4" },
     { name = "markdownify", marker = "extra == 'bfcl'" },
-    { name = "mase", extras = ["mx-ptq"], git = "https://github.com/DeepWok/mase.git?branch=releases%2Fplena-experiments" },
+    { name = "mase", extras = ["mx-ptq"], git = "https://github.com/DeepWok/mase.git?branch=yx%2Fqwen3-moe-gptq" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6" },
     { name = "mkdocs-jupyter", marker = "extra == 'docs'", specifier = ">=0.25" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
