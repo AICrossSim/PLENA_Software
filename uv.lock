@@ -2997,7 +2997,7 @@ wheels = [
 [[package]]
 name = "mase"
 version = "1.0.0"
-source = { git = "https://github.com/DeepWok/mase.git?branch=yx%2Fqwen3-moe-gptq#8a398e87d973a0974b9a1190c6d0cdc5ef20d0ae" }
+source = { git = "https://github.com/DeepWok/mase.git?branch=yx%2Fqwen3-moe-gptq#bb2d147d86dfc7a8ecef57b81ce7ae89a657fb21" }
 dependencies = [
     { name = "absl-py" },
     { name = "accelerate" },
