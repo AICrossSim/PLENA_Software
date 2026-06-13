@@ -116,12 +116,19 @@ def setup_model(model_name, model_parallel, dtype, device, attn_implementation="
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     logger.info("Tokenizer setup complete")
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        attn_implementation=attn_implementation,
-        trust_remote_code=True,
-    )
+    load_kwargs = {
+        "torch_dtype": dtype,
+        "attn_implementation": attn_implementation,
+        "trust_remote_code": True,
+    }
+    if model_parallel:
+        load_kwargs.update({
+            "device_map": "auto",
+            "low_cpu_mem_usage": True,
+        })
+    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    if model_parallel and hasattr(model, "hf_device_map"):
+        print(f"Device map: {model.hf_device_map}")
     logger.info("Model setup complete")
     return tokenizer, model
 
@@ -131,6 +138,8 @@ def move_to_gpu(model, model_parallel=True):
     if device == "cpu":
         return model
     if model_parallel:
+        if hasattr(model, "hf_device_map"):
+            return model
         device_map = create_device_map(model, "auto-balanced")
         print(f"Device map: {device_map}")
         model = dispatch_model(model, device_map=device_map)

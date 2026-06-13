@@ -40,6 +40,9 @@ RESULT_FIELDS = [
     "nsamples",
     "runtime_sec",
     "gpu",
+    "parallel_mode",
+    "visible_gpus",
+    "model_parallel",
     "returncode",
     "gptq_cache_mode",
     "gptq_cache_key",
@@ -121,6 +124,45 @@ def _split_csv(value: str | None) -> list[str] | None:
     if not value:
         return None
     return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _parallel_mode(cfg: dict[str, Any]) -> str:
+    mode = str(cfg.get("runtime", {}).get("parallel_mode", "multiworker")).lower()
+    if mode not in {"multiworker", "pp"}:
+        raise ValueError(f"runtime.parallel_mode must be 'multiworker' or 'pp', got {mode!r}")
+    return mode
+
+
+def _model_parallel_enabled(cfg: dict[str, Any]) -> bool:
+    return _parallel_mode(cfg) == "pp"
+
+
+def _quant_config_is_none(model: dict[str, Any]) -> bool:
+    value = str(model.get("quant_config", "")).strip().lower()
+    return value in {"", "none", "fp", "false"}
+
+
+def _resolve_reserve(runtime: dict[str, Any], args: argparse.Namespace, *, model_parallel: bool) -> tuple[int, int, float, int, bool]:
+    reserve_mb = args.gpu_memory_reserve_mb
+    if reserve_mb is None:
+        reserve_mb = runtime.get("gpu_memory_reserve_mb", 0)
+    reserve_enabled = bool(runtime.get("gpu_memory_reserve_enabled", False))
+    reserve_disable = args.gpu_memory_reserve_disable or bool(runtime.get("gpu_memory_reserve_disable", False))
+    if args.gpu_memory_reserve_mb is not None and args.gpu_memory_reserve_mb > 0:
+        reserve_enabled = True
+        reserve_disable = False
+    if not reserve_enabled:
+        reserve_mb = 0
+        reserve_disable = True
+    if model_parallel and not reserve_disable and int(reserve_mb or 0) > 0:
+        raise ValueError("GPU memory reserve is not supported in runtime.parallel_mode='pp'; disable it or use multiworker.")
+    return (
+        int(reserve_mb or 0),
+        int(args.gpu_memory_reserve_wait_sec if args.gpu_memory_reserve_wait_sec is not None else runtime.get("gpu_memory_reserve_wait_sec", 600)),
+        float(args.gpu_memory_reserve_poll_sec if args.gpu_memory_reserve_poll_sec is not None else runtime.get("gpu_memory_reserve_poll_sec", 5.0)),
+        int(args.gpu_memory_reserve_chunk_mb if args.gpu_memory_reserve_chunk_mb is not None else runtime.get("gpu_memory_reserve_chunk_mb", 512)),
+        bool(reserve_disable),
+    )
 
 
 def _mx_bits(token: str) -> int:
@@ -267,24 +309,16 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
     gptq = cfg.get("gptq", {})
     runtime = cfg.get("runtime", {})
     ppl = cfg.get("ppl", {})
+    model_parallel = _model_parallel_enabled(cfg)
+    quant_config_is_none = _quant_config_is_none(model)
 
     max_samples = _parse_nullable_int(args.ppl_max_samples, ppl.get("max_samples", 64))
     seqlen = int(args.ppl_seqlen or ppl.get("seqlen", 1024))
     gptq_max_layers = _parse_nullable_int(args.gptq_max_layers, gptq.get("max_layers"))
     gptq_cache_mode = args.gptq_cache_mode or "require"
-    reserve_mb = args.gpu_memory_reserve_mb
-    if reserve_mb is None:
-        reserve_mb = runtime.get("gpu_memory_reserve_mb", 0)
-    reserve_wait_sec = args.gpu_memory_reserve_wait_sec
-    if reserve_wait_sec is None:
-        reserve_wait_sec = runtime.get("gpu_memory_reserve_wait_sec", 600)
-    reserve_poll_sec = args.gpu_memory_reserve_poll_sec
-    if reserve_poll_sec is None:
-        reserve_poll_sec = runtime.get("gpu_memory_reserve_poll_sec", 5.0)
-    reserve_chunk_mb = args.gpu_memory_reserve_chunk_mb
-    if reserve_chunk_mb is None:
-        reserve_chunk_mb = runtime.get("gpu_memory_reserve_chunk_mb", 512)
-    reserve_disable = args.gpu_memory_reserve_disable or bool(runtime.get("gpu_memory_reserve_disable", False))
+    reserve_mb, reserve_wait_sec, reserve_poll_sec, reserve_chunk_mb, reserve_disable = _resolve_reserve(
+        runtime, args, model_parallel=model_parallel
+    )
 
     cmd = [
         str(REPO_ROOT / ".venv" / "bin" / "python"),
@@ -300,29 +334,37 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
         "--split", str(args.split or ppl.get("split", "test")),
         "--seqlen", str(seqlen),
         "--max_samples", "null" if max_samples is None else str(max_samples),
-        "--gptq_dataset", str(gptq["dataset"]),
-        "--gptq_nsamples", str(gptq.get("nsamples", 32)),
-        "--gptq_seqlen", str(gptq.get("seqlen", 1024)),
-        "--gptq_format", str(gptq.get("format", "mxint")),
-        "--gptq_weight_width", str(gptq.get("weight_width", 8)),
-        "--gptq_weight_block_size", str(gptq.get("weight_block_size", 32)),
-        "--gptq_cali_batch_size", str(gptq.get("cali_batch_size", 1)),
-        "--gptq_cache_mode", str(gptq_cache_mode),
-        "--decode_weight_mode", str(runtime.get("decode_weight_mode", "fp")),
         "--gpu_memory_reserve_mb", str(reserve_mb or 0),
         "--gpu_memory_reserve_wait_sec", str(reserve_wait_sec),
         "--gpu_memory_reserve_poll_sec", str(reserve_poll_sec),
         "--gpu_memory_reserve_chunk_mb", str(reserve_chunk_mb),
-        "--act_element_width_prefill", trial.act,
-        "--kv_element_width_prefill", trial.kv,
-        "--fp_setting_prefill", trial.fp_setting,
         "--log_dir", str(trial_dir),
     ]
+    if not quant_config_is_none:
+        cmd += [
+            "--decode_weight_mode", str(runtime.get("decode_weight_mode", "fp")),
+            "--act_element_width_prefill", trial.act,
+            "--kv_element_width_prefill", trial.kv,
+            "--fp_setting_prefill", trial.fp_setting,
+        ]
     if reserve_disable:
         cmd += ["--gpu_memory_reserve_disable", "true"]
-    if gptq.get("cache_dir"):
+    if model_parallel:
+        cmd += ["--model_parallel", "true"]
+    if not quant_config_is_none:
+        cmd += [
+            "--gptq_dataset", str(gptq["dataset"]),
+            "--gptq_nsamples", str(gptq.get("nsamples", 32)),
+            "--gptq_seqlen", str(gptq.get("seqlen", 1024)),
+            "--gptq_format", str(gptq.get("format", "mxint")),
+            "--gptq_weight_width", str(gptq.get("weight_width", 8)),
+            "--gptq_weight_block_size", str(gptq.get("weight_block_size", 32)),
+            "--gptq_cali_batch_size", str(gptq.get("cali_batch_size", 1)),
+            "--gptq_cache_mode", str(gptq_cache_mode),
+        ]
+    if not quant_config_is_none and gptq.get("cache_dir"):
         cmd += ["--gptq_cache_dir", str(gptq.get("cache_dir"))]
-    if gptq_max_layers is not None:
+    if not quant_config_is_none and gptq_max_layers is not None:
         cmd += ["--gptq_max_layers", str(gptq_max_layers)]
     return [x for x in cmd if x != ""]
 
@@ -331,11 +373,20 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, arg
     trial_dir.mkdir(parents=True, exist_ok=True)
     cmd = _base_command(cfg, trial, trial_dir, args)
     timeout = int(args.trial_timeout_sec or cfg.get("runtime", {}).get("trial_timeout_sec", 7200))
+    parallel_mode = _parallel_mode(cfg)
+    model_parallel = _model_parallel_enabled(cfg)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["MPLCONFIGDIR"] = str(trial_dir / "matplotlib")
 
-    _write_json(trial_dir / "trial_config.json", {"trial": trial.__dict__, "gpu": gpu, "timeout_sec": timeout})
+    _write_json(trial_dir / "trial_config.json", {
+        "trial": trial.__dict__,
+        "gpu": gpu,
+        "visible_gpus": str(gpu),
+        "parallel_mode": parallel_mode,
+        "model_parallel": model_parallel,
+        "timeout_sec": timeout,
+    })
     (trial_dir / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
 
     start = time.time()
@@ -371,6 +422,9 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, arg
         "nsamples": metrics.get("nsamples", ""),
         "runtime_sec": f"{runtime_sec:.2f}",
         "gpu": gpu,
+        "parallel_mode": parallel_mode,
+        "visible_gpus": str(gpu),
+        "model_parallel": model_parallel,
         "returncode": returncode if returncode is not None else "",
         "gptq_cache_mode": metrics.get("gptq_cache_mode", args.gptq_cache_mode),
         "gptq_cache_key": metrics.get("gptq_cache_key", ""),
@@ -494,7 +548,8 @@ def main() -> None:
     run_dir = REPO_ROOT / "prefill_DSE" / "runs" / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_design_space(run_dir / "design_space.csv", all_trials)
-    _write_json(run_dir / "run_config.json", {"config_path": str(cfg_path), "args": vars(args), "n_design_points": len(all_trials)})
+    parallel_mode = _parallel_mode(cfg)
+    _write_json(run_dir / "run_config.json", {"config_path": str(cfg_path), "args": vars(args), "n_design_points": len(all_trials), "parallel_mode": parallel_mode})
 
     pending = [t for t in trials if _should_run(run_dir / "ppl_trials" / t.trial_id, args)]
     print(f"Design points total: {len(all_trials)}")
@@ -503,9 +558,13 @@ def main() -> None:
     print(f"Run dir             : {run_dir}")
 
     if args.dry_run:
+        dry_gpus = ",".join(_split_csv(args.gpus) or ["0"]) if parallel_mode == "pp" else None
         for t in pending[:10]:
             cmd = _base_command(cfg, t, run_dir / "ppl_trials" / t.trial_id, args)
-            print(f"[{t.trial_id}] {' '.join(cmd)}")
+            if dry_gpus is not None:
+                print(f"[{t.trial_id}] CUDA_VISIBLE_DEVICES={dry_gpus} {' '.join(cmd)}")
+            else:
+                print(f"[{t.trial_id}] {' '.join(cmd)}")
         if args.join_bfcl_results:
             print(f"Join target: {run_dir / 'joined_bfcl_ppl.csv'}")
         return
@@ -515,11 +574,12 @@ def main() -> None:
         q.put(t)
 
     gpus = _split_csv(args.gpus) or ["0"]
+    worker_gpus = [",".join(gpus)] if parallel_mode == "pp" else gpus
     csv_lock = threading.Lock()
     results_csv = run_dir / "results_ppl.csv"
     with tqdm(total=len(pending), desc="Prefill PPL", unit="trial") as pbar:
         threads = []
-        for idx, gpu in enumerate(gpus):
+        for idx, gpu in enumerate(worker_gpus):
             th = threading.Thread(
                 target=_worker,
                 args=(idx, gpu, cfg, q, args, run_dir, results_csv, csv_lock, pbar),

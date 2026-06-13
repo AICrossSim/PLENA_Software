@@ -28,8 +28,10 @@ gptq:
   cache_mode: auto
 
 runtime:
+  parallel_mode: pp
   decode_weight_mode: fp
-  gpu_memory_reserve_mb: 18000
+  gpu_memory_reserve_mb: 0
+  gpu_memory_reserve_disable: true
   gpu_memory_reserve_wait_sec: 600
   gpu_memory_reserve_poll_sec: 5.0
   gpu_memory_reserve_chunk_mb: 512

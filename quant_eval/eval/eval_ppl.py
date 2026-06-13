@@ -4,6 +4,13 @@ from datasets import load_dataset
 import tqdm
 
 
+def _model_input_device(model) -> torch.device:
+    try:
+        return model.get_input_embeddings().weight.device
+    except Exception:
+        return next(model.parameters()).device
+
+
 def evaluate_perplexity(
     model,
     tokenizer,
@@ -42,7 +49,7 @@ def evaluate_perplexity(
             f"Not enough tokens ({input_ids.numel()}) for max_length={max_length}."
         )
 
-    device = next(model.parameters()).device
+    device = _model_input_device(model)
     nlls = []
 
     for i in tqdm.tqdm(range(nsamples), desc="Evaluating PPL", disable=not verbose):

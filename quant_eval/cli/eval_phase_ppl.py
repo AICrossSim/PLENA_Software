@@ -132,7 +132,7 @@ def main(
     seqlen: int = 1024,
     max_samples: int | None = 64,
     # GPU reservation guard. Held during cache/wrapper setup and released before PPL forward.
-    gpu_memory_reserve_mb: int = 20000,
+    gpu_memory_reserve_mb: int = 0,
     gpu_memory_reserve_wait_sec: int = 600,
     gpu_memory_reserve_poll_sec: float = 5.0,
     gpu_memory_reserve_chunk_mb: int = 512,

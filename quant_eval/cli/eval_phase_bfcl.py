@@ -367,6 +367,12 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
     if max_new_tokens is not None and int(max_new_tokens) <= 0:
         raise ValueError(f"max_new_tokens must be positive or None, got {max_new_tokens!r}.")
 
+    def _input_device() -> torch.device:
+        try:
+            return model.get_input_embeddings().weight.device
+        except Exception:
+            return torch.device(device)
+
     def _cap_max_new_tokens(requested: int | None) -> int:
         requested_toks = 1024 if requested is None else int(requested)
         if max_new_tokens is None:
@@ -397,19 +403,19 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                         tools=tools,
                         add_generation_prompt=True,
                         return_tensors="pt",
-                    ).to(device)
+                    ).to(_input_device())
                 except Exception:
                     prompt_ids = tokenizer.apply_chat_template(
                         messages,
                         add_generation_prompt=True,
                         return_tensors="pt",
-                    ).to(device)
+                    ).to(_input_device())
             else:
                 text = "\n".join(
                     f"{m.get('role','user').upper()}: {m.get('content','')}"
                     for m in messages
                 ) + "\nASSISTANT:"
-                prompt_ids = tokenizer(text, return_tensors="pt").input_ids.to(device)
+                prompt_ids = tokenizer(text, return_tensors="pt").input_ids.to(_input_device())
 
             # ── Inference ──────────────────────────────────────────────
             with torch.no_grad():
@@ -550,7 +556,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
             print(f"🔄 Agentic turn {turn + 1}/{MAX_TURNS}")
 
             # Tokenize the current prompt string directly (no chat template).
-            prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+            prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(_input_device())
 
             with torch.no_grad():
                 attention_mask = torch.ones_like(prompt_ids)
@@ -1536,7 +1542,7 @@ def main(
     bfcl_tool_mode:       str   = "auto",
     bfcl_max_new_tokens:  int | None = 2048,
     # ── GPU reservation guard ───────────────────────────────────────────────
-    gpu_memory_reserve_mb: int = 20000,
+    gpu_memory_reserve_mb: int = 0,
     gpu_memory_reserve_wait_sec: int = 600,
     gpu_memory_reserve_poll_sec: float = 5.0,
     gpu_memory_reserve_chunk_mb: int = 512,
@@ -1577,6 +1583,7 @@ def main(
     ffn_keywords:  Union[list[str], None] = None,
     limit: Union[int, None] = None,
     log_dir: Union[str, None] = None,
+    run_evaluate: bool = True,
 ):
     """
     Run BFCL web-search evaluation with phase- and layer-type-dependent
@@ -1652,6 +1659,9 @@ def main(
             uses the built-in defaults.
         limit: Cap the number of samples per category. ``None`` = full dataset.
         log_dir: Directory for ``args.json`` and ``results.json``.
+        run_evaluate: Run ``bfcl evaluate`` after generation. Set to ``False``
+            when only raw generation artifacts, for example token length
+            statistics, are needed.
 
     Returns:
         BFCL evaluation summary — per-category scores plus aggregate metrics,
@@ -2126,6 +2136,40 @@ def main(
         )
         if gen_rc != 0:
             logger.error("bfcl generate exited with code %d", gen_rc)
+
+        if not run_evaluate:
+            if switch is not None:
+                switch.disable()
+            scores = {
+                "bfcl_generate_returncode": gen_rc,
+                "bfcl_result_dir": str(result_dir),
+                "bfcl_score_dir": str(score_dir),
+                "phase_layer_configs": phase_configs,
+                "bfcl_categories": bfcl_test_categories,
+                "bfcl_tool_mode": bfcl_tool_mode,
+                "bfcl_adapter": resolved_bfcl_adapter,
+                "bfcl_adapter_requested": bfcl_adapter,
+                "model_family": model_family,
+                "bfcl_max_new_tokens": bfcl_max_new_tokens,
+                "decode_weight_mode": decode_weight_mode,
+                "precision_metadata": precision_metadata,
+                "gpu_memory_reserve": gpu_memory_reserve.summary(),
+            }
+            if resolved_gptq_config:
+                scores["gptq"] = {
+                    "dataset": resolved_gptq_config.get("dataset"),
+                    "nsamples": resolved_gptq_config.get("nsamples"),
+                    "seqlen": resolved_gptq_config.get("seqlen"),
+                    "format": resolved_gptq_config.get("format"),
+                    "weight_config": resolved_gptq_config.get("weight_config"),
+                    "cali_batch_size": resolved_gptq_config.get("cali_batch_size"),
+                    "max_layers": resolved_gptq_config.get("max_layers"),
+                }
+                scores["gptq_cache"] = gptq_cache_info
+            if log_dir:
+                save_results(log_dir, scores)
+            _tmpdir_ctx.cleanup()
+            return scores
 
     #     # ------------------------------------------------------------------
     #     # Step 2: bfcl evaluate  (pure scoring, no model needed)
