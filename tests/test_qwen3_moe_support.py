@@ -1,10 +1,12 @@
 import torch
+from torch import nn
+from safetensors.torch import save_file
 
 from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
-from quant_eval.eval.unified_mx import Qwen3MoeExpertsMXUnified, apply_unified_mx_wrappers
-from quant_eval.precision import apply_dse_quant_config
+from quant_eval.eval.unified_mx import LinearMXUnified, Qwen3MoeExpertsMXUnified, apply_unified_mx_wrappers
+from quant_eval.precision import apply_dse_quant_config, parse_mx_precision
 
 
 def _tiny_qwen3_moe() -> Qwen3MoeForCausalLM:
@@ -83,6 +85,24 @@ def test_qwen3_moe_dse_config_does_not_select_router_or_sparse_experts():
     assert "mlp\\.experts" not in joined
 
 
+def test_mxint16_seed_config_is_supported_for_high_precision_smoke():
+    spec = parse_mx_precision("MXINT_16")
+    assert spec.canonical == "MXINT_16"
+
+    pass_args = {}
+    metadata = apply_dse_quant_config(
+        pass_args,
+        act_precision="MXINT_8",
+        kv_precision="MXINT_8",
+        fp_setting="FP_E8M5",
+        weight_precision="MXINT_16",
+        model_family="qwen3_moe",
+    )
+
+    assert metadata["WEIGHT_PRECISION"] == "MXINT_16"
+    assert pass_args[r"model\.layers\.\d+\.self_attn\.(q|k|v|o)_proj"]["config"]["weight_width"] == 16
+
+
 def test_qwen3_moe_expert_wrapper_follows_decode_bypass_phase():
     model = _tiny_qwen3_moe()
     apply_unified_mx_wrappers(
@@ -108,3 +128,54 @@ def test_qwen3_moe_expert_wrapper_follows_decode_bypass_phase():
     finally:
         switch.disable()
 
+
+def test_linear_mx_unified_can_switch_to_gpu_resident_fp_weight():
+    layer = LinearMXUnified(2, 1, bias=False, config={**_act_cfg(), "bypass": True})
+    with torch.no_grad():
+        layer.weight.fill_(1.0)
+    layer.set_fp_weight_backup(torch.full_like(layer.weight, 3.0))
+
+    x = torch.tensor([[2.0, 4.0]])
+    assert torch.equal(layer(x), torch.tensor([[6.0]]))
+    layer.set_use_fp_weight(True)
+    assert torch.equal(layer(x), torch.tensor([[18.0]]))
+    layer.set_use_fp_weight(False)
+    assert torch.equal(layer(x), torch.tensor([[6.0]]))
+
+
+def test_phase_switch_gpu_dual_uses_fp_backup_without_disk_reload(tmp_path):
+    class Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.proj = LinearMXUnified(2, 1, bias=False, config={**_act_cfg(), "bypass": True})
+
+    model = Tiny()
+    with torch.no_grad():
+        model.mlp.proj.weight.fill_(1.0)
+
+    save_file(
+        {"mlp.proj.weight": torch.full_like(model.mlp.proj.weight, 5.0)},
+        str(tmp_path / "model.safetensors"),
+    )
+
+    switch = PhaseLayerAutoSwitch(
+        model,
+        {
+            "prefill": {"ffn": {"bypass": True}},
+            "decode": {"ffn": {"weight_mode": "fp", "bypass": True}},
+        },
+        model_name=str(tmp_path),
+        weight_residency="gpu_dual",
+    ).enable()
+    try:
+        assert model.mlp.proj.fp_weight is not None
+        assert not model.mlp.proj.use_fp_weight
+        switch._on_phase_transition("decode", None)
+        assert model.mlp.proj.use_fp_weight
+        out = model.mlp.proj(torch.tensor([[1.0, 1.0]]))
+        assert torch.equal(out, torch.tensor([[10.0]]))
+        switch._on_phase_transition("prefill", None)
+        assert not model.mlp.proj.use_fp_weight
+    finally:
+        switch.disable()

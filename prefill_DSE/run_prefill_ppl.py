@@ -41,8 +41,10 @@ RESULT_FIELDS = [
     "runtime_sec",
     "gpu",
     "parallel_mode",
+    "model_lifecycle",
     "visible_gpus",
     "model_parallel",
+    "decode_weight_residency",
     "returncode",
     "gptq_cache_mode",
     "gptq_cache_key",
@@ -135,6 +137,28 @@ def _parallel_mode(cfg: dict[str, Any]) -> str:
 
 def _model_parallel_enabled(cfg: dict[str, Any]) -> bool:
     return _parallel_mode(cfg) == "pp"
+
+
+def _model_lifecycle(cfg: dict[str, Any]) -> str:
+    lifecycle = str(cfg.get("runtime", {}).get("model_lifecycle", "per_trial")).lower()
+    if lifecycle not in {"per_trial", "persistent"}:
+        raise ValueError(f"runtime.model_lifecycle must be 'per_trial' or 'persistent', got {lifecycle!r}")
+    return lifecycle
+
+
+def _decode_weight_residency(cfg: dict[str, Any]) -> str:
+    residency = str(cfg.get("runtime", {}).get("decode_weight_residency", "disk_reload")).lower()
+    if residency not in {"disk_reload", "gpu_dual"}:
+        raise ValueError(
+            f"runtime.decode_weight_residency must be 'disk_reload' or 'gpu_dual', got {residency!r}"
+        )
+    runtime = cfg.get("runtime", {})
+    if residency == "gpu_dual":
+        if _parallel_mode(cfg) != "pp":
+            raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.parallel_mode='pp'.")
+        if str(runtime.get("decode_weight_mode", "fp")).lower() != "fp":
+            raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.decode_weight_mode='fp'.")
+    return residency
 
 
 def _quant_config_is_none(model: dict[str, Any]) -> bool:
@@ -310,6 +334,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
     runtime = cfg.get("runtime", {})
     ppl = cfg.get("ppl", {})
     model_parallel = _model_parallel_enabled(cfg)
+    decode_weight_residency = _decode_weight_residency(cfg)
     quant_config_is_none = _quant_config_is_none(model)
 
     max_samples = _parse_nullable_int(args.ppl_max_samples, ppl.get("max_samples", 64))
@@ -343,6 +368,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
     if not quant_config_is_none:
         cmd += [
             "--decode_weight_mode", str(runtime.get("decode_weight_mode", "fp")),
+            "--decode_weight_residency", decode_weight_residency,
             "--act_element_width_prefill", trial.act,
             "--kv_element_width_prefill", trial.kv,
             "--fp_setting_prefill", trial.fp_setting,
@@ -362,6 +388,8 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
             "--gptq_cali_batch_size", str(gptq.get("cali_batch_size", 1)),
             "--gptq_cache_mode", str(gptq_cache_mode),
         ]
+        if bool(gptq.get("device_map_aware", False)):
+            cmd += ["--gptq_device_map_aware", "true"]
     if not quant_config_is_none and gptq.get("cache_dir"):
         cmd += ["--gptq_cache_dir", str(gptq.get("cache_dir"))]
     if not quant_config_is_none and gptq_max_layers is not None:
@@ -374,6 +402,8 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, arg
     cmd = _base_command(cfg, trial, trial_dir, args)
     timeout = int(args.trial_timeout_sec or cfg.get("runtime", {}).get("trial_timeout_sec", 7200))
     parallel_mode = _parallel_mode(cfg)
+    model_lifecycle = _model_lifecycle(cfg)
+    decode_weight_residency = _decode_weight_residency(cfg)
     model_parallel = _model_parallel_enabled(cfg)
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -384,6 +414,8 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, arg
         "gpu": gpu,
         "visible_gpus": str(gpu),
         "parallel_mode": parallel_mode,
+        "model_lifecycle": model_lifecycle,
+        "decode_weight_residency": decode_weight_residency,
         "model_parallel": model_parallel,
         "timeout_sec": timeout,
     })
@@ -423,8 +455,10 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, arg
         "runtime_sec": f"{runtime_sec:.2f}",
         "gpu": gpu,
         "parallel_mode": parallel_mode,
+        "model_lifecycle": model_lifecycle,
         "visible_gpus": str(gpu),
         "model_parallel": model_parallel,
+        "decode_weight_residency": decode_weight_residency,
         "returncode": returncode if returncode is not None else "",
         "gptq_cache_mode": metrics.get("gptq_cache_mode", args.gptq_cache_mode),
         "gptq_cache_key": metrics.get("gptq_cache_key", ""),
@@ -521,7 +555,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppl-seqlen", type=int, default=None)
     parser.add_argument("--ppl-max-samples", default="64", help="Number of WikiText2 blocks; use 'none' for full split")
     parser.add_argument("--gptq-max-layers", default=None)
-    parser.add_argument("--gptq-cache-mode", default="require", choices=["off", "auto", "refresh", "require"])
+    parser.add_argument("--gptq-cache-mode", default="require", choices=["off", "auto", "refresh", "require", "memory"])
     parser.add_argument("--gpu-memory-reserve-mb", type=int, default=None)
     parser.add_argument("--gpu-memory-reserve-wait-sec", type=int, default=None)
     parser.add_argument("--gpu-memory-reserve-poll-sec", type=float, default=None)
@@ -549,7 +583,14 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_design_space(run_dir / "design_space.csv", all_trials)
     parallel_mode = _parallel_mode(cfg)
-    _write_json(run_dir / "run_config.json", {"config_path": str(cfg_path), "args": vars(args), "n_design_points": len(all_trials), "parallel_mode": parallel_mode})
+    _write_json(run_dir / "run_config.json", {
+        "config_path": str(cfg_path),
+        "args": vars(args),
+        "n_design_points": len(all_trials),
+        "parallel_mode": parallel_mode,
+        "model_lifecycle": _model_lifecycle(cfg),
+        "decode_weight_residency": _decode_weight_residency(cfg),
+    })
 
     pending = [t for t in trials if _should_run(run_dir / "ppl_trials" / t.trial_id, args)]
     print(f"Design points total: {len(all_trials)}")

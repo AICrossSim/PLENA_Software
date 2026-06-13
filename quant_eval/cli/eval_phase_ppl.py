@@ -146,6 +146,7 @@ def main(
     gptq_weight_block_size: int = 32,
     gptq_cali_batch_size: int = 1,
     gptq_max_layers: int | None = None,
+    gptq_device_map_aware: bool = False,
     gptq_cache_dir: str | None = None,
     gptq_cache_mode: str = "require",
     # Legacy phase widths.
@@ -168,6 +169,7 @@ def main(
     dse_weight_precision: str | None = None,
     dse_weight_block_size: int | None = None,
     decode_weight_mode: str = "quantized",
+    decode_weight_residency: str = "disk_reload",
     attn_keywords: Union[list[str], None] = None,
     ffn_keywords: Union[list[str], None] = None,
     log_dir: Union[str, None] = None,
@@ -203,6 +205,18 @@ def main(
         if decode_weight_mode != "quantized":
             logger.info("Ignoring decode_weight_mode=%s for FP PPL baseline.", decode_weight_mode)
             decode_weight_mode = "quantized"
+        if decode_weight_residency != "disk_reload":
+            raise ValueError("--decode_weight_residency is only meaningful for quantized runs.")
+    decode_weight_residency = str(decode_weight_residency or "disk_reload").lower()
+    if decode_weight_residency not in {"disk_reload", "gpu_dual"}:
+        raise ValueError(
+            "decode_weight_residency must be 'disk_reload' or 'gpu_dual', "
+            f"got {decode_weight_residency!r}."
+        )
+    if decode_weight_residency == "gpu_dual" and decode_weight_mode != "fp":
+        raise ValueError("decode_weight_residency='gpu_dual' requires decode_weight_mode='fp'.")
+    if decode_weight_residency == "gpu_dual" and not model_parallel:
+        raise ValueError("decode_weight_residency='gpu_dual' is only supported with model_parallel=true.")
 
     decode_weight_policy = {"weight_mode": "fp", "bypass": True} if decode_weight_mode == "fp" else {}
     decode_nonlinear_policy = {"bypass": True} if decode_weight_mode == "fp" else {}
@@ -269,6 +283,7 @@ def main(
         print(f"  GPTQ      : dataset={gptq_dataset}, cache={gptq_cache_mode}@{gptq_cache_dir}")
     print(f"  Prefill   : attn={prefill['display']} ffn={prefill['ffn_display']}")
     print(f"  Decode    : {decode_weight_mode} (unused for teacher-forcing PPL unless seq_len==1)")
+    print(f"  Weight res: {decode_weight_residency}")
     if gpu_memory_reserve_enabled:
         print(
             "  GPU reserve: "
@@ -346,18 +361,29 @@ def main(
             weight_block_size=gptq_weight_block_size,
             cali_batch_size=gptq_cali_batch_size,
             max_layers=gptq_max_layers,
+            device_map_aware=bool(gptq_device_map_aware),
         )
         gptq_cache = None
         try:
             if resolved_gptq_config:
                 marked = _mark_gptq_projection_configs(pass_args)
                 logger.info("GPTQ config present: marked_weight_configs=%s", marked)
-                if str(gptq_cache_mode or "off").lower() != "off":
+                normalized_cache_mode = str(gptq_cache_mode or "off").lower()
+                if normalized_cache_mode == "memory":
+                    gptq_cache_info = {
+                        "mode": "memory",
+                        "hit": False,
+                        "path": "",
+                        "loaded_layers": 0,
+                        "partial_layers": 0,
+                        "resuming": False,
+                    }
+                elif normalized_cache_mode != "off":
                     if not gptq_cache_dir:
                         raise ValueError("gptq_cache_dir must be set when gptq_cache_mode is not 'off'.")
                     gptq_cache = _GptqWeightCache(
                         cache_dir=gptq_cache_dir,
-                        mode=gptq_cache_mode,
+                        mode=normalized_cache_mode,
                         gptq_config=resolved_gptq_config,
                         total_layers=len(model.model.layers),
                     )
@@ -407,6 +433,7 @@ def main(
             switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
         if decode_weight_mode == "fp":
             switch_kwargs["model_name"] = model_name
+            switch_kwargs["weight_residency"] = decode_weight_residency
         switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
         switch.enable()
         logger.info("\n%s", switch.summary())
@@ -437,6 +464,8 @@ def main(
         "precision_metadata": precision_metadata,
         "model_family": model_family,
         "decode_weight_mode": decode_weight_mode,
+        "decode_weight_residency": decode_weight_residency,
+        "gptq_device_map_aware": bool(gptq_device_map_aware),
         "gptq_cache": gptq_cache_info,
         "gpu_memory_reserve": gpu_memory_reserve.summary(),
     })

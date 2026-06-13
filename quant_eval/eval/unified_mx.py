@@ -266,6 +266,9 @@ class LinearMXUnified(nn.Linear):
         self.bypass = bool(config.get("bypass", False))
         self.gptq = bool(config.get("gptq", False))
         self.clip_search = bool(config.get("clip_search", False))
+        self.use_fp_weight = False
+        self.register_buffer("fp_weight", None, persistent=False)
+        self.register_buffer("fp_bias", None, persistent=False)
 
     @classmethod
     def from_existing(cls, module: nn.Linear, config: dict | None = None) -> "LinearMXUnified":
@@ -292,10 +295,47 @@ class LinearMXUnified(nn.Linear):
 
     @torch.no_grad()
     def forward(self, x: Tensor) -> Tensor:
+        self._materialize_on_input_device(x.device)
+        weight = self.fp_weight if self.use_fp_weight and self.fp_weight is not None else self.weight
+        bias = self.fp_bias if self.use_fp_weight and self.fp_bias is not None else self.bias
         if self.bypass:
-            return F.linear(x.to(dtype=self.weight.dtype), self.weight, self.bias)
+            return F.linear(x.to(dtype=weight.dtype), weight, bias)
         x = quantize_mx(x, self.config, block_dim=-1, prefix="data_in")
-        return F.linear(x.to(dtype=self.weight.dtype), self.weight, self.bias)
+        return F.linear(x.to(dtype=weight.dtype), weight, bias)
+
+    @torch.no_grad()
+    def _materialize_on_input_device(self, device: torch.device) -> None:
+        """Keep replacement wrappers compatible with HF Accelerate device maps.
+
+        ``device_map="auto"`` attaches hooks before we install some unified
+        wrappers, so the replacement module can retain CPU tensors while its
+        parent layer is executed on a GPU.  Move each tensor once to the device
+        that actually feeds the layer.
+        """
+        if self.weight.device != device:
+            self.weight.data = self.weight.data.to(device=device)
+        if self.bias is not None and self.bias.device != device:
+            self.bias.data = self.bias.data.to(device=device)
+        if self.fp_weight is not None and self.fp_weight.device != device:
+            self.fp_weight = self.fp_weight.to(device=device)
+        if self.fp_bias is not None and self.fp_bias.device != device:
+            self.fp_bias = self.fp_bias.to(device=device)
+
+    @torch.no_grad()
+    def set_fp_weight_backup(self, weight: Tensor, bias: Tensor | None = None) -> None:
+        self.fp_weight = weight.to(device=self.weight.device, dtype=self.weight.dtype).contiguous()
+        if bias is not None:
+            self.fp_bias = bias.to(
+                device=self.bias.device if self.bias is not None else self.weight.device,
+                dtype=self.bias.dtype if self.bias is not None else self.weight.dtype,
+            ).contiguous()
+        elif self.bias is not None:
+            self.fp_bias = None
+
+    def set_use_fp_weight(self, enabled: bool) -> None:
+        if enabled and self.fp_weight is None:
+            raise RuntimeError("FP weight residency requested before fp_weight backup was materialized.")
+        self.use_fp_weight = bool(enabled)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         result = super().load_state_dict(state_dict, strict=strict, assign=assign)
@@ -699,6 +739,7 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
         top_k_index: Tensor,
         top_k_weights: Tensor,
     ) -> Tensor:
+        self._materialize_on_input_device(hidden_states.device)
         if self.bypass:
             return super().forward(hidden_states, top_k_index, top_k_weights)
 
@@ -723,6 +764,13 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+    @torch.no_grad()
+    def _materialize_on_input_device(self, device: torch.device) -> None:
+        if self.gate_up_proj.device != device:
+            self.gate_up_proj.data = self.gate_up_proj.data.to(device=device)
+        if self.down_proj.device != device:
+            self.down_proj.data = self.down_proj.data.to(device=device)
 
 
 def _build_minifloat_quantizer(q_config: dict, *, prefix: str):
@@ -784,7 +832,8 @@ class Qwen3RMSNormMinifloatUnified(Qwen3RMSNorm):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        weight = self.w_quantizer(self.weight) if self.w_quantizer is not None else self.weight
+        base_weight = self.weight.to(device=hidden_states.device)
+        weight = self.w_quantizer(base_weight) if self.w_quantizer is not None else base_weight
         return weight * hidden_states.to(input_dtype)
 
 
@@ -830,7 +879,8 @@ class Qwen3MoeRMSNormMinifloatUnified(Qwen3MoeRMSNorm):
         hidden_states = hidden_states.to(torch.float32)
         variance = hidden_states.pow(2).mean(-1, keepdim=True)
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        weight = self.w_quantizer(self.weight) if self.w_quantizer is not None else self.weight
+        base_weight = self.weight.to(device=hidden_states.device)
+        weight = self.w_quantizer(base_weight) if self.w_quantizer is not None else base_weight
         return weight * hidden_states.to(input_dtype)
 
 
@@ -872,6 +922,32 @@ def _replace_child(root: nn.Module, name: str, new_module: nn.Module) -> None:
         setattr(parent, leaf, new_module)
 
 
+def _install_qwen3_moe_router_device_hooks(model: nn.Module) -> int:
+    """Keep FP router weights colocated with routed hidden states."""
+
+    def _move_router_to_input_device(module: nn.Module, args) -> None:
+        if not args:
+            return None
+        hidden_states = args[0]
+        if not torch.is_tensor(hidden_states) or not hasattr(module, "weight"):
+            return None
+        weight = module.weight
+        if weight.device != hidden_states.device:
+            weight.data = weight.data.to(device=hidden_states.device)
+        return None
+
+    count = 0
+    for name, module in model.named_modules():
+        if not name.endswith(".mlp.gate") or not hasattr(module, "weight"):
+            continue
+        if getattr(module, "_plena_qwen3_moe_router_device_hook", False):
+            continue
+        module.register_forward_pre_hook(_move_router_to_input_device)
+        module._plena_qwen3_moe_router_device_hook = True
+        count += 1
+    return count
+
+
 def apply_unified_mx_wrappers(
     model: nn.Module,
     qwen3_attention_config: dict | None = None,
@@ -900,6 +976,7 @@ def apply_unified_mx_wrappers(
         "qwen3_moe_attention": 0,
         "qwen3_moe_experts": 0,
         "qwen3_moe_rms_norm": 0,
+        "qwen3_moe_router_device_hook": 0,
         "rms_norm_dtype_patch": 0,
     }
     counts["rms_norm_dtype_patch"] = int(_patch_rms_norm_dtype_preservation())
@@ -949,6 +1026,9 @@ def apply_unified_mx_wrappers(
             if isinstance(module, Qwen3MoeRMSNorm) and not isinstance(module, Qwen3MoeRMSNormMinifloatUnified):
                 _replace_child(model, name, Qwen3MoeRMSNormMinifloatUnified.from_rms_norm(module, qwen3_moe_rms_norm_config))
                 counts["qwen3_moe_rms_norm"] += 1
+
+    if qwen3_moe_attention_config is not None or qwen3_moe_experts_config is not None:
+        counts["qwen3_moe_router_device_hook"] = _install_qwen3_moe_router_device_hooks(model)
 
     counts["attention"] = counts["llama_attention"] + counts["qwen3_attention"] + counts["qwen3_moe_attention"]
     return counts

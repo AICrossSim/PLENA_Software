@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import re
 
 
-SUPPORTED_MXINT_BITS = {2, 3, 4, 8}
+SUPPORTED_MXINT_BITS = {2, 3, 4, 8, 16}
 SUPPORTED_MXFP_FORMATS = {(1, 2), (2, 1), (4, 3), (5, 2)}
 SUPPORTED_FP_SETTINGS = {(3, 2), (2, 3), (6, 5), (5, 6), (4, 7), (8, 5)}
 

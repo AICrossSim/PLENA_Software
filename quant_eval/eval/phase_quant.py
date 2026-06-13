@@ -108,6 +108,7 @@ _ATTN_BYPASS_ATTRS = (
 )
 
 _VALID_WEIGHT_MODES = {"quantized", "fp"}
+_VALID_WEIGHT_RESIDENCIES = {"disk_reload", "gpu_dual"}
 
 
 def _set_attention_bypass_attrs(wrapper: nn.Module, bypass: bool) -> None:
@@ -491,6 +492,7 @@ class PhaseLayerAutoSwitch:
         attn_keywords: tuple[str, ...] = _DEFAULT_ATTN_KEYWORDS,
         ffn_keywords:  tuple[str, ...] = _DEFAULT_FFN_KEYWORDS,
         model_name: str | None = None,
+        weight_residency: str = "disk_reload",
     ):
         """
         Args:
@@ -511,12 +513,20 @@ class PhaseLayerAutoSwitch:
         self.attn_keywords = attn_keywords
         self.ffn_keywords  = ffn_keywords
         self.model_name = model_name
+        self.weight_residency = str(weight_residency or "disk_reload").lower()
+        if self.weight_residency not in _VALID_WEIGHT_RESIDENCIES:
+            raise ValueError(
+                f"Unsupported weight_residency={weight_residency!r}; expected one of "
+                f"{sorted(_VALID_WEIGHT_RESIDENCIES)}."
+            )
         self._fp_weight_requested = self._phase_configs_request_fp_weight()
         if self._fp_weight_requested and model_name is None:
             raise ValueError(
                 "PhaseLayerAutoSwitch requires model_name when any phase "
                 "config sets weight_mode='fp'."
             )
+        if self.weight_residency == "gpu_dual" and not self._fp_weight_requested:
+            raise ValueError("weight_residency='gpu_dual' requires at least one phase with weight_mode='fp'.")
 
         # Shared mutable cell — updated by the top-level phase-detection hook,
         # read by every per-submodule hook.  A one-element list is used so
@@ -587,6 +597,8 @@ class PhaseLayerAutoSwitch:
                 f"Could not locate HF safetensors for model_name={model_name!r}; "
                 "weight_mode='fp' cannot load original decode weights."
             )
+        if self._fp_weight_requested and self.weight_residency == "gpu_dual":
+            self._materialize_gpu_dual_fp_weights()
 
     def _phase_requests_fp_weight(self, phase: str) -> bool:
         """Return whether a specific phase requests original FP weights."""
@@ -843,8 +855,10 @@ class PhaseLayerAutoSwitch:
             for mx in info["owned_mx"]:
                 mx.config.update(explicit_weight_overrides)
 
-        # ── Stage 3: disk-backed weight reload / restore ──────────────
-        if self._shard_map is not None or self._fp_weight_active:
+        # ── Stage 3: weight residency switch / reload ────────────────
+        if self.weight_residency == "gpu_dual":
+            self._select_gpu_dual_weight_phase(new_phase)
+        elif self._shard_map is not None or self._fp_weight_active:
             self._reload_weights_for_phase(new_phase)
 
         # ── Stage 4: in-place re-quant of existing KV cache ───────────
@@ -983,6 +997,69 @@ class PhaseLayerAutoSwitch:
                         # module's own weight quantizer using Stage 2's config.
                         mx.load_state_dict(local_sd, strict=False)
 
+    def _gpu_dual_target_modules(self) -> dict[int, tuple[str, object]]:
+        """Return MX modules that need an original FP backup in gpu_dual mode."""
+        targets: dict[int, tuple[str, object]] = {}
+        for info in self._submodule_info.values():
+            for by_layer in self.phase_configs.values():
+                lt_overrides = by_layer.get(info["layer_type"]) or {}
+                if _normalize_weight_mode(lt_overrides) != "fp":
+                    continue
+                for mx in info["owned_mx"]:
+                    mx_name = self._mx_name_by_id.get(id(mx))
+                    if mx_name is not None:
+                        targets[id(mx)] = (mx_name, mx)
+        return targets
+
+    def _materialize_gpu_dual_fp_weights(self) -> None:
+        """Load original checkpoint weights once into GPU-resident buffers."""
+        from safetensors import safe_open
+        from quant_eval.eval.unified_mx import LinearMXUnified
+
+        targets = self._gpu_dual_target_modules()
+        unsupported = [
+            mx_name
+            for mx_name, mx in targets.values()
+            if not isinstance(mx, LinearMXUnified)
+        ]
+        if unsupported:
+            preview = ", ".join(unsupported[:5])
+            suffix = "..." if len(unsupported) > 5 else ""
+            raise ValueError(
+                "weight_residency='gpu_dual' currently supports only LinearMXUnified "
+                "modules. Unsupported modules: "
+                f"{preview}{suffix}. Use weight_residency='disk_reload' for this config."
+            )
+
+        by_shard: dict[str, list[tuple[str, LinearMXUnified]]] = {}
+        for mx_name, mx in targets.values():
+            tensor_name = f"{mx_name}.weight"
+            shard_path = None if self._shard_map is None else self._shard_map.get(tensor_name)
+            if shard_path is None:
+                raise ValueError(
+                    f"Missing checkpoint tensor {tensor_name!r}; cannot materialize gpu_dual FP backup."
+                )
+            by_shard.setdefault(shard_path, []).append((tensor_name, mx))
+
+        for shard_path, items in by_shard.items():
+            with safe_open(shard_path, framework="pt") as f:
+                shard_keys = set(f.keys())
+                for tensor_name, mx in items:
+                    fp_cpu = f.get_tensor(tensor_name)
+                    bias_name = tensor_name[:-len(".weight")] + ".bias"
+                    bias_cpu = f.get_tensor(bias_name) if bias_name in shard_keys else None
+                    mx.set_fp_weight_backup(fp_cpu, bias_cpu)
+
+    def _select_gpu_dual_weight_phase(self, phase: str) -> None:
+        """Select quantized or FP resident weights for this phase."""
+        phase_overrides = self.phase_configs.get(phase, {})
+        for info in self._submodule_info.values():
+            lt_overrides = phase_overrides.get(info["layer_type"]) or {}
+            use_fp = _normalize_weight_mode(lt_overrides) == "fp"
+            for mx in info["owned_mx"]:
+                if hasattr(mx, "set_use_fp_weight"):
+                    mx.set_use_fp_weight(use_fp)
+
     def _requant_kv_cache(self, past_key_values, new_phase: str) -> None:
         """In-place fake-quant of existing K/V entries in ``past_key_values``
         at the new phase's attn width/block_size.
@@ -1098,6 +1175,8 @@ class PhaseLayerAutoSwitch:
         for _, module in self._all_mx_layers:
             if id(module) in self._fp_weight_active:
                 self._restore_quantized_weight(module)
+            if hasattr(module, "set_use_fp_weight"):
+                module.set_use_fp_weight(False)
 
         for name, module in self._all_mx_layers:
             original = self._original_configs.get(name, {})

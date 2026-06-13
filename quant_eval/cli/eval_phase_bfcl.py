@@ -1150,6 +1150,7 @@ def _inject_gptq_config(
     weight_block_size: int,
     cali_batch_size: int,
     max_layers: int | None,
+    device_map_aware: bool = False,
 ) -> dict | None:
     """Merge CLI GPTQ options into pass_args; CLI values take precedence."""
     if dataset is None:
@@ -1179,6 +1180,7 @@ def _inject_gptq_config(
             "weight_block_size": weight_block_size,
         },
         "cali_batch_size": cali_batch_size,
+        "device_map_aware": bool(device_map_aware),
     })
     if max_layers is not None:
         if max_layers <= 0:
@@ -1192,7 +1194,7 @@ def _inject_gptq_config(
 
 
 
-_GPTQ_CACHE_MODES = {"off", "auto", "refresh", "require"}
+_GPTQ_CACHE_MODES = {"off", "auto", "refresh", "require", "memory"}
 _GPTQ_CACHE_MODEL_NAME = "quantized_model"
 
 
@@ -1518,7 +1520,23 @@ def _run_bfcl_evaluate(
     if proc.stderr:
         logger.warning("bfcl evaluate stderr:\n%s", proc.stderr)
 
-    return proc.returncode, scores
+    returncode = proc.returncode
+    if (
+        partial_eval
+        and returncode != 0
+        and per_cat
+        and "StatisticsError" in proc.stderr
+        and "stdev requires at least two data points" in proc.stderr
+    ):
+        logger.warning(
+            "bfcl evaluate produced per-category scores but failed while "
+            "building the leaderboard latency stdev for a one-sample partial eval; "
+            "treating the score as usable."
+        )
+        scores["partial_eval_warning"] = "bfcl_latency_stdev_single_sample"
+        returncode = 0
+
+    return returncode, scores
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1556,6 +1574,7 @@ def main(
     gptq_weight_block_size:int = 32,
     gptq_cali_batch_size:  int = 1,
     gptq_max_layers:       int | None = None,
+    gptq_device_map_aware: bool = False,
     gptq_cache_dir:        str | None = None,
     gptq_cache_mode:       str = "off",
     # ── Legacy width controls; overridden by precision tokens below ───────
@@ -1578,12 +1597,14 @@ def main(
     dse_weight_precision:      str | None = None,
     dse_weight_block_size:     int | None = None,
     decode_weight_mode:        str = "quantized",
+    decode_weight_residency:   str = "disk_reload",
     # ── Optional keyword overrides ─────────────────────────────────────────
     attn_keywords: Union[list[str], None] = None,
     ffn_keywords:  Union[list[str], None] = None,
     limit: Union[int, None] = None,
     log_dir: Union[str, None] = None,
     run_evaluate: bool = True,
+    persistent_trials: list[dict] | None = None,
 ):
     """
     Run BFCL web-search evaluation with phase- and layer-type-dependent
@@ -1653,6 +1674,9 @@ def main(
         decode_weight_mode: ``"quantized"`` keeps current decode behavior;
             ``"fp"`` loads original checkpoint weights for decode Linear
             layers and bypasses Linear activation quantization.
+        decode_weight_residency: ``"disk_reload"`` keeps the legacy FP decode
+            weight reload path. ``"gpu_dual"`` keeps original FP Linear weights
+            in GPU-resident wrapper buffers and phase-switches by flag.
         attn_keywords: Module-name substrings that identify attention blocks.
             ``None`` uses the built-in defaults.
         ffn_keywords: Module-name substrings that identify FFN blocks. ``None``
@@ -1680,6 +1704,16 @@ def main(
             "decode_weight_mode must be 'quantized' or 'fp', "
             f"got {decode_weight_mode!r}."
         )
+    decode_weight_residency = str(decode_weight_residency or "disk_reload").lower()
+    if decode_weight_residency not in {"disk_reload", "gpu_dual"}:
+        raise ValueError(
+            "decode_weight_residency must be 'disk_reload' or 'gpu_dual', "
+            f"got {decode_weight_residency!r}."
+        )
+    if decode_weight_residency == "gpu_dual" and decode_weight_mode != "fp":
+        raise ValueError("decode_weight_residency='gpu_dual' requires decode_weight_mode='fp'.")
+    if decode_weight_residency == "gpu_dual" and not model_parallel:
+        raise ValueError("decode_weight_residency='gpu_dual' is only supported with model_parallel=true.")
     device_id = _normalize_device_id(device_id)
     gpu_memory_reserve_enabled = (
         not gpu_memory_reserve_disable
@@ -1715,6 +1749,8 @@ def main(
                 "--decode_weight_mode is only meaningful for quantized runs; "
                 "use the default with --quant_config none."
             )
+        if decode_weight_residency != "disk_reload":
+            raise ValueError("--decode_weight_residency is only meaningful for quantized runs.")
 
     # ------------------------------------------------------------------
     # Build the nested phase × layer/nonlinear config
@@ -1849,6 +1885,34 @@ def main(
         "dse_weight_block_size": _resolved_dse_weight_block_size,
     }
 
+    def _prefill_phase_from_tokens(act: str, kv: str, fp: str) -> tuple[dict, dict]:
+        act_spec = parse_mx_precision(act)
+        kv_spec = parse_mx_precision(kv)
+        fp_spec = parse_fp_setting(fp)
+        act_cfg = mx_data_config(act_spec, dse_mx_block_size)
+        kv_cfg = mx_data_config(kv_spec, dse_mx_block_size)
+        fp_cfg = fp_data_config(fp_spec)
+        rms_cfg = {
+            **fp_cfg,
+            "weight_exponent_width": fp_spec.exp,
+            "weight_frac_width": fp_spec.frac,
+            "weight_is_finite": True,
+            "weight_round_mode": "rn",
+        }
+        return (
+            {
+                "attn": {**act_cfg, "kv_cache": dict(kv_cfg), "softmax": dict(fp_cfg), "rope": dict(fp_cfg)},
+                "ffn": dict(act_cfg),
+                "mlp": dict(fp_cfg),
+                "rms_norm": rms_cfg,
+            },
+            {
+                "ACT_ELEMENT_WIDTH": act_spec.canonical,
+                "KV_ELEMENT_WIDTH": kv_spec.canonical,
+                "FP_SETTING": fp_spec.canonical,
+            },
+        )
+
     _qwen3_default_precision_enabled = qwen_model_family and not quant_config_is_none
     _codesign_tokens_enabled = _qwen3_default_precision_enabled or any(v is not None for v in (
         act_element_width_prefill, act_element_width_decode,
@@ -1889,6 +1953,7 @@ def main(
     print(f"  Max new tok: {bfcl_max_new_tokens if bfcl_max_new_tokens is not None else 'uncapped'}")
     print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     print(f"  Decode W   : {decode_weight_mode}")
+    print(f"  Weight res : {decode_weight_residency}")
     if gptq_dataset:
         print(f"  GPTQ       : dataset={gptq_dataset}, nsamples={gptq_nsamples}, seqlen={gptq_seqlen}, max_layers={gptq_max_layers}")
         print(f"  GPTQ cache : mode={gptq_cache_mode}, dir={gptq_cache_dir or 'none'}")
@@ -2002,6 +2067,7 @@ def main(
                 weight_block_size=gptq_weight_block_size,
                 cali_batch_size=gptq_cali_batch_size,
                 max_layers=gptq_max_layers,
+                device_map_aware=bool(gptq_device_map_aware),
             )
             gptq_cache = None
             gptq_cache_info = {"mode": str(gptq_cache_mode or "off").lower(), "hit": False}
@@ -2016,12 +2082,22 @@ def main(
                     resolved_gptq_config.get("max_layers"),
                     marked_gptq_configs,
                 )
-                if str(gptq_cache_mode or "off").lower() != "off":
+                normalized_cache_mode = str(gptq_cache_mode or "off").lower()
+                if normalized_cache_mode == "memory":
+                    gptq_cache_info = {
+                        "mode": "memory",
+                        "hit": False,
+                        "path": "",
+                        "loaded_layers": 0,
+                        "partial_layers": 0,
+                        "resuming": False,
+                    }
+                elif normalized_cache_mode != "off":
                     if not gptq_cache_dir:
                         raise ValueError("gptq_cache_dir must be set when gptq_cache_mode is not 'off'.")
                     gptq_cache = _GptqWeightCache(
                         cache_dir=gptq_cache_dir,
-                        mode=gptq_cache_mode,
+                        mode=normalized_cache_mode,
                         gptq_config=resolved_gptq_config,
                         total_layers=len(model.model.layers),
                     )
@@ -2101,6 +2177,7 @@ def main(
                 switch_kwargs["ffn_keywords"] = tuple(ffn_keywords)
             if decode_weight_mode == "fp":
                 switch_kwargs["model_name"] = model_name
+                switch_kwargs["weight_residency"] = decode_weight_residency
 
             switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
             switch.enable()
@@ -2119,6 +2196,86 @@ def main(
             bfcl_adapter=bfcl_adapter_obj,
         )
         _start_server(app, server_host, server_port)
+
+        if persistent_trials:
+            persistent_results = {
+                "model_family": model_family,
+                "decode_weight_mode": decode_weight_mode,
+                "decode_weight_residency": decode_weight_residency,
+                "gptq_cache": gptq_cache_info,
+                "trials": [],
+            }
+            for trial_spec in persistent_trials:
+                trial_log_dir = Path(str(trial_spec["log_dir"]))
+                trial_log_dir.mkdir(parents=True, exist_ok=True)
+                trial_result_dir = trial_log_dir / "bfcl_results"
+                trial_score_dir = trial_log_dir / "bfcl_scores"
+                trial_result_dir.mkdir(parents=True, exist_ok=True)
+                trial_score_dir.mkdir(parents=True, exist_ok=True)
+
+                if switch is not None:
+                    prefill_phase, prefill_meta = _prefill_phase_from_tokens(
+                        str(trial_spec["act"]),
+                        str(trial_spec["kv"]),
+                        str(trial_spec["fp_setting"]),
+                    )
+                    switch.phase_configs["prefill"] = prefill_phase
+                    precision_metadata["prefill"] = prefill_meta
+                    switch._on_phase_transition("prefill", None)
+                    switch._phase[0] = "prefill"
+
+                gen_rc = _run_bfcl_generate(
+                    model_name=model_name,
+                    test_categories=bfcl_test_categories,
+                    host=server_host,
+                    port=server_port,
+                    result_dir=trial_result_dir,
+                    num_threads=bfcl_num_threads,
+                    limit=limit,
+                    model_alias=bfcl_model_alias,
+                )
+                if run_evaluate:
+                    eval_rc, scores = _run_bfcl_evaluate(
+                        model_name=model_name,
+                        test_categories=bfcl_test_categories,
+                        result_dir=trial_result_dir,
+                        score_dir=trial_score_dir,
+                        model_alias=bfcl_model_alias,
+                        partial_eval=limit is not None,
+                    )
+                else:
+                    eval_rc, scores = 0, {}
+
+                scores.update({
+                    "bfcl_generate_returncode": gen_rc,
+                    "bfcl_evaluate_returncode": eval_rc,
+                    "bfcl_result_dir": str(trial_result_dir),
+                    "bfcl_score_dir": str(trial_score_dir),
+                    "phase_layer_configs": phase_configs,
+                    "precision_metadata": dict(precision_metadata),
+                    "bfcl_categories": bfcl_test_categories,
+                    "bfcl_tool_mode": bfcl_tool_mode,
+                    "bfcl_adapter": resolved_bfcl_adapter,
+                    "bfcl_adapter_requested": bfcl_adapter,
+                    "model_family": model_family,
+                    "bfcl_max_new_tokens": bfcl_max_new_tokens,
+                    "decode_weight_mode": decode_weight_mode,
+                    "decode_weight_residency": decode_weight_residency,
+                    "gpu_memory_reserve": gpu_memory_reserve.summary(),
+                    "gptq_cache": gptq_cache_info,
+                    "persistent_trial": {
+                        "trial_id": trial_spec.get("trial_id", ""),
+                        "act": trial_spec.get("act", ""),
+                        "kv": trial_spec.get("kv", ""),
+                        "fp_setting": trial_spec.get("fp_setting", ""),
+                    },
+                })
+                save_results(trial_log_dir, scores)
+                persistent_results["trials"].append(scores)
+
+            if switch is not None:
+                switch.disable()
+            return persistent_results
 
         # ------------------------------------------------------------------
         # Step 1: bfcl generate  (calls the local server)
@@ -2152,6 +2309,7 @@ def main(
                 "model_family": model_family,
                 "bfcl_max_new_tokens": bfcl_max_new_tokens,
                 "decode_weight_mode": decode_weight_mode,
+                "decode_weight_residency": decode_weight_residency,
                 "precision_metadata": precision_metadata,
                 "gpu_memory_reserve": gpu_memory_reserve.summary(),
             }
@@ -2164,6 +2322,7 @@ def main(
                     "weight_config": resolved_gptq_config.get("weight_config"),
                     "cali_batch_size": resolved_gptq_config.get("cali_batch_size"),
                     "max_layers": resolved_gptq_config.get("max_layers"),
+                    "device_map_aware": resolved_gptq_config.get("device_map_aware", False),
                 }
                 scores["gptq_cache"] = gptq_cache_info
             if log_dir:
@@ -2225,6 +2384,7 @@ def main(
         scores["model_family"] = model_family
         scores["bfcl_max_new_tokens"] = bfcl_max_new_tokens
         scores["decode_weight_mode"] = decode_weight_mode
+        scores["decode_weight_residency"] = decode_weight_residency
         scores["precision_metadata"] = precision_metadata
         scores["gpu_memory_reserve"] = gpu_memory_reserve.summary()
         if resolved_gptq_config:
@@ -2236,6 +2396,7 @@ def main(
                 "weight_config": resolved_gptq_config.get("weight_config"),
                 "cali_batch_size": resolved_gptq_config.get("cali_batch_size"),
                 "max_layers": resolved_gptq_config.get("max_layers"),
+                "device_map_aware": resolved_gptq_config.get("device_map_aware", False),
             }
             scores["gptq_cache"] = gptq_cache_info
 

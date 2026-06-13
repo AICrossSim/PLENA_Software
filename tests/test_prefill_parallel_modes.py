@@ -65,6 +65,7 @@ def test_bfcl_pp_command_enables_model_parallel_and_disables_reserve(tmp_path):
     assert "--model_parallel true" in joined
     assert "--gpu_memory_reserve_mb 0" in joined
     assert "--gpu_memory_reserve_disable true" in joined
+    assert "--decode_weight_residency disk_reload" in joined
 
 
 def test_ppl_multiworker_command_keeps_single_worker_semantics(tmp_path):
@@ -81,3 +82,28 @@ def test_pp_mode_rejects_enabled_gpu_reserve(tmp_path):
     trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
     with pytest.raises(ValueError, match="parallel_mode='pp'"):
         bfcl_base_command(_cfg(parallel_mode="pp", reserve_enabled=True), trial, tmp_path, 9000, _args())
+
+
+def test_gpu_dual_and_memory_cache_are_passed_to_bfcl_eval(tmp_path):
+    cfg = _cfg(parallel_mode="pp")
+    cfg["runtime"]["decode_weight_residency"] = "gpu_dual"
+    cfg["gptq"]["cache_mode"] = "memory"
+    cfg["gptq"]["device_map_aware"] = True
+    trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
+    cmd = bfcl_base_command(cfg, trial, tmp_path, 9000, _args())
+    joined = " ".join(cmd)
+
+    assert "--decode_weight_residency gpu_dual" in joined
+    assert "--gptq_cache_mode memory" in joined
+    assert "--gptq_device_map_aware true" in joined
+
+
+def test_ppl_passes_device_map_aware_gptq_flag(tmp_path):
+    cfg = _cfg(parallel_mode="pp")
+    cfg["gptq"]["device_map_aware"] = True
+    trial = PplTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
+    cmd = ppl_base_command(cfg, trial, tmp_path, _args())
+    joined = " ".join(cmd)
+
+    assert "--model_parallel true" in joined
+    assert "--gptq_device_map_aware true" in joined
