@@ -8,9 +8,11 @@ overrides such as --limit 2 and --gptq-max-layers 1 for smoke tests.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import hashlib
 import json
+import multiprocessing as mp
 import os
 import queue
 import shutil
@@ -18,6 +20,7 @@ import socket
 import subprocess
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -43,6 +46,7 @@ RESULT_FIELDS = [
     "gpu",
     "parallel_mode",
     "model_lifecycle",
+    "trial_weight_reuse",
     "visible_gpus",
     "model_parallel",
     "decode_weight_residency",
@@ -73,6 +77,17 @@ class Trial:
 def _load_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def _bool_arg(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected boolean value, got {value!r}.")
 
 
 def _as_list(value: Any) -> list[str]:
@@ -141,6 +156,12 @@ def _model_lifecycle(cfg: dict[str, Any]) -> str:
     return lifecycle
 
 
+def _trial_weight_reuse(cfg: dict[str, Any]) -> bool:
+    runtime = cfg.get("runtime", {})
+    default = _model_lifecycle(cfg) == "persistent"
+    return bool(runtime.get("trial_weight_reuse", default))
+
+
 def _decode_weight_residency(cfg: dict[str, Any]) -> str:
     residency = str(cfg.get("runtime", {}).get("decode_weight_residency", "disk_reload")).lower()
     if residency not in {"disk_reload", "gpu_dual"}:
@@ -149,8 +170,11 @@ def _decode_weight_residency(cfg: dict[str, Any]) -> str:
         )
     runtime = cfg.get("runtime", {})
     if residency == "gpu_dual":
-        if _parallel_mode(cfg) != "pp":
-            raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.parallel_mode='pp'.")
+        if _model_lifecycle(cfg) != "persistent":
+            raise ValueError(
+                "runtime.decode_weight_residency='gpu_dual' requires "
+                "runtime.model_lifecycle='persistent'."
+            )
         if str(runtime.get("decode_weight_mode", "fp")).lower() != "fp":
             raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.decode_weight_mode='fp'.")
     return residency
@@ -159,29 +183,6 @@ def _decode_weight_residency(cfg: dict[str, Any]) -> str:
 def _quant_config_is_none(model: dict[str, Any]) -> bool:
     value = str(model.get("quant_config", "")).strip().lower()
     return value in {"", "none", "fp", "false"}
-
-
-def _resolve_reserve(runtime: dict[str, Any], args: argparse.Namespace, *, model_parallel: bool) -> tuple[int, int, float, int, bool]:
-    reserve_mb = args.gpu_memory_reserve_mb
-    if reserve_mb is None:
-        reserve_mb = runtime.get("gpu_memory_reserve_mb", 0)
-    reserve_enabled = bool(runtime.get("gpu_memory_reserve_enabled", False))
-    reserve_disable = args.gpu_memory_reserve_disable or bool(runtime.get("gpu_memory_reserve_disable", False))
-    if args.gpu_memory_reserve_mb is not None and args.gpu_memory_reserve_mb > 0:
-        reserve_enabled = True
-        reserve_disable = False
-    if not reserve_enabled:
-        reserve_mb = 0
-        reserve_disable = True
-    if model_parallel and not reserve_disable and int(reserve_mb or 0) > 0:
-        raise ValueError("GPU memory reserve is not supported in runtime.parallel_mode='pp'; disable it or use multiworker.")
-    return (
-        int(reserve_mb or 0),
-        int(args.gpu_memory_reserve_wait_sec if args.gpu_memory_reserve_wait_sec is not None else runtime.get("gpu_memory_reserve_wait_sec", 600)),
-        float(args.gpu_memory_reserve_poll_sec if args.gpu_memory_reserve_poll_sec is not None else runtime.get("gpu_memory_reserve_poll_sec", 5.0)),
-        int(args.gpu_memory_reserve_chunk_mb if args.gpu_memory_reserve_chunk_mb is not None else runtime.get("gpu_memory_reserve_chunk_mb", 512)),
-        bool(reserve_disable),
-    )
 
 
 def _mx_bits(token: str) -> int:
@@ -413,9 +414,6 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
     model_parallel = _model_parallel_enabled(cfg)
     quant_config_is_none = _quant_config_is_none(model)
     decode_weight_residency = _decode_weight_residency(cfg)
-    reserve_mb, reserve_wait_sec, reserve_poll_sec, reserve_chunk_mb, reserve_disable = _resolve_reserve(
-        runtime, args, model_parallel=model_parallel
-    )
 
     limit = args.limit if args.limit is not None else bfcl.get("limit")
     bfcl_max_new_tokens = (
@@ -423,6 +421,15 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         if args.bfcl_max_new_tokens is not None
         else bfcl.get("max_new_tokens", 2048)
     )
+    bfcl_generate_mode = args.bfcl_generate_mode if args.bfcl_generate_mode is not None else bfcl.get("generate_mode", "cli")
+    bfcl_batch_size = args.bfcl_batch_size if args.bfcl_batch_size is not None else bfcl.get("batch_size", 16)
+    arg_bfcl_disable_thinking = getattr(args, "bfcl_disable_thinking", None)
+    bfcl_disable_thinking = arg_bfcl_disable_thinking if arg_bfcl_disable_thinking is not None else bfcl.get("disable_thinking", False)
+    arg_attn_implementation = getattr(args, "attn_implementation", None)
+    attn_implementation = arg_attn_implementation if arg_attn_implementation is not None else runtime.get("attn_implementation", "auto")
+    runtime_bypass_components = getattr(args, "runtime_bypass_components", None)
+    if runtime_bypass_components is None:
+        runtime_bypass_components = runtime.get("runtime_bypass_components", runtime.get("bypass_components"))
     gptq_max_layers = _parse_gptq_max_layers(args.gptq_max_layers, gptq.get("max_layers"))
 
     cmd = [
@@ -435,16 +442,17 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         "--model_family", str(model.get("model_family", "llama")),
         "--dtype", str(model.get("dtype", "bfloat16")),
         "--quant_config", str(model.get("quant_config", "quant_eval/configs/llama_mxint4.toml")),
+        "--attn_implementation", str(attn_implementation),
         "--device_id", "cuda:0",
         "--bfcl_test_categories", str(bfcl.get("test_categories", "multiple")),
         "--bfcl_tool_mode", str(bfcl.get("tool_mode", "return")),
         "--bfcl_num_threads", str(bfcl.get("num_threads", 1)),
         "--bfcl_max_new_tokens", str(bfcl_max_new_tokens),
+        "--bfcl_generate_mode", str(bfcl_generate_mode),
+        "--bfcl_batch_size", str(bfcl_batch_size),
+        "--bfcl_batch_length_bucket", str(bool(bfcl.get("batch_length_bucket", True))).lower(),
+        "--bfcl_disable_thinking", str(bool(bfcl_disable_thinking)).lower(),
         "--server_port", str(port),
-        "--gpu_memory_reserve_mb", str(reserve_mb),
-        "--gpu_memory_reserve_wait_sec", str(reserve_wait_sec),
-        "--gpu_memory_reserve_poll_sec", str(reserve_poll_sec),
-        "--gpu_memory_reserve_chunk_mb", str(reserve_chunk_mb),
         "--log_dir", str(trial_dir),
     ]
     if not quant_config_is_none:
@@ -452,9 +460,14 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
             "--decode_weight_mode", str(runtime.get("decode_weight_mode", "fp")),
             "--decode_weight_residency", decode_weight_residency,
             "--act_element_width_prefill", trial.act,
+            "--act_element_width_decode", trial.act,
             "--kv_element_width_prefill", trial.kv,
+            "--kv_element_width_decode", trial.kv,
             "--fp_setting_prefill", trial.fp_setting,
+            "--fp_setting_decode", trial.fp_setting,
         ]
+        if runtime_bypass_components:
+            cmd += ["--runtime_bypass_components", str(runtime_bypass_components)]
     if not quant_config_is_none:
         cmd += [
             "--gptq_dataset", str(gptq["dataset"]),
@@ -477,8 +490,6 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         cmd += ["--gptq_max_layers", str(gptq_max_layers)]
     if model_parallel:
         cmd += ["--model_parallel", "true"]
-    if reserve_disable:
-        cmd += ["--gpu_memory_reserve_disable", "true"]
     return [x for x in cmd if x != ""]
 
 
@@ -491,7 +502,11 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
     model_lifecycle = _model_lifecycle(cfg)
     decode_weight_residency = _decode_weight_residency(cfg)
     model_parallel = _model_parallel_enabled(cfg)
-    timeout = int(args.trial_timeout_sec or runtime.get("trial_timeout_sec", 7200))
+    arg_trial_timeout_sec = getattr(args, "trial_timeout_sec", None)
+    timeout_cfg = arg_trial_timeout_sec if arg_trial_timeout_sec is not None else runtime.get("trial_timeout_sec", 7200)
+    timeout = int(timeout_cfg) if timeout_cfg is not None else None
+    if timeout is not None and timeout <= 0:
+        timeout = None
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["MPLCONFIGDIR"] = str(trial_dir / "matplotlib")
@@ -509,6 +524,7 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
         "visible_gpus": str(gpu),
         "parallel_mode": parallel_mode,
         "model_lifecycle": model_lifecycle,
+        "trial_weight_reuse": _trial_weight_reuse(cfg),
         "decode_weight_residency": decode_weight_residency,
         "model_parallel": model_parallel,
         "port": port,
@@ -568,6 +584,7 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
         "gpu": gpu,
         "parallel_mode": parallel_mode,
         "model_lifecycle": model_lifecycle,
+        "trial_weight_reuse": _trial_weight_reuse(cfg),
         "decode_weight_residency": decode_weight_residency,
         "visible_gpus": str(gpu),
         "model_parallel": model_parallel,
@@ -591,27 +608,39 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
     return row
 
 
-def _run_persistent_trials(
+def _run_persistent_trial_group(
     cfg: dict[str, Any],
     pending: list[Trial],
     run_dir: Path,
-    results_csv: Path,
     args: argparse.Namespace,
-) -> None:
+    *,
+    visible_gpus: str,
+    port: int,
+    parallel_mode: str,
+    model_parallel: bool,
+    worker_idx: int | None = None,
+    progress_jsonl: Path | None = None,
+) -> list[dict[str, Any]]:
     if not pending:
-        return
-    if _parallel_mode(cfg) != "pp":
-        raise ValueError("runtime.model_lifecycle='persistent' requires runtime.parallel_mode='pp'.")
+        return []
     model = cfg["model"]
     bfcl = cfg.get("bfcl", {})
     gptq = cfg.get("gptq", {})
     runtime = cfg.get("runtime", {})
     if _quant_config_is_none(model):
         raise ValueError("runtime.model_lifecycle='persistent' is only implemented for quantized BFCL DSE runs.")
+    if not _trial_weight_reuse(cfg):
+        raise ValueError(
+            "runtime.model_lifecycle='persistent' currently requires "
+            "runtime.trial_weight_reuse=true. Use model_lifecycle='per_trial' "
+            "for reload-per-trial execution."
+        )
 
-    visible_gpus = ",".join(_split_csv(args.gpus) or ["0"])
     os.environ["CUDA_VISIBLE_DEVICES"] = visible_gpus
-    os.environ["MPLCONFIGDIR"] = str(run_dir / "matplotlib")
+    mpl_dir = run_dir / "matplotlib"
+    if worker_idx is not None:
+        mpl_dir = mpl_dir / f"worker_{worker_idx}"
+    os.environ["MPLCONFIGDIR"] = str(mpl_dir)
     os.environ["BFCL_PROJECT_ROOT"] = str((REPO_ROOT / runtime.get("bfcl_project_root", ".bfcl")).resolve())
     bfcl_bin = runtime.get("bfcl_env_bin")
     if bfcl_bin:
@@ -628,11 +657,16 @@ def _run_persistent_trials(
         if args.bfcl_max_new_tokens is not None
         else bfcl.get("max_new_tokens", 2048)
     )
+    bfcl_generate_mode = args.bfcl_generate_mode if args.bfcl_generate_mode is not None else bfcl.get("generate_mode", "cli")
+    bfcl_batch_size = args.bfcl_batch_size if args.bfcl_batch_size is not None else bfcl.get("batch_size", 16)
+    arg_bfcl_disable_thinking = getattr(args, "bfcl_disable_thinking", None)
+    bfcl_disable_thinking = arg_bfcl_disable_thinking if arg_bfcl_disable_thinking is not None else bfcl.get("disable_thinking", False)
+    arg_attn_implementation = getattr(args, "attn_implementation", None)
+    attn_implementation = arg_attn_implementation if arg_attn_implementation is not None else runtime.get("attn_implementation", "auto")
+    runtime_bypass_components = getattr(args, "runtime_bypass_components", None)
+    if runtime_bypass_components is None:
+        runtime_bypass_components = runtime.get("runtime_bypass_components", runtime.get("bypass_components"))
     gptq_max_layers = _parse_gptq_max_layers(args.gptq_max_layers, gptq.get("max_layers"))
-    reserve_mb, reserve_wait_sec, reserve_poll_sec, reserve_chunk_mb, reserve_disable = _resolve_reserve(
-        runtime, args, model_parallel=True
-    )
-    port = int(args.base_port)
     trial_specs = []
     for trial in pending:
         trial_dir = run_dir / "trials" / trial.trial_id
@@ -642,16 +676,21 @@ def _run_persistent_trials(
             "act": trial.act,
             "kv": trial.kv,
             "fp_setting": trial.fp_setting,
+            "decode_act": trial.act,
+            "decode_kv": trial.kv,
+            "decode_fp_setting": trial.fp_setting,
             "log_dir": str(trial_dir),
         })
         _write_json(trial_dir / "trial_config.json", {
             "trial": trial.__dict__,
             "gpu": visible_gpus,
             "visible_gpus": visible_gpus,
-            "parallel_mode": "pp",
+            "parallel_mode": parallel_mode,
             "model_lifecycle": "persistent",
+            "trial_weight_reuse": _trial_weight_reuse(cfg),
             "decode_weight_residency": _decode_weight_residency(cfg),
-            "model_parallel": True,
+            "model_parallel": model_parallel,
+            "worker_idx": worker_idx,
             "port": port,
             "timeout_sec": None,
         })
@@ -664,23 +703,27 @@ def _run_persistent_trials(
         model_family=str(model.get("model_family", "llama")),
         dtype=str(model.get("dtype", "bfloat16")),
         quant_config=str(model.get("quant_config", "quant_eval/configs/llama_mxint4.toml")),
+        attn_implementation=str(attn_implementation),
         device_id="cuda:0",
-        model_parallel=True,
+        model_parallel=model_parallel,
         bfcl_test_categories=str(bfcl.get("test_categories", "multiple")),
         bfcl_tool_mode=str(bfcl.get("tool_mode", "return")),
         bfcl_num_threads=int(bfcl.get("num_threads", 1)),
         bfcl_max_new_tokens=bfcl_max_new_tokens,
+        bfcl_generate_mode=str(bfcl_generate_mode),
+        bfcl_batch_size=int(bfcl_batch_size),
+        bfcl_batch_length_bucket=bool(bfcl.get("batch_length_bucket", True)),
+        bfcl_disable_thinking=bool(bfcl_disable_thinking),
         server_port=port,
-        gpu_memory_reserve_mb=reserve_mb,
-        gpu_memory_reserve_wait_sec=reserve_wait_sec,
-        gpu_memory_reserve_poll_sec=reserve_poll_sec,
-        gpu_memory_reserve_chunk_mb=reserve_chunk_mb,
-        gpu_memory_reserve_disable=reserve_disable,
         decode_weight_mode=str(runtime.get("decode_weight_mode", "fp")),
         decode_weight_residency=_decode_weight_residency(cfg),
+        runtime_bypass_components=str(runtime_bypass_components) if runtime_bypass_components else None,
         act_element_width_prefill=pending[0].act,
+        act_element_width_decode=pending[0].act,
         kv_element_width_prefill=pending[0].kv,
+        kv_element_width_decode=pending[0].kv,
         fp_setting_prefill=pending[0].fp_setting,
+        fp_setting_decode=pending[0].fp_setting,
         gptq_dataset=str(gptq["dataset"]),
         gptq_nsamples=int(gptq.get("nsamples", 32)),
         gptq_seqlen=int(gptq.get("seqlen", 1024)),
@@ -694,10 +737,11 @@ def _run_persistent_trials(
         gptq_cache_mode=str(gptq.get("cache_mode", "off")),
         limit=limit,
         persistent_trials=trial_specs,
+        persistent_progress_path=str(progress_jsonl) if progress_jsonl is not None else None,
     )
     total_runtime = time.time() - start
 
-    csv_lock = threading.Lock()
+    rows: list[dict[str, Any]] = []
     for trial, scores in zip(pending, results.get("trials", []), strict=False):
         trial_dir = run_dir / "trials" / trial.trial_id
         score_dir = _find_score_dir(trial_dir)
@@ -722,11 +766,12 @@ def _run_persistent_trials(
             "raw_output_count": raw_count,
             "runtime_sec": f"{total_runtime / max(len(pending), 1):.2f}",
             "gpu": visible_gpus,
-            "parallel_mode": "pp",
+            "parallel_mode": parallel_mode,
             "model_lifecycle": "persistent",
+            "trial_weight_reuse": _trial_weight_reuse(cfg),
             "decode_weight_residency": _decode_weight_residency(cfg),
             "visible_gpus": visible_gpus,
-            "model_parallel": True,
+            "model_parallel": model_parallel,
             "server_port": port,
             "returncode": scores.get("bfcl_generate_returncode", ""),
             "gptq_cache_mode": gptq_cache.get("mode", gptq.get("cache_mode", "")),
@@ -741,7 +786,383 @@ def _run_persistent_trials(
             "fp_bits_proxy": fb,
         }
         _write_json(trial_dir / "status.json", row)
+        rows.append(row)
+    return rows
+
+
+def _run_persistent_trials(
+    cfg: dict[str, Any],
+    pending: list[Trial],
+    run_dir: Path,
+    results_csv: Path,
+    args: argparse.Namespace,
+) -> None:
+    if not pending:
+        return
+    if _parallel_mode(cfg) != "pp":
+        raise ValueError("runtime.model_lifecycle='persistent' with multiworker should use the multiworker worker pool.")
+    rows = _run_persistent_trial_group(
+        cfg,
+        pending,
+        run_dir,
+        args,
+        visible_gpus=",".join(_split_csv(args.gpus) or ["0"]),
+        port=int(args.base_port),
+        parallel_mode="pp",
+        model_parallel=True,
+    )
+    csv_lock = threading.Lock()
+    for row in rows:
         _upsert_csv(results_csv, row, csv_lock)
+
+
+def _failure_row_for_persistent_trial(
+    cfg: dict[str, Any],
+    trial: Trial,
+    run_dir: Path,
+    *,
+    gpu: str,
+    port: int,
+    error: str,
+    worker_idx: int | None,
+) -> dict[str, Any]:
+    trial_dir = run_dir / "trials" / trial.trial_id
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    pc, ab, kb, fb = _proxy_cost(trial.act, trial.kv, trial.fp_setting)
+    row = {
+        "trial_id": trial.trial_id,
+        "act": trial.act,
+        "kv": trial.kv,
+        "fp_setting": trial.fp_setting,
+        "status": "failed",
+        "accuracy": "",
+        "correct": "",
+        "total": "",
+        "format_error_count": 0,
+        "raw_output_count": 0,
+        "runtime_sec": "",
+        "gpu": gpu,
+        "parallel_mode": _parallel_mode(cfg),
+        "model_lifecycle": "persistent",
+        "trial_weight_reuse": _trial_weight_reuse(cfg),
+        "decode_weight_residency": _decode_weight_residency(cfg),
+        "visible_gpus": gpu,
+        "model_parallel": False,
+        "server_port": port,
+        "returncode": "",
+        "gptq_cache_mode": cfg.get("gptq", {}).get("cache_mode", ""),
+        "gptq_cache_key": "",
+        "gptq_cache_hit": "",
+        "gptq_cache_path": "",
+        "log_dir": str(trial_dir),
+        "error_message": error,
+        "proxy_cost": pc,
+        "act_bits_proxy": ab,
+        "kv_bits_proxy": kb,
+        "fp_bits_proxy": fb,
+    }
+    _write_json(trial_dir / "status.json", row)
+    _write_json(trial_dir / "trial_config.json", {
+        "trial": trial.__dict__,
+        "gpu": gpu,
+        "visible_gpus": gpu,
+        "parallel_mode": _parallel_mode(cfg),
+        "model_lifecycle": "persistent",
+        "trial_weight_reuse": _trial_weight_reuse(cfg),
+        "decode_weight_residency": _decode_weight_residency(cfg),
+        "model_parallel": False,
+        "worker_idx": worker_idx,
+        "port": port,
+        "timeout_sec": None,
+    })
+    return row
+
+
+def _completed_row_for_persistent_trial(
+    cfg: dict[str, Any],
+    trial: Trial,
+    run_dir: Path,
+    *,
+    gpu: str,
+    port: int,
+    worker_idx: int | None,
+) -> dict[str, Any] | None:
+    trial_dir = run_dir / "trials" / trial.trial_id
+    results_json = trial_dir / "results.json"
+    if not results_json.exists():
+        return None
+
+    try:
+        result_payload = json.loads(results_json.read_text(encoding="utf-8"))
+    except Exception:
+        result_payload = {}
+
+    score_dir = _find_score_dir(trial_dir)
+    result_dir = _find_results_dir(trial_dir)
+    accuracy, correct, total, raw_count, format_errors = _extract_results_json_metrics(results_json)
+    if accuracy == "":
+        accuracy, correct, total = _extract_accuracy(score_dir)
+    if raw_count == 0:
+        raw_count, format_errors = _count_raw_outputs(result_dir)
+    pc, ab, kb, fb = _proxy_cost(trial.act, trial.kv, trial.fp_setting)
+    gptq_cache = result_payload.get("gptq_cache", {}) if isinstance(result_payload.get("gptq_cache"), dict) else {}
+    gen_rc = result_payload.get("bfcl_generate_returncode", "")
+    eval_rc = result_payload.get("bfcl_evaluate_returncode", "")
+    status = "success" if gen_rc == 0 and eval_rc in {"", 0} else "failed"
+    row = {
+        "trial_id": trial.trial_id,
+        "act": trial.act,
+        "kv": trial.kv,
+        "fp_setting": trial.fp_setting,
+        "status": status,
+        "accuracy": accuracy,
+        "correct": correct,
+        "total": total,
+        "format_error_count": format_errors,
+        "raw_output_count": raw_count,
+        "runtime_sec": "",
+        "gpu": gpu,
+        "parallel_mode": _parallel_mode(cfg),
+        "model_lifecycle": "persistent",
+        "trial_weight_reuse": _trial_weight_reuse(cfg),
+        "decode_weight_residency": _decode_weight_residency(cfg),
+        "visible_gpus": gpu,
+        "model_parallel": False,
+        "server_port": port,
+        "returncode": gen_rc,
+        "gptq_cache_mode": gptq_cache.get("mode", cfg.get("gptq", {}).get("cache_mode", "")),
+        "gptq_cache_key": gptq_cache.get("key", ""),
+        "gptq_cache_hit": gptq_cache.get("hit", ""),
+        "gptq_cache_path": gptq_cache.get("path", ""),
+        "log_dir": str(trial_dir),
+        "error_message": "",
+        "proxy_cost": pc,
+        "act_bits_proxy": ab,
+        "kv_bits_proxy": kb,
+        "fp_bits_proxy": fb,
+    }
+    _write_json(trial_dir / "status.json", row)
+    if not (trial_dir / "trial_config.json").exists():
+        _write_json(trial_dir / "trial_config.json", {
+            "trial": trial.__dict__,
+            "gpu": gpu,
+            "visible_gpus": gpu,
+            "parallel_mode": _parallel_mode(cfg),
+            "model_lifecycle": "persistent",
+            "trial_weight_reuse": _trial_weight_reuse(cfg),
+            "decode_weight_residency": _decode_weight_residency(cfg),
+            "model_parallel": False,
+            "worker_idx": worker_idx,
+            "port": port,
+            "timeout_sec": None,
+        })
+    return row
+
+
+def _persistent_worker_process(
+    worker_idx: int,
+    gpu: str,
+    cfg: dict[str, Any],
+    trial_payload: list[dict[str, Any]],
+    run_dir_str: str,
+    args_payload: dict[str, Any],
+    port: int,
+    out_jsonl_str: str,
+    progress_jsonl_str: str,
+) -> None:
+    run_dir = Path(run_dir_str)
+    out_jsonl = Path(out_jsonl_str)
+    progress_jsonl = Path(progress_jsonl_str)
+    args = argparse.Namespace(**args_payload)
+    trials = [Trial(**payload) for payload in trial_payload]
+    log_path = run_dir / "workers" / f"worker_{worker_idx}_gpu-{_safe_token(str(gpu))}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, Any]] = []
+    with log_path.open("w", encoding="utf-8") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+        try:
+            print(
+                f"Persistent multiworker worker {worker_idx}: gpu={gpu}, "
+                f"trials={len(trials)}, port={port}",
+                flush=True,
+            )
+            rows = _run_persistent_trial_group(
+                cfg,
+                trials,
+                run_dir,
+                args,
+                visible_gpus=str(gpu),
+                port=port,
+                parallel_mode="multiworker",
+                model_parallel=False,
+                worker_idx=worker_idx,
+                progress_jsonl=progress_jsonl,
+            )
+            seen = {str(row.get("trial_id", "")) for row in rows}
+            for trial in trials:
+                if trial.trial_id not in seen:
+                    rows.append(
+                        _completed_row_for_persistent_trial(
+                            cfg,
+                            trial,
+                            run_dir,
+                            gpu=str(gpu),
+                            port=port,
+                            worker_idx=worker_idx,
+                        )
+                        or _failure_row_for_persistent_trial(
+                            cfg,
+                            trial,
+                            run_dir,
+                            gpu=str(gpu),
+                            port=port,
+                            error="persistent worker returned no result for trial",
+                            worker_idx=worker_idx,
+                        )
+                    )
+        except Exception as exc:
+            rows = [
+                _completed_row_for_persistent_trial(
+                    cfg,
+                    trial,
+                    run_dir,
+                    gpu=str(gpu),
+                    port=port,
+                    worker_idx=worker_idx,
+                )
+                or _failure_row_for_persistent_trial(
+                    cfg,
+                    trial,
+                    run_dir,
+                    gpu=str(gpu),
+                    port=port,
+                    error=repr(exc),
+                    worker_idx=worker_idx,
+                )
+                for trial in trials
+            ]
+            print(f"Worker {worker_idx} failed: {exc!r}", flush=True)
+            traceback.print_exc()
+            raise
+        finally:
+            out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+            with out_jsonl.open("w", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def _read_persistent_progress(path: Path, completed: set[str]) -> list[str]:
+    if not path.exists():
+        return []
+    new_ids: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        trial_id = str(event.get("trial_id", ""))
+        if not trial_id or trial_id in completed:
+            continue
+        completed.add(trial_id)
+        new_ids.append(trial_id)
+    return new_ids
+
+
+def _run_persistent_multiworker_trials(
+    cfg: dict[str, Any],
+    pending: list[Trial],
+    run_dir: Path,
+    results_csv: Path,
+    args: argparse.Namespace,
+) -> None:
+    if not pending:
+        return
+    if _quant_config_is_none(cfg["model"]):
+        raise ValueError("runtime.model_lifecycle='persistent' is only implemented for quantized BFCL DSE runs.")
+    if not _trial_weight_reuse(cfg):
+        raise ValueError(
+            "runtime.model_lifecycle='persistent' currently requires "
+            "runtime.trial_weight_reuse=true. Use model_lifecycle='per_trial' "
+            "for reload-per-trial execution."
+        )
+    gpus = _split_csv(args.gpus) or ["0"]
+    assignments: list[list[Trial]] = [[] for _ in gpus]
+    for idx, trial in enumerate(pending):
+        assignments[idx % len(gpus)].append(trial)
+
+    ctx = mp.get_context("spawn")
+    procs: list[tuple[int, str, list[Trial], Path, Path, mp.Process]] = []
+    for idx, (gpu, trials) in enumerate(zip(gpus, assignments, strict=True)):
+        if not trials:
+            continue
+        out_jsonl = run_dir / "workers" / f"worker_{idx}_results.jsonl"
+        progress_jsonl = run_dir / "workers" / f"worker_{idx}_progress.jsonl"
+        progress_jsonl.unlink(missing_ok=True)
+        proc = ctx.Process(
+            target=_persistent_worker_process,
+            args=(
+                idx,
+                gpu,
+                cfg,
+                [trial.__dict__ for trial in trials],
+                str(run_dir),
+                vars(args),
+                int(args.base_port) + idx,
+                str(out_jsonl),
+                str(progress_jsonl),
+            ),
+        )
+        proc.start()
+        procs.append((idx, gpu, trials, out_jsonl, progress_jsonl, proc))
+
+    csv_lock = threading.Lock()
+    completed_trial_ids: set[str] = set()
+    remaining = list(procs)
+    with tqdm(total=len(pending), desc="Persistent multiworker DSE", unit="trial") as pbar:
+        while remaining:
+            next_remaining: list[tuple[int, str, list[Trial], Path, Path, mp.Process]] = []
+            for idx, gpu, trials, out_jsonl, progress_jsonl, proc in remaining:
+                new_ids = _read_persistent_progress(progress_jsonl, completed_trial_ids)
+                if new_ids:
+                    pbar.update(len(new_ids))
+
+                if proc.is_alive():
+                    next_remaining.append((idx, gpu, trials, out_jsonl, progress_jsonl, proc))
+                    continue
+
+                proc.join()
+                rows: list[dict[str, Any]] = []
+                if out_jsonl.exists():
+                    for line in out_jsonl.read_text(encoding="utf-8").splitlines():
+                        if line.strip():
+                            rows.append(json.loads(line))
+                if proc.exitcode != 0 and not rows:
+                    rows = [
+                        _failure_row_for_persistent_trial(
+                            cfg,
+                            trial,
+                            run_dir,
+                            gpu=str(gpu),
+                            port=int(args.base_port) + idx,
+                            error=f"worker {idx} exited with code {proc.exitcode}",
+                            worker_idx=idx,
+                        )
+                        for trial in trials
+                    ]
+                for row in rows:
+                    trial_id = str(row.get("trial_id", ""))
+                    if trial_id and trial_id not in completed_trial_ids:
+                        completed_trial_ids.add(trial_id)
+                        pbar.update(1)
+                    _upsert_csv(results_csv, row, csv_lock)
+            remaining = next_remaining
+            if remaining:
+                time.sleep(1.0)
 
 
 def _port_is_available(host: str, port: int) -> bool:
@@ -806,6 +1227,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--gptq-max-layers", default=None)
     parser.add_argument("--bfcl-max-new-tokens", type=int, default=None)
+    parser.add_argument("--bfcl-generate-mode", choices=["cli", "batched"], default=None)
+    parser.add_argument("--bfcl-batch-size", type=int, default=None)
+    parser.add_argument("--bfcl-disable-thinking", type=_bool_arg, default=None)
+    parser.add_argument("--attn-implementation", choices=["auto", "sdpa", "eager"], default=None)
+    parser.add_argument("--runtime-bypass-components", default=None)
     parser.add_argument("--max-trials", type=int, default=None)
     parser.add_argument("--only-trials", default=None)
     parser.add_argument("--retry-failed", action="store_true")
@@ -814,11 +1240,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-port", type=int, default=9000)
     parser.add_argument("--trial-timeout-sec", type=int, default=None)
     parser.add_argument("--compact-artifacts", action="store_true")
-    parser.add_argument("--gpu-memory-reserve-mb", type=int, default=None)
-    parser.add_argument("--gpu-memory-reserve-wait-sec", type=int, default=None)
-    parser.add_argument("--gpu-memory-reserve-poll-sec", type=float, default=None)
-    parser.add_argument("--gpu-memory-reserve-chunk-mb", type=int, default=None)
-    parser.add_argument("--gpu-memory-reserve-disable", action="store_true")
     return parser.parse_args()
 
 
@@ -847,6 +1268,7 @@ def main() -> None:
         "n_design_points": len(all_trials),
         "parallel_mode": parallel_mode,
         "model_lifecycle": model_lifecycle,
+        "trial_weight_reuse": _trial_weight_reuse(cfg),
         "decode_weight_residency": _decode_weight_residency(cfg),
     })
 
@@ -858,13 +1280,28 @@ def main() -> None:
 
     if args.dry_run:
         if model_lifecycle == "persistent":
-            dry_gpus = ",".join(_split_csv(args.gpus) or ["0"])
-            print(
-                "Persistent in-process BFCL DSE: "
-                f"CUDA_VISIBLE_DEVICES={dry_gpus}, trials={len(pending)}, "
-                f"decode_weight_residency={_decode_weight_residency(cfg)}, "
-                f"gptq_cache_mode={cfg.get('gptq', {}).get('cache_mode', 'off')}"
-            )
+            gpus = _split_csv(args.gpus) or ["0"]
+            if parallel_mode == "multiworker":
+                assignments = [0 for _ in gpus]
+                for idx, _trial in enumerate(pending):
+                    assignments[idx % len(gpus)] += 1
+                print(
+                    "Persistent multiworker BFCL DSE: "
+                    f"workers={len(gpus)}, trial_weight_reuse={_trial_weight_reuse(cfg)}, "
+                    f"decode_weight_residency={_decode_weight_residency(cfg)}, "
+                    f"gptq_cache_mode={cfg.get('gptq', {}).get('cache_mode', 'off')}"
+                )
+                for idx, (gpu, count) in enumerate(zip(gpus, assignments, strict=True)):
+                    print(f"  worker {idx}: CUDA_VISIBLE_DEVICES={gpu}, trials={count}, port={args.base_port + idx}")
+            else:
+                dry_gpus = ",".join(gpus)
+                print(
+                    "Persistent in-process BFCL DSE: "
+                    f"CUDA_VISIBLE_DEVICES={dry_gpus}, trials={len(pending)}, "
+                    f"decode_weight_residency={_decode_weight_residency(cfg)}, "
+                    f"gptq_cache_mode={cfg.get('gptq', {}).get('cache_mode', 'off')}"
+                )
+            return
         preview = pending[:10]
         dry_gpus = ",".join(_split_csv(args.gpus) or ["0"]) if parallel_mode == "pp" else None
         for t in preview:
@@ -877,7 +1314,10 @@ def main() -> None:
 
     if model_lifecycle == "persistent":
         results_csv = run_dir / "results.csv"
-        _run_persistent_trials(cfg, pending, run_dir, results_csv, args)
+        if parallel_mode == "multiworker":
+            _run_persistent_multiworker_trials(cfg, pending, run_dir, results_csv, args)
+        else:
+            _run_persistent_trials(cfg, pending, run_dir, results_csv, args)
         print(f"Results CSV: {results_csv}")
         return
 

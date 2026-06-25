@@ -8,7 +8,7 @@ PPL diagnostics cannot alter the BFCL/GPTQ execution path.
 from __future__ import annotations
 
 from typing import Union
-import atexit
+import gc
 import shutil
 import time
 
@@ -16,7 +16,6 @@ import torch
 import transformers
 
 from quant_eval.cli.eval_phase_bfcl import (
-    _FixedCudaMemoryReserve,
     _GptqWeightCache,
     _inject_gptq_config,
     _mark_gptq_projection_configs,
@@ -24,7 +23,7 @@ from quant_eval.cli.eval_phase_bfcl import (
 )
 from quant_eval.eval import evaluate_perplexity
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
-from quant_eval.eval.unified_mx import apply_unified_mx_wrappers
+from quant_eval.eval.unified_mx import apply_qwen3_gptq_cache_unified_wrappers, apply_unified_mx_wrappers
 from quant_eval.precision import (
     apply_dse_quant_config,
     fp_data_config,
@@ -131,12 +130,6 @@ def main(
     model_family: str = "qwen3",
     seqlen: int = 1024,
     max_samples: int | None = 64,
-    # GPU reservation guard. Held during cache/wrapper setup and released before PPL forward.
-    gpu_memory_reserve_mb: int = 0,
-    gpu_memory_reserve_wait_sec: int = 600,
-    gpu_memory_reserve_poll_sec: float = 5.0,
-    gpu_memory_reserve_chunk_mb: int = 512,
-    gpu_memory_reserve_disable: bool = False,
     # GPTQ cache/config. Defaults are load-only to avoid rerunning GPTQ in PPL diagnostics.
     gptq_dataset: str | None = None,
     gptq_nsamples: int = 32,
@@ -177,16 +170,6 @@ def main(
     device_id = _normalize_device_id(device_id)
     model_family = model_family.lower()
     qwen_model_family = model_family in {"qwen3", "qwen3_moe"}
-    gpu_memory_reserve_enabled = (
-        not gpu_memory_reserve_disable
-        and gpu_memory_reserve_mb is not None
-        and int(gpu_memory_reserve_mb) > 0
-    )
-    if gpu_memory_reserve_enabled and model_parallel:
-        raise ValueError(
-            "GPU memory reservation currently supports only single-GPU PPL eval; "
-            "disable it with --gpu_memory_reserve_disable true for model_parallel runs."
-        )
 
     quant_config_is_none = quant_config is None or str(quant_config).strip().lower() in {"", "none", "fp", "false"}
     if quant_config_is_none:
@@ -215,8 +198,6 @@ def main(
         )
     if decode_weight_residency == "gpu_dual" and decode_weight_mode != "fp":
         raise ValueError("decode_weight_residency='gpu_dual' requires decode_weight_mode='fp'.")
-    if decode_weight_residency == "gpu_dual" and not model_parallel:
-        raise ValueError("decode_weight_residency='gpu_dual' is only supported with model_parallel=true.")
 
     decode_weight_policy = {"weight_mode": "fp", "bypass": True} if decode_weight_mode == "fp" else {}
     decode_nonlinear_policy = {"bypass": True} if decode_weight_mode == "fp" else {}
@@ -284,15 +265,6 @@ def main(
     print(f"  Prefill   : attn={prefill['display']} ffn={prefill['ffn_display']}")
     print(f"  Decode    : {decode_weight_mode} (unused for teacher-forcing PPL unless seq_len==1)")
     print(f"  Weight res: {decode_weight_residency}")
-    if gpu_memory_reserve_enabled:
-        print(
-            "  GPU reserve: "
-            f"reserve={int(gpu_memory_reserve_mb)}MB, "
-            f"wait={gpu_memory_reserve_wait_sec}s, "
-            f"chunk={gpu_memory_reserve_chunk_mb}MB"
-        )
-    else:
-        print("  GPU reserve: disabled")
     print("=" * 64)
 
     if log_dir:
@@ -313,27 +285,15 @@ def main(
     )
     model.eval()
 
-    gpu_memory_reserve = _FixedCudaMemoryReserve(
-        device=device_id,
-        reserve_mb=int(gpu_memory_reserve_mb or 0),
-        wait_sec=gpu_memory_reserve_wait_sec,
-        poll_sec=gpu_memory_reserve_poll_sec,
-        chunk_mb=gpu_memory_reserve_chunk_mb,
-        enabled=gpu_memory_reserve_enabled,
-        release_label="before PPL forward",
-    )
-    gpu_memory_reserve.acquire()
-    atexit.register(gpu_memory_reserve.release)
-
     gptq_cache_info = {"mode": str(gptq_cache_mode or "off").lower(), "hit": False}
     switch = None
     if quant_config_is_none:
-        # No low-memory quantization/setup phase remains for FP baseline.
-        gpu_memory_reserve.release()
+        t_move = time.time()
         if model_parallel:
             model = move_to_gpu(model, model_parallel)
         else:
             model.to(device_id)
+        logger.info("Model device placement complete in %.1fs", time.time() - t_move)
     else:
         from chop.passes.module.transforms import quantize_module_transform_pass
 
@@ -395,32 +355,53 @@ def main(
                         resolved_gptq_config["checkpoint_dir"] = str(gptq_cache.cache_path)
 
             t0 = time.time()
-            model, _ = quantize_module_transform_pass(model, pass_args)
-            if gptq_cache is not None and not gptq_cache.hit:
-                gptq_cache.finalize()
-                gptq_cache_info = gptq_cache.summary()
+            qwen_cache_fast_path = bool(
+                qwen_model_family
+                and gptq_cache is not None
+                and gptq_cache.hit
+                and (codesign_tokens_enabled or qwen_model_family)
+            )
+            if qwen_cache_fast_path:
+                logger.info("GPTQ cache hit Qwen fast path: skipping Chop transform pass.")
+            else:
+                t_chop = time.time()
+                model, _ = quantize_module_transform_pass(model, pass_args)
+                logger.info("Chop quantize_module_transform_pass complete in %.1fs", time.time() - t_chop)
+                if gptq_cache is not None and not gptq_cache.hit:
+                    gptq_cache.finalize()
+                    gptq_cache_info = gptq_cache.summary()
             if codesign_tokens_enabled or qwen_model_family:
                 qwen3_moe_experts_config = None
                 if model_family == "qwen3_moe" and prefill["mlp"]:
                     qwen3_moe_experts_config = {**prefill["ffn"], **prefill["mlp"]}
-                counts = apply_unified_mx_wrappers(
-                    model,
-                    qwen3_attention_config=prefill["attn"] if model_family == "qwen3" else None,
-                    qwen3_mlp_config=prefill["mlp"] if model_family == "qwen3" and prefill["mlp"] else None,
-                    qwen3_rms_norm_config=prefill["rms_norm"] if model_family == "qwen3" and prefill["rms_norm"] else None,
-                    qwen3_moe_attention_config=prefill["attn"] if model_family == "qwen3_moe" else None,
-                    qwen3_moe_experts_config=qwen3_moe_experts_config,
-                    qwen3_moe_rms_norm_config=prefill["rms_norm"] if model_family == "qwen3_moe" and prefill["rms_norm"] else None,
-                )
+                t_unified = time.time()
+                wrapper_kwargs = {
+                    "qwen3_attention_config": prefill["attn"] if model_family == "qwen3" else None,
+                    "qwen3_mlp_config": prefill["mlp"] if model_family == "qwen3" and prefill["mlp"] else None,
+                    "qwen3_rms_norm_config": prefill["rms_norm"] if model_family == "qwen3" and prefill["rms_norm"] else None,
+                    "qwen3_moe_attention_config": prefill["attn"] if model_family == "qwen3_moe" else None,
+                    "qwen3_moe_experts_config": qwen3_moe_experts_config,
+                    "qwen3_moe_rms_norm_config": prefill["rms_norm"] if model_family == "qwen3_moe" and prefill["rms_norm"] else None,
+                }
+                if qwen_cache_fast_path:
+                    counts = apply_qwen3_gptq_cache_unified_wrappers(
+                        model,
+                        attn_linear_config=prefill["attn"],
+                        ffn_linear_config=prefill["ffn"],
+                        **wrapper_kwargs,
+                    )
+                else:
+                    counts = apply_unified_mx_wrappers(model, **wrapper_kwargs)
                 logger.info("Installed unified MX wrappers: %s", counts)
+                logger.info("Unified wrapper install complete in %.1fs", time.time() - t_unified)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             logger.info("Quantization setup complete in %.1fs", time.time() - t0)
         finally:
             if gptq_cache is not None:
                 gptq_cache.release()
 
-        # Release before any final placement/eval allocations so the reserve does
-        # not overlap with PPL forward memory.
-        gpu_memory_reserve.release()
         if model_parallel:
             model = move_to_gpu(model, model_parallel)
         else:
@@ -434,8 +415,10 @@ def main(
         if decode_weight_mode == "fp":
             switch_kwargs["model_name"] = model_name
             switch_kwargs["weight_residency"] = decode_weight_residency
+        t_switch = time.time()
         switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
         switch.enable()
+        logger.info("Phase switch setup complete in %.1fs", time.time() - t_switch)
         logger.info("\n%s", switch.summary())
 
     try:
@@ -452,7 +435,9 @@ def main(
     finally:
         if switch is not None:
             switch.disable()
-        gpu_memory_reserve.release(log=False)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     results.update({
         "dataset": dataset,
@@ -467,7 +452,6 @@ def main(
         "decode_weight_residency": decode_weight_residency,
         "gptq_device_map_aware": bool(gptq_device_map_aware),
         "gptq_cache": gptq_cache_info,
-        "gpu_memory_reserve": gpu_memory_reserve.summary(),
     })
     if log_dir:
         save_results(log_dir, results)

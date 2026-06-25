@@ -4,3 +4,4 @@ __pycache__/
 gptq_cache/
 
 gptq_cache_qwen3/
+*.yaml

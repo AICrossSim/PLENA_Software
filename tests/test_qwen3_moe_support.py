@@ -3,9 +3,15 @@ from torch import nn
 from safetensors.torch import save_file
 
 from transformers.models.qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
+from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
 
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
-from quant_eval.eval.unified_mx import LinearMXUnified, Qwen3MoeExpertsMXUnified, apply_unified_mx_wrappers
+from quant_eval.eval.unified_mx import (
+    LinearMXUnified,
+    Qwen3MoeExpertsMXUnified,
+    apply_qwen3_gptq_cache_unified_wrappers,
+    apply_unified_mx_wrappers,
+)
 from quant_eval.precision import apply_dse_quant_config, parse_mx_precision
 
 
@@ -51,6 +57,10 @@ def _fp_cfg() -> dict:
 
 def test_qwen3_moe_unified_wrapper_counts_are_nonzero():
     model = _tiny_qwen3_moe()
+    original_experts = [m for m in model.modules() if isinstance(m, Qwen3MoeExperts)]
+    original_gate_up_ids = [id(m.gate_up_proj) for m in original_experts]
+    original_down_ids = [id(m.down_proj) for m in original_experts]
+
     counts = apply_unified_mx_wrappers(
         model,
         qwen3_moe_attention_config={**_act_cfg(), "kv_cache": _act_cfg(), "softmax": _fp_cfg(), "rope": _fp_cfg()},
@@ -62,6 +72,9 @@ def test_qwen3_moe_unified_wrapper_counts_are_nonzero():
     assert counts["qwen3_moe_experts"] == 2
     assert counts["qwen3_moe_rms_norm"] > 0
     assert counts["qwen3_attention"] == 0
+    wrapped_experts = [m for m in model.modules() if isinstance(m, Qwen3MoeExpertsMXUnified)]
+    assert [id(m.gate_up_proj) for m in wrapped_experts] == original_gate_up_ids
+    assert [id(m.down_proj) for m in wrapped_experts] == original_down_ids
 
     router_names = [name for name, _ in model.named_modules() if name.endswith(".mlp.gate")]
     assert router_names
@@ -141,6 +154,46 @@ def test_linear_mx_unified_can_switch_to_gpu_resident_fp_weight():
     assert torch.equal(layer(x), torch.tensor([[18.0]]))
     layer.set_use_fp_weight(False)
     assert torch.equal(layer(x), torch.tensor([[6.0]]))
+
+
+def test_linear_mx_unified_from_existing_reuses_parameters():
+    source = nn.Linear(2, 3, bias=True)
+    wrapped = LinearMXUnified.from_existing(source, {**_act_cfg(), "bypass": True})
+
+    assert wrapped.weight is source.weight
+    assert wrapped.bias is source.bias
+
+
+def test_qwen3_gptq_cache_fast_path_wraps_only_projection_linears():
+    model = _tiny_qwen3_moe()
+    q_proj = model.model.layers[0].self_attn.q_proj
+    router = model.model.layers[0].mlp.gate
+    lm_head = model.lm_head
+    q_proj_weight = q_proj.weight
+    router_weight = router.weight
+    lm_head_weight = lm_head.weight
+
+    counts = apply_qwen3_gptq_cache_unified_wrappers(
+        model,
+        attn_linear_config=_act_cfg(),
+        ffn_linear_config=_act_cfg(),
+        qwen3_moe_attention_config={**_act_cfg(), "kv_cache": _act_cfg(), "softmax": _fp_cfg(), "rope": _fp_cfg()},
+        qwen3_moe_experts_config={**_act_cfg(), **_fp_cfg()},
+        qwen3_moe_rms_norm_config=_fp_cfg(),
+    )
+
+    wrapped_q_proj = model.model.layers[0].self_attn.q_proj
+    assert isinstance(wrapped_q_proj, LinearMXUnified)
+    assert wrapped_q_proj.weight is q_proj_weight
+    assert wrapped_q_proj.gptq
+    assert counts["direct_gptq_linear"] > 0
+
+    assert model.model.layers[0].mlp.gate is router
+    assert model.model.layers[0].mlp.gate.weight is router_weight
+    assert not isinstance(model.model.layers[0].mlp.gate, LinearMXUnified)
+    assert model.lm_head is lm_head
+    assert model.lm_head.weight is lm_head_weight
+    assert not isinstance(model.lm_head, LinearMXUnified)
 
 
 def test_phase_switch_gpu_dual_uses_fp_backup_without_disk_reload(tmp_path):

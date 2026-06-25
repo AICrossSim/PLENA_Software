@@ -44,8 +44,40 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from chop.nn.quantizers import mxint_quantizer, mxfp_quantizer
 from chop.nn.quantizers._minifloat_mx import MinifloatMeta, minifloat_quantizer_sim
 from chop.nn.quantized.functional.rope import rope_minifloat
-from chop.nn.quantized.functional.softmax import softmax_minifloat
 from chop.nn.quantized.functional.silu import silu_minifloat
+
+
+def _minifloat_quantize(x: Tensor, config: dict) -> Tensor:
+    x_quantizer = partial(
+        minifloat_quantizer_sim,
+        minifloat_meta=MinifloatMeta(
+            exp_bits=config["data_in_exponent_width"],
+            frac_bits=config["data_in_frac_width"],
+            is_finite=config.get("data_in_is_finite", True),
+            round_mode=config.get("data_in_round_mode", "rn"),
+        ),
+    )
+    return x_quantizer(x)
+
+
+def _softmax_minifloat_preserve_mask(
+    logits: Tensor,
+    attention_mask: Optional[Tensor],
+    config: dict,
+    *,
+    dim: int = -1,
+) -> Tensor:
+    """Quantize attention logits without quantizing the additive mask.
+
+    BF16/FP attention masks often contain very large negative values.  If those
+    masked logits are sent through the minifloat quantizer, the mask can be
+    clipped to a finite value that is no longer effectively -inf.  Quantize the
+    real QK scores first, then apply the mask immediately before softmax.
+    """
+    logits = _minifloat_quantize(logits, config)
+    if attention_mask is not None:
+        logits = logits + attention_mask.to(logits.dtype)
+    return F.softmax(logits.to(torch.float32), dim=dim).to(logits.dtype)
 
 
 def _infer_mx_family(config: dict | None, prefix: str = "data_in") -> str | None:
@@ -139,14 +171,15 @@ def _eager_attention_forward_unified(
         query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
+    causal_mask = None
     if attention_mask is not None:
         causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-        attn_weights = attn_weights + causal_mask.to(attn_weights.dtype)
 
     if not softmax_bypass:
-        attn_weights = softmax_minifloat(attn_weights, softmax_config, dim=-1)
+        attn_weights = _softmax_minifloat_preserve_mask(attn_weights, causal_mask, softmax_config, dim=-1)
     else:
+        if causal_mask is not None:
+            attn_weights = attn_weights + causal_mask.to(attn_weights.dtype)
         attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
 
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
@@ -182,12 +215,12 @@ def _eager_qwen3_attention_forward_unified(
         query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
 
     if not softmax_bypass:
-        attn_weights = softmax_minifloat(attn_weights, softmax_config, dim=-1)
+        attn_weights = _softmax_minifloat_preserve_mask(attn_weights, attention_mask, softmax_config, dim=-1)
     else:
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
         attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
 
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
@@ -223,12 +256,12 @@ def _eager_qwen3_moe_attention_forward_unified(
         query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
 
     if not softmax_bypass:
-        attn_weights = softmax_minifloat(attn_weights, softmax_config, dim=-1)
+        attn_weights = _softmax_minifloat_preserve_mask(attn_weights, attention_mask, softmax_config, dim=-1)
     else:
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
         attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
 
     attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
@@ -246,10 +279,13 @@ def _phase_attn_config_to_q_config(config: dict | None) -> dict:
     kv = deepcopy(cfg.pop("kv_cache", {}))
     softmax = deepcopy(cfg.pop("softmax", {}))
     rope = deepcopy(cfg.pop("rope", {}))
+    qk = deepcopy(cfg.pop("qk_matmul", {}))
+    av = deepcopy(cfg.pop("av_matmul", {}))
+    cfg.pop("linear_bypass", None)
     act_cfg = deepcopy(cfg)
     return {
-        "qk_matmul": deepcopy(act_cfg),
-        "av_matmul": deepcopy(act_cfg),
+        "qk_matmul": {**deepcopy(act_cfg), **qk},
+        "av_matmul": {**deepcopy(act_cfg), **av},
         "kv_cache": kv,
         "softmax": softmax,
         "rope": rope,
@@ -277,14 +313,17 @@ class LinearMXUnified(nn.Linear):
             module.in_features,
             module.out_features,
             module.bias is not None,
-            device=module.weight.device,
+            device="meta",
             dtype=module.weight.dtype,
             config=cfg,
         )
-        with torch.no_grad():
-            new.weight.copy_(module.weight.detach())
-            if module.bias is not None and new.bias is not None:
-                new.bias.copy_(module.bias.detach())
+        # Reuse the already GPTQ/fake-quantized Parameter instead of allocating
+        # and copying a second full-sized weight tensor. This is critical for
+        # very large MoE models where wrapper installation can otherwise double
+        # resident GPU memory.
+        new.weight = module.weight
+        new.bias = module.bias
+        new.training = module.training
         return new
 
     @classmethod
@@ -373,15 +412,15 @@ class LlamaAttentionMXUnified(LlamaAttention):
             "softmax": deepcopy(getattr(attention, "softmax_config", {})),
             "rope": deepcopy(getattr(attention, "rope_config", {})),
         }
-        new = cls(attention.config, attention.layer_idx, cfg)
-        device, dtype = next(attention.parameters()).device, next(attention.parameters()).dtype
-        new = new.to(device=device, dtype=dtype)
+        with torch.device("meta"):
+            new = cls(attention.config, attention.layer_idx, cfg)
         # Preserve already-quantized projection modules instead of rebuilding
         # them as plain nn.Linear modules.
         new.q_proj = attention.q_proj
         new.k_proj = attention.k_proj
         new.v_proj = attention.v_proj
         new.o_proj = attention.o_proj
+        new.training = attention.training
         return new
 
     def forward(
@@ -482,15 +521,15 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
             "softmax": deepcopy(getattr(attention, "softmax_config", {})),
             "rope": deepcopy(getattr(attention, "rope_config", {})),
         }
-        new = cls(attention.config, attention.layer_idx, cfg)
-        device, dtype = next(attention.parameters()).device, next(attention.parameters()).dtype
-        new = new.to(device=device, dtype=dtype)
+        with torch.device("meta"):
+            new = cls(attention.config, attention.layer_idx, cfg)
         new.q_proj = attention.q_proj
         new.k_proj = attention.k_proj
         new.v_proj = attention.v_proj
         new.o_proj = attention.o_proj
         new.q_norm = attention.q_norm
         new.k_norm = attention.k_norm
+        new.training = attention.training
         return new
 
     def forward(
@@ -586,15 +625,15 @@ class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
             "softmax": deepcopy(getattr(attention, "softmax_config", {})),
             "rope": deepcopy(getattr(attention, "rope_config", {})),
         }
-        new = cls(attention.config, attention.layer_idx, cfg)
-        device, dtype = next(attention.parameters()).device, next(attention.parameters()).dtype
-        new = new.to(device=device, dtype=dtype)
+        with torch.device("meta"):
+            new = cls(attention.config, attention.layer_idx, cfg)
         new.q_proj = attention.q_proj
         new.k_proj = attention.k_proj
         new.v_proj = attention.v_proj
         new.o_proj = attention.o_proj
         new.q_norm = attention.q_norm
         new.k_norm = attention.k_norm
+        new.training = attention.training
         return new
 
     def forward(
@@ -683,14 +722,14 @@ class Qwen3MLPMXUnified(Qwen3MLP):
     def from_mlp(cls, mlp: Qwen3MLP, q_config: dict | None = None) -> "Qwen3MLPMXUnified":
         cfg = deepcopy(q_config if q_config is not None else getattr(mlp, "q_config", {}))
         layer_idx = getattr(mlp, "layer_idx", None)
-        new = cls(mlp.config, layer_idx=layer_idx, q_config=cfg)
-        device, dtype = next(mlp.parameters()).device, next(mlp.parameters()).dtype
-        new = new.to(device=device, dtype=dtype)
+        with torch.device("meta"):
+            new = cls(mlp.config, layer_idx=layer_idx, q_config=cfg)
         # Preserve already-replaced projection modules and the configured HF act_fn.
         new.gate_proj = mlp.gate_proj
         new.up_proj = mlp.up_proj
         new.down_proj = mlp.down_proj
         new.act_fn = mlp.act_fn
+        new.training = mlp.training
         return new
 
     def forward(self, x: Tensor) -> Tensor:
@@ -725,12 +764,12 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
             config.hidden_size = experts.hidden_dim
             config.moe_intermediate_size = experts.intermediate_dim
             config.hidden_act = getattr(getattr(experts, "act_fn", None), "__name__", "silu")
-        new = cls(config, q_config=cfg)
-        new = new.to(device=experts.gate_up_proj.device, dtype=experts.gate_up_proj.dtype)
-        with torch.no_grad():
-            new.gate_up_proj.copy_(experts.gate_up_proj.detach())
-            new.down_proj.copy_(experts.down_proj.detach())
+        with torch.device("meta"):
+            new = cls(config, q_config=cfg)
+        new.gate_up_proj = experts.gate_up_proj
+        new.down_proj = experts.down_proj
         new.act_fn = experts.act_fn
+        new.training = experts.training
         return new
 
     def forward(
@@ -806,15 +845,15 @@ class Qwen3RMSNormMinifloatUnified(Qwen3RMSNorm):
         q_config: dict | None = None,
     ) -> "Qwen3RMSNormMinifloatUnified":
         cfg = deepcopy(q_config if q_config is not None else getattr(rms_norm, "q_config", {}))
-        new = cls(
-            hidden_size=rms_norm.weight.numel(),
-            eps=float(getattr(rms_norm, "variance_epsilon", 1e-6)),
-            layer_idx=getattr(rms_norm, "layer_idx", None),
-            q_config=cfg,
-        )
-        new = new.to(device=rms_norm.weight.device, dtype=rms_norm.weight.dtype)
-        with torch.no_grad():
-            new.weight.copy_(rms_norm.weight.detach())
+        with torch.device("meta"):
+            new = cls(
+                hidden_size=rms_norm.weight.numel(),
+                eps=float(getattr(rms_norm, "variance_epsilon", 1e-6)),
+                layer_idx=getattr(rms_norm, "layer_idx", None),
+                q_config=cfg,
+            )
+        new.weight = rms_norm.weight
+        new.training = rms_norm.training
         return new
 
     def _sync_quantizers_from_config(self) -> None:
@@ -853,15 +892,15 @@ class Qwen3MoeRMSNormMinifloatUnified(Qwen3MoeRMSNorm):
         q_config: dict | None = None,
     ) -> "Qwen3MoeRMSNormMinifloatUnified":
         cfg = deepcopy(q_config if q_config is not None else getattr(rms_norm, "q_config", {}))
-        new = cls(
-            hidden_size=rms_norm.weight.numel(),
-            eps=float(getattr(rms_norm, "variance_epsilon", 1e-6)),
-            layer_idx=getattr(rms_norm, "layer_idx", None),
-            q_config=cfg,
-        )
-        new = new.to(device=rms_norm.weight.device, dtype=rms_norm.weight.dtype)
-        with torch.no_grad():
-            new.weight.copy_(rms_norm.weight.detach())
+        with torch.device("meta"):
+            new = cls(
+                hidden_size=rms_norm.weight.numel(),
+                eps=float(getattr(rms_norm, "variance_epsilon", 1e-6)),
+                layer_idx=getattr(rms_norm, "layer_idx", None),
+                q_config=cfg,
+            )
+        new.weight = rms_norm.weight
+        new.training = rms_norm.training
         return new
 
     def _sync_quantizers_from_config(self) -> None:
@@ -920,6 +959,64 @@ def _replace_child(root: nn.Module, name: str, new_module: nn.Module) -> None:
         parent[int(leaf)] = new_module
     else:
         setattr(parent, leaf, new_module)
+
+
+def _is_qwen3_gptq_linear_target(name: str) -> bool:
+    leaf = name.rsplit(".", 1)[-1]
+    if ".self_attn." in name and leaf in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+        return True
+    if ".mlp." in name and leaf in {"gate_proj", "up_proj", "down_proj"}:
+        return True
+    return False
+
+
+def _qwen3_gptq_linear_config(name: str, attn_config: dict, ffn_config: dict) -> dict:
+    config = attn_config if ".self_attn." in name else ffn_config
+    cfg = deepcopy(config or {})
+    cfg["gptq"] = True
+    return cfg
+
+
+def apply_qwen3_gptq_cache_unified_wrappers(
+    model: nn.Module,
+    *,
+    attn_linear_config: dict,
+    ffn_linear_config: dict,
+    qwen3_attention_config: dict | None = None,
+    qwen3_mlp_config: dict | None = None,
+    qwen3_rms_norm_config: dict | None = None,
+    qwen3_moe_attention_config: dict | None = None,
+    qwen3_moe_experts_config: dict | None = None,
+    qwen3_moe_rms_norm_config: dict | None = None,
+) -> dict[str, int]:
+    """Install unified wrappers directly on GPTQ-cache-loaded Qwen modules.
+
+    GPTQ cache loading writes fake-quantized weights back into the original HF
+    modules.  On a full cache hit we can skip Chop's replacement pass and wrap
+    only the affected projections, preserving cached weights while leaving
+    non-target modules such as ``lm_head`` and MoE routers untouched.
+    """
+    counts = {"direct_gptq_linear": 0}
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear) or isinstance(module, LinearMXUnified):
+            continue
+        if not _is_qwen3_gptq_linear_target(name):
+            continue
+        cfg = _qwen3_gptq_linear_config(name, attn_linear_config, ffn_linear_config)
+        _replace_child(model, name, LinearMXUnified.from_existing(module, cfg))
+        counts["direct_gptq_linear"] += 1
+
+    wrapper_counts = apply_unified_mx_wrappers(
+        model,
+        qwen3_attention_config=qwen3_attention_config,
+        qwen3_mlp_config=qwen3_mlp_config,
+        qwen3_rms_norm_config=qwen3_rms_norm_config,
+        qwen3_moe_attention_config=qwen3_moe_attention_config,
+        qwen3_moe_experts_config=qwen3_moe_experts_config,
+        qwen3_moe_rms_norm_config=qwen3_moe_rms_norm_config,
+    )
+    counts.update(wrapper_counts)
+    return counts
 
 
 def _install_qwen3_moe_router_device_hooks(model: nn.Module) -> int:

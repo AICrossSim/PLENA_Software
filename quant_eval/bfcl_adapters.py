@@ -19,8 +19,11 @@ BFCL_ADAPTER_NAMES = ("auto", "qwen3_fc", "llama31_fc_legacy", "raw")
 def _loads_json_or_literal(payload: str) -> Any:
     try:
         return json.loads(payload)
-    except json.JSONDecodeError:
-        return ast.literal_eval(payload)
+    except (json.JSONDecodeError, RecursionError):
+        try:
+            return ast.literal_eval(payload)
+        except (SyntaxError, ValueError, TypeError, RecursionError) as exc:
+            raise ValueError("Unable to parse tool payload") from exc
 
 
 def _json_dumps_compact(value: Any) -> str:
@@ -37,7 +40,7 @@ def _arguments_from_payload(parsed: dict[str, Any]) -> Any:
     if isinstance(args, str):
         try:
             return json.loads(args)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             return args
     return args
 
@@ -80,7 +83,7 @@ def _parse_payload_sequence(payload: str) -> list[dict[str, Any]]:
                 _append_openai_tool_call(tool_calls, item)
         else:
             _append_openai_tool_call(tool_calls, parsed)
-    except (json.JSONDecodeError, SyntaxError, ValueError, TypeError):
+    except (json.JSONDecodeError, SyntaxError, ValueError, TypeError, RecursionError):
         return []
     return tool_calls
 
@@ -149,7 +152,7 @@ def _parse_tool_call_tags(text: str) -> tuple[list[dict[str, Any]], str]:
     for match in matches:
         try:
             _append_openai_tool_call(tool_calls, _loads_json_or_literal(match.strip()))
-        except (json.JSONDecodeError, SyntaxError, ValueError, TypeError):
+        except (json.JSONDecodeError, SyntaxError, ValueError, TypeError, RecursionError):
             continue
     leftover = re.sub(pattern, "", text or "", flags=re.DOTALL).strip()
     return tool_calls, leftover
@@ -232,7 +235,7 @@ class Qwen3FCAdapter(BFCLAdapter):
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     # Preserve malformed argument strings as model output. BFCL
                     # should count that as a format/semantic failure.
                     pass
@@ -293,7 +296,7 @@ class Llama31FCLegacyAdapter(BFCLAdapter):
             if isinstance(args, str):
                 try:
                     args = json.loads(args)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     pass
             payloads.append({"name": name, "parameters": args})
         if not payloads:

@@ -151,11 +151,9 @@ def _decode_weight_residency(cfg: dict[str, Any]) -> str:
     if residency not in {"disk_reload", "gpu_dual"}:
         raise ValueError(
             f"runtime.decode_weight_residency must be 'disk_reload' or 'gpu_dual', got {residency!r}"
-        )
+    )
     runtime = cfg.get("runtime", {})
     if residency == "gpu_dual":
-        if _parallel_mode(cfg) != "pp":
-            raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.parallel_mode='pp'.")
         if str(runtime.get("decode_weight_mode", "fp")).lower() != "fp":
             raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.decode_weight_mode='fp'.")
     return residency
@@ -164,29 +162,6 @@ def _decode_weight_residency(cfg: dict[str, Any]) -> str:
 def _quant_config_is_none(model: dict[str, Any]) -> bool:
     value = str(model.get("quant_config", "")).strip().lower()
     return value in {"", "none", "fp", "false"}
-
-
-def _resolve_reserve(runtime: dict[str, Any], args: argparse.Namespace, *, model_parallel: bool) -> tuple[int, int, float, int, bool]:
-    reserve_mb = args.gpu_memory_reserve_mb
-    if reserve_mb is None:
-        reserve_mb = runtime.get("gpu_memory_reserve_mb", 0)
-    reserve_enabled = bool(runtime.get("gpu_memory_reserve_enabled", False))
-    reserve_disable = args.gpu_memory_reserve_disable or bool(runtime.get("gpu_memory_reserve_disable", False))
-    if args.gpu_memory_reserve_mb is not None and args.gpu_memory_reserve_mb > 0:
-        reserve_enabled = True
-        reserve_disable = False
-    if not reserve_enabled:
-        reserve_mb = 0
-        reserve_disable = True
-    if model_parallel and not reserve_disable and int(reserve_mb or 0) > 0:
-        raise ValueError("GPU memory reserve is not supported in runtime.parallel_mode='pp'; disable it or use multiworker.")
-    return (
-        int(reserve_mb or 0),
-        int(args.gpu_memory_reserve_wait_sec if args.gpu_memory_reserve_wait_sec is not None else runtime.get("gpu_memory_reserve_wait_sec", 600)),
-        float(args.gpu_memory_reserve_poll_sec if args.gpu_memory_reserve_poll_sec is not None else runtime.get("gpu_memory_reserve_poll_sec", 5.0)),
-        int(args.gpu_memory_reserve_chunk_mb if args.gpu_memory_reserve_chunk_mb is not None else runtime.get("gpu_memory_reserve_chunk_mb", 512)),
-        bool(reserve_disable),
-    )
 
 
 def _mx_bits(token: str) -> int:
@@ -341,9 +316,6 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
     seqlen = int(args.ppl_seqlen or ppl.get("seqlen", 1024))
     gptq_max_layers = _parse_nullable_int(args.gptq_max_layers, gptq.get("max_layers"))
     gptq_cache_mode = args.gptq_cache_mode or "require"
-    reserve_mb, reserve_wait_sec, reserve_poll_sec, reserve_chunk_mb, reserve_disable = _resolve_reserve(
-        runtime, args, model_parallel=model_parallel
-    )
 
     cmd = [
         str(REPO_ROOT / ".venv" / "bin" / "python"),
@@ -359,10 +331,6 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
         "--split", str(args.split or ppl.get("split", "test")),
         "--seqlen", str(seqlen),
         "--max_samples", "null" if max_samples is None else str(max_samples),
-        "--gpu_memory_reserve_mb", str(reserve_mb or 0),
-        "--gpu_memory_reserve_wait_sec", str(reserve_wait_sec),
-        "--gpu_memory_reserve_poll_sec", str(reserve_poll_sec),
-        "--gpu_memory_reserve_chunk_mb", str(reserve_chunk_mb),
         "--log_dir", str(trial_dir),
     ]
     if not quant_config_is_none:
@@ -373,8 +341,6 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
             "--kv_element_width_prefill", trial.kv,
             "--fp_setting_prefill", trial.fp_setting,
         ]
-    if reserve_disable:
-        cmd += ["--gpu_memory_reserve_disable", "true"]
     if model_parallel:
         cmd += ["--model_parallel", "true"]
     if not quant_config_is_none:
@@ -400,7 +366,10 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
 def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, args: argparse.Namespace) -> dict[str, Any]:
     trial_dir.mkdir(parents=True, exist_ok=True)
     cmd = _base_command(cfg, trial, trial_dir, args)
-    timeout = int(args.trial_timeout_sec or cfg.get("runtime", {}).get("trial_timeout_sec", 7200))
+    timeout_cfg = args.trial_timeout_sec if args.trial_timeout_sec is not None else cfg.get("runtime", {}).get("trial_timeout_sec", 7200)
+    timeout = int(timeout_cfg) if timeout_cfg is not None else None
+    if timeout is not None and timeout <= 0:
+        timeout = None
     parallel_mode = _parallel_mode(cfg)
     model_lifecycle = _model_lifecycle(cfg)
     decode_weight_residency = _decode_weight_residency(cfg)
@@ -556,11 +525,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ppl-max-samples", default="64", help="Number of WikiText2 blocks; use 'none' for full split")
     parser.add_argument("--gptq-max-layers", default=None)
     parser.add_argument("--gptq-cache-mode", default="require", choices=["off", "auto", "refresh", "require", "memory"])
-    parser.add_argument("--gpu-memory-reserve-mb", type=int, default=None)
-    parser.add_argument("--gpu-memory-reserve-wait-sec", type=int, default=None)
-    parser.add_argument("--gpu-memory-reserve-poll-sec", type=float, default=None)
-    parser.add_argument("--gpu-memory-reserve-chunk-mb", type=int, default=None)
-    parser.add_argument("--gpu-memory-reserve-disable", action="store_true")
     parser.add_argument("--join-bfcl-results", default=None)
     return parser.parse_args()
 

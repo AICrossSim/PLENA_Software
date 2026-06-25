@@ -15,6 +15,7 @@ import json
 import math
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ DEFAULT_GPUS = "2,3,4"
 DEFAULT_BFCL_ENV_BIN = ".conda/envs/plena-bfcl/bin"
 DEFAULT_BFCL_PROJECT_ROOT = ".bfcl"
 
-LENGTH_FIELDS = ["id", "input_tokens", "output_tokens", "total_tokens", "latency"]
+LENGTH_FIELDS = ["id", "input_tokens", "output_tokens", "total_tokens", "osl_isl_ratio", "latency"]
 
 
 def _timestamp() -> str:
@@ -111,6 +112,7 @@ def load_length_rows(path: Path) -> list[dict[str, Any]]:
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
                     "total_tokens": input_tokens + output_tokens,
+                    "osl_isl_ratio": (output_tokens / input_tokens) if input_tokens else "",
                     "latency": float(record["latency"]) if record.get("latency") is not None else "",
                 }
             )
@@ -165,6 +167,7 @@ def build_summary(rows: list[dict[str, Any]], *, max_new_tokens: int | None) -> 
         "isl": _metric_summary([int(row["input_tokens"]) for row in rows]),
         "osl": _metric_summary(output_tokens),
         "total_tokens": _metric_summary([int(row["total_tokens"]) for row in rows]),
+        "osl_isl_ratio": _metric_summary([float(row["osl_isl_ratio"]) for row in rows if row["osl_isl_ratio"] != ""]),
         "latency": _metric_summary(latencies),
         "max_new_tokens": max_new_tokens,
         "hit_max_new_tokens_count": (
@@ -202,8 +205,50 @@ def write_outputs(
 
     config_path = out_dir / "run_config.json"
     config_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
+    _write_length_figure(rows, out_dir)
 
     return summary
+
+
+def _write_length_figure(rows: list[dict[str, Any]], out_dir: Path) -> None:
+    if not rows:
+        return
+    import matplotlib.pyplot as plt
+
+    metrics = [
+        ("ISL", [float(row["input_tokens"]) for row in rows], "Prompt tokens"),
+        ("OSL", [float(row["output_tokens"]) for row in rows], "Output tokens"),
+        ("OSL / ISL", [float(row["osl_isl_ratio"]) for row in rows if row["osl_isl_ratio"] != ""], "Ratio"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.3), constrained_layout=True)
+    for ax, (title, values, ylabel) in zip(axes, metrics, strict=True):
+        bins = "auto"
+        if title == "OSL / ISL":
+            # Keep a long-thinking outlier from flattening the visible mass.
+            p99 = _nearest_rank(values, 99)
+            plot_values = [min(value, p99) for value in values] if p99 is not None else values
+            xlabel = f"{ylabel} (clipped at p99={p99:.2f})" if p99 is not None else ylabel
+        else:
+            plot_values = values
+            xlabel = ylabel
+        ax.hist(plot_values, bins=bins, color="#4C78A8", edgecolor="white", linewidth=0.7)
+        mean = statistics.fmean(values)
+        p50 = statistics.median(values)
+        ax.axvline(mean, color="#E15759", linewidth=1.2, label=f"mean={mean:.1f}")
+        ax.axvline(p50, color="#59A14F", linewidth=1.2, linestyle="--", label=f"p50={p50:.1f}")
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Count")
+        ax.grid(axis="y", alpha=0.25, linewidth=0.8)
+        ax.legend(fontsize=7, frameon=False)
+    figure_dir = out_dir / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    fig.suptitle("BFCL Multiple Length Distributions", fontsize=12)
+    fig.savefig(figure_dir / "bfcl_multiple_isl_osl_ratio_bars.pdf")
+    fig.savefig(figure_dir / "bfcl_multiple_isl_osl_ratio_bars.png", dpi=220)
+    fig.savefig(figure_dir / "bfcl_multiple_isl_osl_ratio_hist.pdf")
+    fig.savefig(figure_dir / "bfcl_multiple_isl_osl_ratio_hist.png", dpi=220)
+    plt.close(fig)
 
 
 def _configure_environment(args: argparse.Namespace) -> None:
@@ -243,16 +288,50 @@ def run_bfcl_generate(args: argparse.Namespace, run_dir: Path) -> Path:
         server_port=args.server_port,
         bfcl_tool_mode="return",
         bfcl_max_new_tokens=args.max_new_tokens,
-        gpu_memory_reserve_mb=0,
-        gpu_memory_reserve_disable=True,
+        bfcl_generate_mode=args.bfcl_generate_mode,
+        bfcl_batch_size=args.batch_size,
+        bfcl_batch_length_bucket=args.batch_length_bucket,
         limit=args.limit,
         log_dir=str(bfcl_log_dir),
-        run_evaluate=False,
+        run_evaluate=args.run_evaluate,
     )
-    result_dir = Path(result["bfcl_result_dir"])
+    result_dir_value = result.get("bfcl_result_dir") or result.get("bfcl_result_path")
+    if result_dir_value:
+        result_dir = Path(result_dir_value)
+    else:
+        result_candidates = sorted(bfcl_log_dir.glob("**/bfcl_results"))
+        if not result_candidates:
+            raise KeyError("eval_phase_bfcl result did not include bfcl_result_dir and no bfcl_results dir was found")
+        result_dir = result_candidates[-1]
     if not result_dir.exists():
         raise FileNotFoundError(f"BFCL result dir was not created: {result_dir}")
     return result_dir
+
+
+def run_bfcl_evaluate(args: argparse.Namespace, result_path: Path, out_dir: Path) -> dict[str, Any]:
+    _configure_environment(args)
+    score_dir = out_dir / "bfcl_scores"
+    cmd = [
+        "bfcl",
+        "evaluate",
+        "--model", args.bfcl_model_alias,
+        "--test-category", "multiple",
+        "--result-dir", str(result_path),
+        "--score-dir", str(score_dir),
+    ]
+    if args.limit is not None:
+        cmd.append("--partial-eval")
+    proc = subprocess.run(cmd, cwd=REPO_ROOT, text=True, capture_output=True)
+    (out_dir / "bfcl_evaluate_stdout.log").write_text(proc.stdout, encoding="utf-8")
+    (out_dir / "bfcl_evaluate_stderr.log").write_text(proc.stderr, encoding="utf-8")
+    score_jsons = sorted(score_dir.glob("**/BFCL_v*_multiple_score.json"))
+    overall_csvs = sorted(score_dir.glob("**/data_overall.csv"))
+    return {
+        "returncode": proc.returncode,
+        "score_dir": str(score_dir),
+        "score_files": [str(path) for path in score_jsons],
+        "overall_csv": str(overall_csvs[-1]) if overall_csvs else "",
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -267,6 +346,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=1024)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--num-threads", type=int, default=1)
+    parser.add_argument("--bfcl-generate-mode", choices=["cli", "batched"], default="batched")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--batch-length-bucket", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-evaluate", action="store_true")
     parser.add_argument("--server-host", default="127.0.0.1")
     parser.add_argument("--server-port", type=int, default=9000)
     parser.add_argument("--output-dir", default=None)
@@ -297,6 +380,10 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens,
         "limit": args.limit,
         "num_threads": args.num_threads,
+        "bfcl_generate_mode": args.bfcl_generate_mode,
+        "batch_size": args.batch_size,
+        "batch_length_bucket": args.batch_length_bucket,
+        "run_evaluate": args.run_evaluate,
         "server": f"http://{args.server_host}:{args.server_port}",
         "parse_only": args.parse_only,
         "offline": args.offline,
@@ -310,6 +397,9 @@ def main() -> None:
         print(f"BFCL alias          : {args.bfcl_model_alias}")
         print(f"Max new tokens      : {args.max_new_tokens}")
         print(f"Limit               : {args.limit if args.limit is not None else 'full multiple'}")
+        print(f"Generate mode       : {args.bfcl_generate_mode}")
+        print(f"Batch size          : {args.batch_size}")
+        print(f"Run evaluate        : {args.run_evaluate}")
         print(f"Parse only          : {args.parse_only or 'no'}")
         return
 
@@ -323,17 +413,26 @@ def main() -> None:
     run_config["bfcl_result_path"] = str(result_path)
 
     rows = load_length_rows(result_path)
+    if args.parse_only and args.run_evaluate:
+        run_config["bfcl_evaluate"] = run_bfcl_evaluate(args, result_path, out_dir)
     summary = write_outputs(rows, out_dir, max_new_tokens=args.max_new_tokens, run_config=run_config)
 
     print(f"Rows        : {len(rows)}")
     print(f"Output dir  : {out_dir}")
     print(f"lengths.csv : {out_dir / 'lengths.csv'}")
     print(f"summary.json: {out_dir / 'summary.json'}")
+    print(f"figure      : {out_dir / 'figures' / 'bfcl_multiple_isl_osl_ratio_bars.pdf'}")
     print(
         "ISL mean/max: "
         f"{summary['isl']['mean']:.2f}/{summary['isl']['max']} | "
         "OSL mean/max: "
         f"{summary['osl']['mean']:.2f}/{summary['osl']['max']}"
+    )
+    print(
+        "OSL/ISL mean/p50/max: "
+        f"{summary['osl_isl_ratio']['mean']:.4f}/"
+        f"{summary['osl_isl_ratio']['p50']:.4f}/"
+        f"{summary['osl_isl_ratio']['max']:.4f}"
     )
     print(f"Hit max_new_tokens: {summary['hit_max_new_tokens_count']}")
 

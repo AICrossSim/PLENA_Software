@@ -4,6 +4,9 @@ import pytest
 
 from prefill_DSE.run_prefill_dse import Trial as BfclTrial
 from prefill_DSE.run_prefill_dse import _base_command as bfcl_base_command
+from prefill_DSE.run_prefill_dse import _decode_weight_residency
+from prefill_DSE.run_prefill_dse import _read_persistent_progress
+from prefill_DSE.run_prefill_dse import _trial_weight_reuse
 from prefill_DSE.run_prefill_ppl import Trial as PplTrial
 from prefill_DSE.run_prefill_ppl import _base_command as ppl_base_command
 
@@ -12,12 +15,9 @@ def _args(**overrides):
     values = {
         "limit": 1,
         "bfcl_max_new_tokens": 64,
+        "bfcl_generate_mode": None,
+        "bfcl_batch_size": None,
         "gptq_max_layers": "1",
-        "gpu_memory_reserve_mb": None,
-        "gpu_memory_reserve_wait_sec": None,
-        "gpu_memory_reserve_poll_sec": None,
-        "gpu_memory_reserve_chunk_mb": None,
-        "gpu_memory_reserve_disable": False,
         "dataset": None,
         "subset": None,
         "split": None,
@@ -29,7 +29,7 @@ def _args(**overrides):
     return argparse.Namespace(**values)
 
 
-def _cfg(parallel_mode="multiworker", reserve_enabled=False):
+def _cfg(parallel_mode="multiworker"):
     return {
         "model": {
             "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -50,21 +50,17 @@ def _cfg(parallel_mode="multiworker", reserve_enabled=False):
         "runtime": {
             "parallel_mode": parallel_mode,
             "decode_weight_mode": "fp",
-            "gpu_memory_reserve_enabled": reserve_enabled,
-            "gpu_memory_reserve_mb": 1024 if reserve_enabled else 0,
-            "gpu_memory_reserve_disable": not reserve_enabled,
         },
     }
 
 
-def test_bfcl_pp_command_enables_model_parallel_and_disables_reserve(tmp_path):
+def test_bfcl_pp_command_enables_model_parallel_without_reserve_args(tmp_path):
     trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
     cmd = bfcl_base_command(_cfg(parallel_mode="pp"), trial, tmp_path, 9000, _args())
     joined = " ".join(cmd)
 
     assert "--model_parallel true" in joined
-    assert "--gpu_memory_reserve_mb 0" in joined
-    assert "--gpu_memory_reserve_disable true" in joined
+    assert "gpu_memory_reserve" not in joined
     assert "--decode_weight_residency disk_reload" in joined
 
 
@@ -74,18 +70,12 @@ def test_ppl_multiworker_command_keeps_single_worker_semantics(tmp_path):
     joined = " ".join(cmd)
 
     assert "--model_parallel" not in joined
-    assert "--gpu_memory_reserve_mb 0" in joined
-    assert "--gpu_memory_reserve_disable true" in joined
-
-
-def test_pp_mode_rejects_enabled_gpu_reserve(tmp_path):
-    trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
-    with pytest.raises(ValueError, match="parallel_mode='pp'"):
-        bfcl_base_command(_cfg(parallel_mode="pp", reserve_enabled=True), trial, tmp_path, 9000, _args())
+    assert "gpu_memory_reserve" not in joined
 
 
 def test_gpu_dual_and_memory_cache_are_passed_to_bfcl_eval(tmp_path):
     cfg = _cfg(parallel_mode="pp")
+    cfg["runtime"]["model_lifecycle"] = "persistent"
     cfg["runtime"]["decode_weight_residency"] = "gpu_dual"
     cfg["gptq"]["cache_mode"] = "memory"
     cfg["gptq"]["device_map_aware"] = True
@@ -98,6 +88,37 @@ def test_gpu_dual_and_memory_cache_are_passed_to_bfcl_eval(tmp_path):
     assert "--gptq_device_map_aware true" in joined
 
 
+def test_gpu_dual_requires_persistent_lifecycle():
+    cfg = _cfg(parallel_mode="multiworker")
+    cfg["runtime"]["decode_weight_residency"] = "gpu_dual"
+
+    with pytest.raises(ValueError, match="model_lifecycle='persistent'"):
+        _decode_weight_residency(cfg)
+
+
+def test_gpu_dual_allowed_for_persistent_multiworker():
+    cfg = _cfg(parallel_mode="multiworker")
+    cfg["runtime"]["model_lifecycle"] = "persistent"
+    cfg["runtime"]["trial_weight_reuse"] = True
+    cfg["runtime"]["decode_weight_residency"] = "gpu_dual"
+
+    assert _decode_weight_residency(cfg) == "gpu_dual"
+    assert _trial_weight_reuse(cfg) is True
+
+
+def test_bfcl_batched_generate_mode_is_passed_to_eval(tmp_path):
+    cfg = _cfg(parallel_mode="pp")
+    cfg["bfcl"]["generate_mode"] = "batched"
+    cfg["bfcl"]["batch_size"] = 16
+    trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
+    cmd = bfcl_base_command(cfg, trial, tmp_path, 9000, _args())
+    joined = " ".join(cmd)
+
+    assert "--bfcl_generate_mode batched" in joined
+    assert "--bfcl_batch_size 16" in joined
+    assert "--bfcl_batch_length_bucket true" in joined
+
+
 def test_ppl_passes_device_map_aware_gptq_flag(tmp_path):
     cfg = _cfg(parallel_mode="pp")
     cfg["gptq"]["device_map_aware"] = True
@@ -107,3 +128,19 @@ def test_ppl_passes_device_map_aware_gptq_flag(tmp_path):
 
     assert "--model_parallel true" in joined
     assert "--gptq_device_map_aware true" in joined
+
+
+def test_persistent_progress_reader_deduplicates_and_skips_bad_lines(tmp_path):
+    progress = tmp_path / "progress.jsonl"
+    progress.write_text(
+        '{"trial_id": "a", "status": "done"}\n'
+        'not-json\n'
+        '{"trial_id": "b", "status": "done"}\n'
+        '{"trial_id": "a", "status": "done"}\n',
+        encoding="utf-8",
+    )
+    completed: set[str] = set()
+
+    assert _read_persistent_progress(progress, completed) == ["a", "b"]
+    assert _read_persistent_progress(progress, completed) == []
+    assert completed == {"a", "b"}

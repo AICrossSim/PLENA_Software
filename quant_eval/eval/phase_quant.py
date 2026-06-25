@@ -159,7 +159,7 @@ def _apply_module_config(module: nn.Module, overrides: dict) -> None:
     ``bypass`` is both a config value and a module attribute read directly by
     LinearMXInt.forward(), so keep them in sync.
     """
-    desired_bypass = bool(overrides.get("bypass", False))
+    desired_bypass = bool(overrides.get("linear_bypass", overrides.get("bypass", False)))
     module.config["bypass"] = desired_bypass
     if hasattr(module, "bypass"):
         module.bypass = desired_bypass
@@ -171,7 +171,7 @@ def _apply_module_config(module: nn.Module, overrides: dict) -> None:
         module.config.pop("data_in_width", None)
 
     for key, value in overrides.items():
-        if key in ("weight_mode", "kv_cache", "softmax", "rope"):
+        if key in ("weight_mode", "linear_bypass", "kv_cache", "softmax", "rope", "qk_matmul", "av_matmul"):
             continue
         if key == "bypass":
             continue
@@ -804,11 +804,23 @@ class PhaseLayerAutoSwitch:
                     if not isinstance(target, dict):
                         continue
                     if attr_name in ("qk_config", "av_config"):
+                        sub_key = "qk_matmul" if attr_name == "qk_config" else "av_matmul"
+                        sub_cfg = attn_overrides.get(sub_key)
                         target.clear()
                         for key, value in attn_overrides.items():
-                            if key in ("kv_cache", "softmax", "rope", "weight_mode"):
+                            if key in (
+                                "kv_cache",
+                                "softmax",
+                                "rope",
+                                "qk_matmul",
+                                "av_matmul",
+                                "weight_mode",
+                                "linear_bypass",
+                            ):
                                 continue
                             target[key] = value
+                        if isinstance(sub_cfg, dict):
+                            target.update(sub_cfg)
                     elif attr_name == "kv_cache_config":
                         sub_cfg = attn_overrides.get("kv_cache", {})
                         if sub_cfg:
@@ -1242,6 +1254,22 @@ class PhaseLayerAutoSwitch:
                     kv_name = f"MXFP_E{kv_cfg['data_in_exponent_width']}M{kv_cfg['data_in_frac_width']}"
                 if kv_name:
                     base = f"ACT={base}, KV={kv_name}(B{kv_cfg.get('data_in_block_size', '?')})"
+            subparts = []
+            for label, key in (
+                ("qk", "qk_matmul"),
+                ("av", "av_matmul"),
+                ("softmax", "softmax"),
+                ("rope", "rope"),
+            ):
+                sub_cfg = cfg.get(key)
+                if isinstance(sub_cfg, dict) and sub_cfg.get("bypass", False):
+                    subparts.append(f"{label}=bypass")
+            if isinstance(kv_cfg, dict) and kv_cfg.get("bypass", False):
+                subparts.append("kv=bypass")
+            if cfg.get("linear_bypass", False):
+                subparts.append("linear=bypass")
+            if subparts:
+                base = f"{base}; " + ", ".join(subparts)
             return f"{base}  weight={_normalize_weight_mode(cfg)}"
 
         def _fmt_fp(cfg: dict) -> str:

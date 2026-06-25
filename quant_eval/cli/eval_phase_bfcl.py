@@ -31,7 +31,6 @@ Example:
 
 from __future__ import annotations
 
-import atexit
 import gc
 import hashlib
 import json
@@ -60,7 +59,7 @@ from quant_eval.utils import (
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.quantize import load_quant_config
 from quant_eval.precision import apply_dse_quant_config, parse_fp_setting, parse_mx_precision, mx_data_config, fp_data_config
-from quant_eval.eval.unified_mx import apply_unified_mx_wrappers
+from quant_eval.eval.unified_mx import apply_qwen3_gptq_cache_unified_wrappers, apply_unified_mx_wrappers
 from quant_eval.bfcl_adapters import BFCL_ADAPTER_NAMES, resolve_bfcl_adapter
 
 from fastapi import FastAPI, Request
@@ -76,186 +75,37 @@ set_logging_verbosity("debug")
 # ── Default BFCL V4 web-search categories ─────────────────────────────────────
 BFCL_WEB_SEARCH_CATEGORIES = ("web_search_base", "web_search_no_snippet")
 BFCL_TOOL_MODES = ("auto", "return", "execute")
+BFCL_GENERATE_MODES = ("cli", "batched")
+ATTN_IMPLEMENTATIONS = ("auto", "sdpa", "eager")
 
 # ── OpenAI-compatible server defaults ─────────────────────────────────────────
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8915
 
-_CUDA_RESERVE_MB = 1024 * 1024
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class _FixedCudaMemoryReserve:
-    """Hold a fixed CUDA allocation during low-memory phases of eval.
-
-    This guard makes GPTQ's low-memory phase keep a fixed amount of GPU memory
-    occupied, then releases it immediately before BFCL generation.
-    """
-
-    def __init__(
-        self,
-        *,
-        device: str,
-        reserve_mb: int,
-        wait_sec: int,
-        poll_sec: float,
-        chunk_mb: int,
-        enabled: bool,
-        release_label: str = "before BFCL generate",
-    ):
-        self.device = torch.device(device)
-        self.reserve_mb = int(reserve_mb or 0)
-        self.wait_sec = int(wait_sec)
-        self.poll_sec = float(poll_sec)
-        self.chunk_mb = int(chunk_mb)
-        self.enabled = bool(enabled and self.reserve_mb > 0)
-        self.release_label = release_label
-        self._buffers: list[torch.Tensor] = []
-        self._reserved_mb = 0
-        self._total_mb = 0
-        self._free_before_mb = 0
-
-        if self.enabled:
-            if self.device.type != "cuda":
-                raise ValueError(
-                    "GPU memory reservation requires a CUDA device; "
-                    f"got {device!r}. Disable it with --gpu_memory_reserve_disable true."
-                )
-            if self.chunk_mb <= 0:
-                raise ValueError("gpu_memory_reserve_chunk_mb must be > 0.")
-            if self.wait_sec < 0:
-                raise ValueError("gpu_memory_reserve_wait_sec must be >= 0.")
-            if self.poll_sec <= 0:
-                raise ValueError("gpu_memory_reserve_poll_sec must be > 0.")
-
-    def _device_index(self) -> int:
-        if self.device.index is None:
-            return torch.cuda.current_device()
-        return self.device.index
-
-    def _memory_info_mb(self) -> tuple[int, int]:
-        free_bytes, total_bytes = torch.cuda.mem_get_info(self._device_index())
-        return free_bytes // _CUDA_RESERVE_MB, total_bytes // _CUDA_RESERVE_MB
-
-    def acquire(self) -> None:
-        if not self.enabled:
-            logger.info("GPU reserve disabled.")
-            return
-        if not torch.cuda.is_available():
-            raise RuntimeError("GPU reserve requested but torch.cuda is not available.")
-
-        torch.cuda.set_device(self._device_index())
-        start = time.monotonic()
-        last_error = "unknown allocation failure"
-        while True:
-            free_mb, total_mb = self._memory_info_mb()
-            self._free_before_mb = int(free_mb)
-            self._total_mb = int(total_mb)
-            if free_mb >= self.reserve_mb:
-                try:
-                    remaining_mb = self.reserve_mb
-                    while remaining_mb > 0:
-                        alloc_mb = min(self.chunk_mb, remaining_mb)
-                        self._buffers.append(
-                            torch.empty(
-                                alloc_mb * _CUDA_RESERVE_MB,
-                                dtype=torch.uint8,
-                                device=self.device,
-                            )
-                        )
-                        self._reserved_mb += alloc_mb
-                        remaining_mb -= alloc_mb
-                    logger.info(
-                        "GPU reserve acquired: total=%dMB free_before=%dMB reserved=%dMB",
-                        self._total_mb,
-                        self._free_before_mb,
-                        self._reserved_mb,
-                    )
-                    print(
-                        "GPU reserve acquired: "
-                        f"total={self._total_mb}MB "
-                        f"free_before={self._free_before_mb}MB "
-                        f"reserved={self._reserved_mb}MB"
-                    )
-                    return
-                except RuntimeError as exc:
-                    last_error = str(exc)
-                    self.release(log=False)
-                    torch.cuda.empty_cache()
-            else:
-                last_error = (
-                    f"free={free_mb}MB is below requested reserve={self.reserve_mb}MB "
-                    f"on total={total_mb}MB GPU"
-                )
-
-            if time.monotonic() - start >= self.wait_sec:
-                raise RuntimeError(
-                    "Timed out acquiring GPU reserve after "
-                    f"{self.wait_sec}s: {last_error}. Lower --gpu_memory_reserve_mb, "
-                    "choose a freer GPU, or disable reservation."
-                )
-            logger.info(
-                "Waiting for GPU reserve: reserve=%dMB free=%dMB total=%dMB retry_in=%.1fs",
-                self.reserve_mb,
-                free_mb,
-                total_mb,
-                self.poll_sec,
-            )
-            time.sleep(self.poll_sec)
-
-    def release(self, *, log: bool = True) -> None:
-        if not self._buffers and self._reserved_mb == 0:
-            return
-        released_mb = self._reserved_mb
-        free_before_mb, total_mb = (0, 0)
-        free_after_mb = 0
-
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            torch.cuda.set_device(self._device_index())
-            torch.cuda.synchronize(self._device_index())
-            free_before_mb, total_mb = self._memory_info_mb()
-
-        self._buffers.clear()
-        self._reserved_mb = 0
-        gc.collect()
-
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            # Make reserve release visible to subsequent BFCL generate requests
-            # before the server starts handling decode allocations. Without the
-            # synchronizes, PyTorch/CUDA allocator bookkeeping can transiently
-            # overlap the reservation with the first generation memory peak.
-            torch.cuda.synchronize(self._device_index())
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(self._device_index())
-            free_after_mb, total_mb = self._memory_info_mb()
-
-        if log:
-            logger.info(
-                "GPU reserve released %s: released=%dMB free_before=%dMB free_after=%dMB total=%dMB",
-                self.release_label,
-                released_mb,
-                free_before_mb,
-                free_after_mb,
-                total_mb,
-            )
-            print(
-                f"GPU reserve released {self.release_label}: "
-                f"released={released_mb}MB "
-                f"free_before={free_before_mb}MB "
-                f"free_after={free_after_mb}MB "
-                f"total={total_mb}MB"
-            )
-
-    def summary(self) -> dict:
-        return {
-            "enabled": self.enabled,
-            "reserve_mb": self.reserve_mb,
-            "reserved_mb": self._reserved_mb,
-            "total_mb": self._total_mb,
-            "free_before_mb": self._free_before_mb,
-            "chunk_mb": self.chunk_mb,
-            "wait_sec": self.wait_sec,
-            "poll_sec": self.poll_sec,
-        }
+def resolve_attention_backend(
+    requested: str | None,
+    *,
+    qwen_model_family: bool,
+    quant_config_is_none: bool,
+    codesign_tokens_enabled: bool,
+) -> str:
+    """Choose an HF attention backend that matches PLENA runtime wrappers."""
+    value = str(requested or "auto").strip().lower()
+    if value == "auto":
+        # Qwen3 unified attention wrappers use an eager-style attention core
+        # when QK/softmax/AV are quantized. Loading Qwen3 with SDPA and then
+        # switching into that eager-style core can produce backend-mismatch
+        # failures such as repeated chat-template tokens. Keep FP baselines on
+        # SDPA by default, but use eager for quantized Qwen3/Qwen3-MoE paths.
+        if qwen_model_family and not quant_config_is_none and codesign_tokens_enabled:
+            return "eager"
+        return "sdpa"
+    if value not in {"sdpa", "eager"}:
+        raise ValueError(f"attn_implementation must be one of {ATTN_IMPLEMENTATIONS}, got {requested!r}.")
+    return value
 
 
 def _execute_tool(tool_call: dict) -> str:
@@ -1410,6 +1260,7 @@ def _run_bfcl_generate(
 ) -> int:
     """Call ``bfcl generate`` against the local server; return the exit code."""
     bfcl_name = _bfcl_model_name(model_name, model_alias=model_alias)
+    result_dir = result_dir.resolve()
     cmd = [
         "bfcl", "generate",
         "--model",         bfcl_name,
@@ -1418,9 +1269,14 @@ def _run_bfcl_generate(
         "--result-dir",    str(result_dir),
         "--num-threads",   str(num_threads),
     ]
+    local_model_path = Path(model_name)
+    if local_model_path.is_dir():
+        cmd.extend(["--local-model-path", str(local_model_path.resolve())])
     env = os.environ.copy()
     env["LOCAL_SERVER_ENDPOINT"] = host
     env["LOCAL_SERVER_PORT"]     = str(port)
+    if local_model_path.is_dir():
+        env.setdefault("REMOTE_OPENAI_TOKENIZER_PATH", str(local_model_path.resolve()))
 
     if limit is not None:
         if limit <= 0:
@@ -1437,13 +1293,238 @@ def _run_bfcl_generate(
         ids_path.write_text(json.dumps(ids, indent=2) + "\n")
         cmd.append("--run-ids")
 
-    print(cmd)
-    print(host)
-    print(port)
-
     logger.info("Running: %s", " ".join(cmd))
     proc = subprocess.run(cmd, env=env)
     return proc.returncode
+
+
+def _bfcl_site_packages_candidates() -> list[Path]:
+    candidates: list[Path] = []
+    env_bin = os.environ.get("PATH", "").split(os.pathsep)
+    for entry in env_bin:
+        p = Path(entry)
+        if p.name == "bin":
+            candidates.extend((p.parent / "lib").glob("python*/site-packages"))
+    candidates.extend((_REPO_ROOT / ".conda" / "envs" / "plena-bfcl" / "lib").glob("python*/site-packages"))
+    return [p for p in candidates if p.exists()]
+
+
+def _ensure_bfcl_eval_importable() -> None:
+    try:
+        import bfcl_eval  # noqa: F401
+        return
+    except Exception:
+        pass
+    for site_packages in _bfcl_site_packages_candidates():
+        value = str(site_packages)
+        if value not in sys.path:
+            sys.path.insert(0, value)
+        try:
+            import bfcl_eval  # noqa: F401
+            return
+        except Exception:
+            continue
+
+
+def _load_bfcl_multiple_entries(limit: int | None) -> list[dict]:
+    if limit is not None and limit <= 0:
+        raise ValueError("limit must be positive when set.")
+    _ensure_bfcl_eval_importable()
+    try:
+        from bfcl_eval.utils import load_dataset_entry  # type: ignore
+
+        rows = load_dataset_entry("multiple")
+    except Exception as exc:
+        data_path = os.environ.get("BFCL_MULTIPLE_DATA_PATH")
+        candidates = [Path(data_path)] if data_path else []
+        for site_packages in _bfcl_site_packages_candidates():
+            candidates.append(site_packages / "bfcl_eval" / "data" / "BFCL_v4_multiple.json")
+        candidates.append(_REPO_ROOT / ".conda" / "envs" / "plena-bfcl" / "lib" / "python3.11" / "site-packages" / "bfcl_eval" / "data" / "BFCL_v4_multiple.json")
+        for path in candidates:
+            if path and path.exists():
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                break
+        else:
+            raise FileNotFoundError("Unable to locate BFCL_v4_multiple.json for batched generation.") from exc
+    if limit is not None:
+        rows = rows[:limit]
+    if not rows:
+        raise RuntimeError("No BFCL multiple rows selected for batched generation.")
+    return rows
+
+
+def _extract_first_turn_messages(row: dict) -> list[dict[str, str]]:
+    question = row.get("question", [])
+    if question and isinstance(question, list) and isinstance(question[0], list):
+        first_turn = question[0]
+    elif isinstance(question, list):
+        first_turn = question
+    else:
+        first_turn = []
+    messages: list[dict[str, str]] = []
+    for message in first_turn:
+        if isinstance(message, dict):
+            messages.append({
+                "role": str(message.get("role", "user")),
+                "content": str(message.get("content", "")),
+            })
+    if not messages:
+        raise ValueError(f"BFCL row {row.get('id', '<unknown>')} has no first-turn messages.")
+    return messages
+
+
+def _render_qwen3_bfcl_prompt(row: dict, *, disable_thinking: bool = False) -> str:
+    from calib.build_bfcl_official_wrapped_qwen3 import render_qwen3_fc_prompt
+
+    functions = row.get("function", [])
+    if not isinstance(functions, list):
+        raise TypeError(f"BFCL row {row.get('id', '<unknown>')} function field is not a list.")
+    prompt = render_qwen3_fc_prompt(_extract_first_turn_messages(row), functions)
+    if disable_thinking:
+        # Mirrors Qwen3's tokenizer chat_template when
+        # apply_chat_template(..., enable_thinking=False) is used.
+        assistant_prefix = "<|im_start|>assistant\n"
+        if not prompt.endswith(assistant_prefix):
+            raise ValueError("Qwen3 BFCL prompt did not end with the expected assistant prefix.")
+        prompt += "<think>\n\n</think>\n\n"
+    return prompt
+
+
+def _batch_input_device(model, fallback_device: str) -> torch.device:
+    try:
+        return model.get_input_embeddings().weight.device
+    except Exception:
+        return torch.device(fallback_device)
+
+
+def _trim_generated_padding(tokens: torch.Tensor, pad_token_id: int | None, eos_token_id: int | None) -> torch.Tensor:
+    if tokens.numel() == 0 or pad_token_id is None or pad_token_id == eos_token_id:
+        return tokens
+    end = tokens.numel()
+    while end > 0 and int(tokens[end - 1]) == int(pad_token_id):
+        end -= 1
+    return tokens[:end]
+
+
+def _write_bfcl_multiple_results(result_dir: Path, bfcl_name: str, records: list[dict]) -> Path:
+    out_dir = result_dir / bfcl_name.replace("/", "_") / "non_live"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "BFCL_v4_multiple_result.json"
+    with out_path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return out_path
+
+
+def _run_batched_bfcl_multiple_generate(
+    *,
+    model,
+    tokenizer,
+    device: str,
+    result_dir: Path,
+    model_name: str,
+    model_alias: str | None,
+    bfcl_adapter,
+    max_new_tokens: int | None,
+    limit: int | None,
+    batch_size: int,
+    batch_length_bucket: bool,
+    disable_thinking: bool,
+) -> int:
+    if batch_size <= 0:
+        raise ValueError("bfcl_batch_size must be positive.")
+
+    rows = _load_bfcl_multiple_entries(limit)
+    prompts = [_render_qwen3_bfcl_prompt(row, disable_thinking=disable_thinking) for row in rows]
+    prompt_lengths = [len(tokenizer(prompt, add_special_tokens=False).input_ids) for prompt in prompts]
+    indices = list(range(len(rows)))
+    if batch_length_bucket:
+        indices.sort(key=lambda idx: prompt_lengths[idx])
+
+    old_padding_side = getattr(tokenizer, "padding_side", "right")
+    old_pad_token = tokenizer.pad_token
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+    input_device = _batch_input_device(model, device)
+    max_new_toks = 1024 if max_new_tokens is None else int(max_new_tokens)
+    results_by_index: dict[int, dict] = {}
+
+    try:
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start:start + batch_size]
+            batch_prompts = [prompts[idx] for idx in batch_indices]
+            encoded = input_ids = attention_mask = output_ids = generated = None
+            try:
+                encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True)
+                input_ids = encoded.input_ids.to(input_device)
+                attention_mask = encoded.attention_mask.to(input_device)
+                t0 = time.time()
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=max_new_toks,
+                        do_sample=False,
+                        pad_token_id=tokenizer.pad_token_id,
+                    )
+                batch_latency = time.time() - t0
+                generated = output_ids[:, input_ids.shape[-1]:]
+                for row_pos, idx in enumerate(batch_indices):
+                    gen_ids = _trim_generated_padding(
+                        generated[row_pos].detach().cpu(),
+                        tokenizer.pad_token_id,
+                        tokenizer.eos_token_id,
+                    )
+                    raw_text = tokenizer.decode(gen_ids, skip_special_tokens=False).strip()
+                    try:
+                        tool_calls, _content = bfcl_adapter.parse_tool_calls(raw_text)
+                        if tool_calls:
+                            result_text = bfcl_adapter.return_text_from_tool_calls(tool_calls, raw_text=raw_text)
+                        else:
+                            result_text = bfcl_adapter.normalize_return_text(raw_text)
+                    except (RecursionError, ValueError, TypeError) as exc:
+                        logger.warning(
+                            "BFCL adapter failed for sample %s; preserving raw output for scoring: %s",
+                            rows[idx].get("id"),
+                            exc,
+                        )
+                        result_text = raw_text
+                    prompt_tokens = int(attention_mask[row_pos].sum().item())
+                    completion_tokens = int(gen_ids.numel())
+                    results_by_index[idx] = {
+                        "id": rows[idx]["id"],
+                        "result": result_text,
+                        "input_token_count": prompt_tokens,
+                        "output_token_count": completion_tokens,
+                        "latency": batch_latency,
+                    }
+                logger.info(
+                    "Batched BFCL multiple generated %d/%d samples (batch_size=%d, latency=%.2fs)",
+                    min(start + len(batch_indices), len(indices)),
+                    len(indices),
+                    len(batch_indices),
+                    batch_latency,
+                )
+                partial_records = [results_by_index[idx] for idx in range(len(rows)) if idx in results_by_index]
+                _write_bfcl_multiple_results(
+                    result_dir,
+                    _bfcl_model_name(model_name, model_alias=model_alias),
+                    partial_records,
+                )
+            finally:
+                del generated, output_ids, attention_mask, input_ids, encoded
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+    finally:
+        tokenizer.padding_side = old_padding_side
+        tokenizer.pad_token = old_pad_token
+
+    records = [results_by_index[idx] for idx in range(len(rows))]
+    out_path = _write_bfcl_multiple_results(result_dir, _bfcl_model_name(model_name, model_alias=model_alias), records)
+    logger.info("Wrote batched BFCL multiple results: %s", out_path)
+    return 0
 
 
 def _load_bfcl_score_file(path: Path) -> object:
@@ -1457,14 +1538,32 @@ def _load_bfcl_score_file(path: Path) -> object:
     text = path.read_text().strip()
     if not text:
         return {}
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        records = []
+        skipped = 0
+        for line in lines:
+            try:
+                records.append(json.loads(line))
+            except (json.JSONDecodeError, RecursionError) as exc:
+                skipped += 1
+                logger.warning("Skipping unparsable BFCL score record in %s: %s", path, exc)
+        if skipped and records and isinstance(records[0], dict):
+            records[0]["_parse_warning"] = f"skipped {skipped} unparsable score record(s)"
+        return records
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
         records = []
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
+        skipped = 0
+        for line in lines:
+            try:
                 records.append(json.loads(line))
+            except (json.JSONDecodeError, RecursionError) as exc:
+                skipped += 1
+                logger.warning("Skipping unparsable BFCL score record in %s: %s", path, exc)
+        if skipped and records and isinstance(records[0], dict):
+            records[0]["_parse_warning"] = f"skipped {skipped} unparsable score record(s)"
         return records
 
 
@@ -1478,6 +1577,8 @@ def _run_bfcl_evaluate(
 ) -> tuple[int, dict]:
     """Call ``bfcl evaluate``; return (exit_code, parsed_scores)."""
     bfcl_name = _bfcl_model_name(model_name, model_alias=model_alias)
+    result_dir = result_dir.resolve()
+    score_dir = score_dir.resolve()
     cmd = [
         "bfcl", "evaluate",
         "--model",         bfcl_name,
@@ -1549,6 +1650,7 @@ def main(
     dtype:       str = "bfloat16",
     quant_config: str = "quant_eval/configs/qwen3_mxint16.toml",
     model_parallel: bool = False,
+    attn_implementation: str = "auto",
     # ── BFCL settings ──────────────────────────────────────────────────────
     bfcl_test_categories: Union[list[str], str, None] = None,
     bfcl_model_alias:     str | None = "Qwen/Qwen3-8B-FC",
@@ -1559,12 +1661,10 @@ def main(
     server_port:          int   = DEFAULT_PORT,
     bfcl_tool_mode:       str   = "auto",
     bfcl_max_new_tokens:  int | None = 2048,
-    # ── GPU reservation guard ───────────────────────────────────────────────
-    gpu_memory_reserve_mb: int = 0,
-    gpu_memory_reserve_wait_sec: int = 600,
-    gpu_memory_reserve_poll_sec: float = 5.0,
-    gpu_memory_reserve_chunk_mb: int = 512,
-    gpu_memory_reserve_disable: bool = False,
+    bfcl_generate_mode:   str = "cli",
+    bfcl_batch_size:      int = 16,
+    bfcl_batch_length_bucket: bool = True,
+    bfcl_disable_thinking: bool = False,
     # ── GPTQ calibration/weight quantization ───────────────────────────────
     gptq_dataset:          str | None = None,
     gptq_nsamples:         int = 32,
@@ -1598,6 +1698,8 @@ def main(
     dse_weight_block_size:     int | None = None,
     decode_weight_mode:        str = "quantized",
     decode_weight_residency:   str = "disk_reload",
+    runtime_weight_only:       bool = False,
+    runtime_bypass_components: str | None = None,
     # ── Optional keyword overrides ─────────────────────────────────────────
     attn_keywords: Union[list[str], None] = None,
     ffn_keywords:  Union[list[str], None] = None,
@@ -1605,6 +1707,7 @@ def main(
     log_dir: Union[str, None] = None,
     run_evaluate: bool = True,
     persistent_trials: list[dict] | None = None,
+    persistent_progress_path: str | None = None,
 ):
     """
     Run BFCL web-search evaluation with phase- and layer-type-dependent
@@ -1623,6 +1726,10 @@ def main(
         quant_config: Path to a TOML quantization recipe. Use ``"none"``
             for a true FP baseline that skips quantization and phase switching.
         model_parallel: Distribute across GPUs with ``device_map="auto"``.
+        attn_implementation: HF attention backend used when loading the model.
+            ``"auto"`` keeps FP baselines on SDPA but uses eager for quantized
+            Qwen3/Qwen3-MoE paths where runtime wrappers insert quantization
+            inside the attention core.
         bfcl_test_categories: BFCL category names to evaluate (e.g.
             ``["web_search_base", "web_search_no_snippet"]``). ``None`` uses
             the default web-search category set. Also accepts JSON-list string
@@ -1635,6 +1742,12 @@ def main(
         model_family: Quantized model family for DSE config generation. Supported
             values are ``qwen3`` and ``llama``.
         bfcl_num_threads: Parallel inference threads for ``bfcl generate``.
+        bfcl_generate_mode: ``"cli"`` uses the official BFCL generator;
+            ``"batched"`` directly writes BFCL multiple results from batched
+            in-process HF generation.
+        bfcl_disable_thinking: In batched Qwen3 generation, prefill an empty
+            thinking block after the assistant prefix, matching the tokenizer
+            template's ``enable_thinking=False`` behavior.
         server_host: Host for the local OpenAI-compatible server.
         server_port: Port for the local OpenAI-compatible server.
         bfcl_tool_mode: ``"auto"`` executes tools only for web-search categories;
@@ -1643,12 +1756,6 @@ def main(
             web-search behavior.
         bfcl_max_new_tokens: Local cap applied to BFCL-requested ``max_tokens``
             before calling ``model.generate``. ``None`` disables the cap.
-        gpu_memory_reserve_mb: Fixed CUDA memory reservation held during GPTQ and
-            quantization, then released before BFCL generation. ``0`` disables it.
-        gpu_memory_reserve_wait_sec: Seconds to wait for enough free memory.
-        gpu_memory_reserve_poll_sec: Poll interval while waiting for memory.
-        gpu_memory_reserve_chunk_mb: Chunk size for the reservation tensors.
-        gpu_memory_reserve_disable: Disable the reservation guard entirely.
         gptq_dataset: Optional GPTQ calibration dataset. Plain paths are treated
             as ``file:<path>`` for the GPTQ loader. When set, CLI GPTQ values
             override any ``[gptq]`` block in ``quant_config``.
@@ -1677,6 +1784,13 @@ def main(
         decode_weight_residency: ``"disk_reload"`` keeps the legacy FP decode
             weight reload path. ``"gpu_dual"`` keeps original FP Linear weights
             in GPU-resident wrapper buffers and phase-switches by flag.
+        runtime_weight_only: Debug/sanity mode for quantized runs. If true,
+            keep GPTQ/fake-quantized weights but bypass runtime activation,
+            KV, attention nonlinear, MLP nonlinear, and RMSNorm quantization.
+        runtime_bypass_components: Optional comma-separated component list for
+            debugging runtime quantization. Valid entries: attn, ffn, mlp,
+            rms_norm, all. This bypasses the selected runtime components in
+            both prefill and decode while keeping weight quantization intact.
         attn_keywords: Module-name substrings that identify attention blocks.
             ``None`` uses the built-in defaults.
         ffn_keywords: Module-name substrings that identify FFN blocks. ``None``
@@ -1694,6 +1808,18 @@ def main(
     """
     bfcl_test_categories = _normalize_bfcl_categories(bfcl_test_categories)
     bfcl_tool_mode = _resolve_bfcl_tool_mode(bfcl_test_categories, bfcl_tool_mode)
+    bfcl_generate_mode = str(bfcl_generate_mode or "cli").lower()
+    if bfcl_generate_mode not in BFCL_GENERATE_MODES:
+        raise ValueError(f"bfcl_generate_mode must be one of {BFCL_GENERATE_MODES}, got {bfcl_generate_mode!r}.")
+    if bfcl_generate_mode == "batched":
+        if bfcl_test_categories != ["multiple"] or bfcl_tool_mode != "return":
+            raise ValueError(
+                "bfcl_generate_mode='batched' currently supports only "
+                "bfcl_test_categories='multiple' with bfcl_tool_mode='return'. "
+                "Use bfcl_generate_mode='cli' for other BFCL categories."
+            )
+        if int(bfcl_batch_size) <= 0:
+            raise ValueError("bfcl_batch_size must be positive.")
     bfcl_adapter_obj = resolve_bfcl_adapter(bfcl_adapter, model_name=model_name, model_alias=bfcl_model_alias)
     resolved_bfcl_adapter = bfcl_adapter_obj.name
     model_family = model_family.lower()
@@ -1712,19 +1838,7 @@ def main(
         )
     if decode_weight_residency == "gpu_dual" and decode_weight_mode != "fp":
         raise ValueError("decode_weight_residency='gpu_dual' requires decode_weight_mode='fp'.")
-    if decode_weight_residency == "gpu_dual" and not model_parallel:
-        raise ValueError("decode_weight_residency='gpu_dual' is only supported with model_parallel=true.")
     device_id = _normalize_device_id(device_id)
-    gpu_memory_reserve_enabled = (
-        not gpu_memory_reserve_disable
-        and gpu_memory_reserve_mb is not None
-        and int(gpu_memory_reserve_mb) > 0
-    )
-    if gpu_memory_reserve_enabled and model_parallel:
-        raise ValueError(
-            "GPU memory reservation currently supports only single-GPU eval; "
-            "disable it with --gpu_memory_reserve_disable true for model_parallel runs."
-        )
     quant_config_is_none = quant_config is None or str(quant_config).strip().lower() in {"", "none", "fp", "false"}
     if quant_config_is_none:
         quant_config = "none"
@@ -1877,12 +1991,83 @@ def main(
             "rms_norm": {**_decode_precision["rms_norm"], **decode_nonlinear_policy},
         },
     }
+    bypass_components = {
+        item.strip().lower()
+        for item in str(runtime_bypass_components or "").split(",")
+        if item.strip()
+    }
+    if "all" in bypass_components:
+        bypass_components.update({"attn", "ffn", "mlp", "rms_norm"})
+    valid_bypass_components = {
+        "attn",
+        "attn_linear",
+        "attn_core",
+        "qk",
+        "av",
+        "kv_cache",
+        "softmax",
+        "rope",
+        "ffn",
+        "mlp",
+        "rms_norm",
+    }
+    invalid_bypass_components = bypass_components - valid_bypass_components
+    if invalid_bypass_components:
+        raise ValueError(
+            f"Unsupported runtime_bypass_components={sorted(invalid_bypass_components)}; "
+            f"expected entries from {sorted(valid_bypass_components)} or 'all'."
+        )
+    if runtime_weight_only:
+        bypass_components.update(valid_bypass_components)
+
+    def _apply_runtime_bypass(phase: dict) -> dict:
+        if not bypass_components:
+            return phase
+        if quant_config_is_none:
+            raise ValueError("runtime bypass controls are only meaningful for quantized runs.")
+
+        if "attn" in bypass_components:
+            phase["attn"] = {
+                **phase.get("attn", {}),
+                "bypass": True,
+                "kv_cache": {"bypass": True},
+                "softmax": {"bypass": True},
+                "rope": {"bypass": True},
+            }
+        else:
+            attn_phase = {**phase.get("attn", {})}
+            if "attn_linear" in bypass_components:
+                attn_phase["linear_bypass"] = True
+            if "attn_core" in bypass_components or "qk" in bypass_components:
+                attn_phase["qk_matmul"] = {"bypass": True}
+            if "attn_core" in bypass_components or "av" in bypass_components:
+                attn_phase["av_matmul"] = {"bypass": True}
+            if "attn_core" in bypass_components or "kv_cache" in bypass_components:
+                attn_phase["kv_cache"] = {"bypass": True}
+            if "attn_core" in bypass_components or "softmax" in bypass_components:
+                attn_phase["softmax"] = {"bypass": True}
+            if "attn_core" in bypass_components or "rope" in bypass_components:
+                attn_phase["rope"] = {"bypass": True}
+            phase["attn"] = attn_phase
+        if "ffn" in bypass_components:
+            phase["ffn"] = {**phase.get("ffn", {}), "bypass": True}
+        if "mlp" in bypass_components:
+            phase["mlp"] = {"bypass": True}
+        if "rms_norm" in bypass_components:
+            phase["rms_norm"] = {"bypass": True}
+        return phase
+
+    _apply_runtime_bypass(phase_configs["prefill"])
+    _apply_runtime_bypass(phase_configs["decode"])
+
     precision_metadata = {
         "prefill": _prefill_precision["metadata"],
         "decode": _decode_precision["metadata"],
         "dse_mx_block_size": dse_mx_block_size,
         "dse_weight_precision": _resolved_dse_weight_precision,
         "dse_weight_block_size": _resolved_dse_weight_block_size,
+        "runtime_weight_only": bool(runtime_weight_only),
+        "runtime_bypass_components": sorted(bypass_components),
     }
 
     def _prefill_phase_from_tokens(act: str, kv: str, fp: str) -> tuple[dict, dict]:
@@ -1899,19 +2084,28 @@ def main(
             "weight_is_finite": True,
             "weight_round_mode": "rn",
         }
+        phase = {
+            "attn": {**act_cfg, "kv_cache": dict(kv_cfg), "softmax": dict(fp_cfg), "rope": dict(fp_cfg)},
+            "ffn": dict(act_cfg),
+            "mlp": dict(fp_cfg),
+            "rms_norm": rms_cfg,
+        }
         return (
-            {
-                "attn": {**act_cfg, "kv_cache": dict(kv_cfg), "softmax": dict(fp_cfg), "rope": dict(fp_cfg)},
-                "ffn": dict(act_cfg),
-                "mlp": dict(fp_cfg),
-                "rms_norm": rms_cfg,
-            },
+            _apply_runtime_bypass(phase),
             {
                 "ACT_ELEMENT_WIDTH": act_spec.canonical,
                 "KV_ELEMENT_WIDTH": kv_spec.canonical,
                 "FP_SETTING": fp_spec.canonical,
             },
         )
+
+    def _decode_phase_from_tokens(act: str, kv: str, fp: str) -> tuple[dict, dict]:
+        phase, meta = _prefill_phase_from_tokens(act, kv, fp)
+        phase["attn"] = {**phase["attn"], **decode_weight_policy}
+        phase["ffn"] = {**phase["ffn"], **decode_weight_policy}
+        phase["mlp"] = {**phase["mlp"], **decode_nonlinear_policy}
+        phase["rms_norm"] = {**phase["rms_norm"], **decode_nonlinear_policy}
+        return phase, meta
 
     _qwen3_default_precision_enabled = qwen_model_family and not quant_config_is_none
     _codesign_tokens_enabled = _qwen3_default_precision_enabled or any(v is not None for v in (
@@ -1927,6 +2121,26 @@ def main(
         parse_mx_precision(precision_metadata["prefill"]["KV_ELEMENT_WIDTH"])
         parse_mx_precision(precision_metadata["decode"]["ACT_ELEMENT_WIDTH"])
         parse_mx_precision(precision_metadata["decode"]["KV_ELEMENT_WIDTH"])
+
+    requested_attn_implementation = str(attn_implementation or "auto").strip().lower()
+    resolved_attn_implementation = resolve_attention_backend(
+        requested_attn_implementation,
+        qwen_model_family=qwen_model_family,
+        quant_config_is_none=quant_config_is_none,
+        codesign_tokens_enabled=_codesign_tokens_enabled,
+    )
+    if (
+        requested_attn_implementation == "sdpa"
+        and qwen_model_family
+        and not quant_config_is_none
+        and _codesign_tokens_enabled
+    ):
+        logger.warning(
+            "Qwen3/Qwen3-MoE quantized attention was explicitly initialized with SDPA. "
+            "PLENA unified attention-core quantization is eager-style; use "
+            "attn_implementation='auto' or 'eager' unless you are intentionally "
+            "reproducing the SDPA/eager mismatch failure mode."
+        )
 
     # ------------------------------------------------------------------
     # Print header
@@ -1950,23 +2164,20 @@ def main(
     print(f"  Tool mode  : {bfcl_tool_mode}")
     print(f"  Adapter    : {resolved_bfcl_adapter} (requested={bfcl_adapter})")
     print(f"  Family     : {model_family}")
+    print(f"  Attention  : {resolved_attn_implementation} (requested={requested_attn_implementation})")
     print(f"  Max new tok: {bfcl_max_new_tokens if bfcl_max_new_tokens is not None else 'uncapped'}")
+    print(f"  Generate   : {bfcl_generate_mode}" + (f" (batch={bfcl_batch_size})" if bfcl_generate_mode == "batched" else ""))
+    if bfcl_generate_mode == "batched":
+        print(f"  Thinking   : {'disabled' if bfcl_disable_thinking else 'enabled'}")
     print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     print(f"  Decode W   : {decode_weight_mode}")
     print(f"  Weight res : {decode_weight_residency}")
+    if bypass_components:
+        print(f"  Runtime    : bypass {','.join(sorted(bypass_components))}")
     if gptq_dataset:
         print(f"  GPTQ       : dataset={gptq_dataset}, nsamples={gptq_nsamples}, seqlen={gptq_seqlen}, max_layers={gptq_max_layers}")
         print(f"  GPTQ cache : mode={gptq_cache_mode}, dir={gptq_cache_dir or 'none'}")
     print(f"  Server     : http://{server_host}:{server_port}")
-    if gpu_memory_reserve_enabled:
-        print(
-            "  GPU reserve: "
-            f"reserve={int(gpu_memory_reserve_mb)}MB, "
-            f"wait={gpu_memory_reserve_wait_sec}s, "
-            f"chunk={gpu_memory_reserve_chunk_mb}MB"
-        )
-    else:
-        print("  GPU reserve: disabled")
     print()
     print(f"  {'':10s}  {'attn':>24s}  {'ffn':>24s}")
     print(f"  {'prefill':10s}  {_pa:>24s}  {_pf:>24s}")
@@ -2013,19 +2224,9 @@ def main(
         model_parallel,
         dtype=torch_dtype,
         device=device_id if not model_parallel else None,
+        attn_implementation=resolved_attn_implementation,
     )
     model.eval()
-
-    gpu_memory_reserve = _FixedCudaMemoryReserve(
-        device=device_id,
-        reserve_mb=int(gpu_memory_reserve_mb or 0),
-        wait_sec=gpu_memory_reserve_wait_sec,
-        poll_sec=gpu_memory_reserve_poll_sec,
-        chunk_mb=gpu_memory_reserve_chunk_mb,
-        enabled=gpu_memory_reserve_enabled,
-    )
-    gpu_memory_reserve.acquire()
-    atexit.register(gpu_memory_reserve.release)
 
     try:
         # ------------------------------------------------------------------
@@ -2115,33 +2316,54 @@ def main(
             logger.info("Quantizing %d linear layers...", n_linear)
             t0 = time.time()
             try:
-                model, _ = quantize_module_transform_pass(model, pass_args)
-                if gptq_cache is not None and not gptq_cache.hit:
-                    gptq_cache.finalize()
-                    gptq_cache_info = gptq_cache.summary()
-                    # The cache lock only protects GPTQ cache population.
-                    # Runtime wrapper installation is trial-local and can run
-                    # concurrently on other workers once metadata is complete.
-                    gptq_cache.release()
+                qwen_cache_fast_path = bool(
+                    qwen_model_family
+                    and gptq_cache is not None
+                    and gptq_cache.hit
+                    and (_codesign_tokens_enabled or qwen_model_family)
+                )
+                if qwen_cache_fast_path:
+                    logger.info("GPTQ cache hit Qwen fast path: skipping Chop transform pass.")
+                else:
+                    t_chop = time.time()
+                    model, _ = quantize_module_transform_pass(model, pass_args)
+                    logger.info("Chop quantize_module_transform_pass complete in %.1fs", time.time() - t_chop)
+                    if gptq_cache is not None and not gptq_cache.hit:
+                        gptq_cache.finalize()
+                        gptq_cache_info = gptq_cache.summary()
+                        # The cache lock only protects GPTQ cache population.
+                        # Runtime wrapper installation is trial-local and can run
+                        # concurrently on other workers once metadata is complete.
+                        gptq_cache.release()
                 if _codesign_tokens_enabled or qwen_model_family:
                     _qwen3_moe_experts_config = None
-                    if model_family == "qwen3_moe" and _prefill_precision["mlp"]:
+                    if model_family == "qwen3_moe" and phase_configs["prefill"]["mlp"]:
                         _qwen3_moe_experts_config = {
-                            **_prefill_precision["ffn"],
-                            **_prefill_precision["mlp"],
+                            **phase_configs["prefill"]["ffn"],
+                            **phase_configs["prefill"]["mlp"],
                         }
-                    unified_counts = apply_unified_mx_wrappers(
-                        model,
-                        qwen3_attention_config=_prefill_precision["attn"] if model_family == "qwen3" else None,
-                        qwen3_mlp_config=_prefill_precision["mlp"] if model_family == "qwen3" and _prefill_precision["mlp"] else None,
-                        qwen3_rms_norm_config=_prefill_precision["rms_norm"] if model_family == "qwen3" and _prefill_precision["rms_norm"] else None,
-                        qwen3_moe_attention_config=_prefill_precision["attn"] if model_family == "qwen3_moe" else None,
-                        qwen3_moe_experts_config=_qwen3_moe_experts_config,
-                        qwen3_moe_rms_norm_config=_prefill_precision["rms_norm"] if model_family == "qwen3_moe" and _prefill_precision["rms_norm"] else None,
-                    )
+                    t_unified = time.time()
+                    wrapper_kwargs = {
+                        "qwen3_attention_config": phase_configs["prefill"]["attn"] if model_family == "qwen3" else None,
+                        "qwen3_mlp_config": phase_configs["prefill"]["mlp"] if model_family == "qwen3" and phase_configs["prefill"]["mlp"] else None,
+                        "qwen3_rms_norm_config": phase_configs["prefill"]["rms_norm"] if model_family == "qwen3" and phase_configs["prefill"]["rms_norm"] else None,
+                        "qwen3_moe_attention_config": phase_configs["prefill"]["attn"] if model_family == "qwen3_moe" else None,
+                        "qwen3_moe_experts_config": _qwen3_moe_experts_config,
+                        "qwen3_moe_rms_norm_config": phase_configs["prefill"]["rms_norm"] if model_family == "qwen3_moe" and phase_configs["prefill"]["rms_norm"] else None,
+                    }
+                    if qwen_cache_fast_path:
+                        unified_counts = apply_qwen3_gptq_cache_unified_wrappers(
+                            model,
+                            attn_linear_config=phase_configs["prefill"]["attn"],
+                            ffn_linear_config=phase_configs["prefill"]["ffn"],
+                            **wrapper_kwargs,
+                        )
+                    else:
+                        unified_counts = apply_unified_mx_wrappers(model, **wrapper_kwargs)
                     logger.info(
-                        "Installed unified MX wrappers: %d Linear, %d attention (llama=%d, qwen3=%d, qwen3_moe=%d), qwen3_mlp=%d, qwen3_rms_norm=%d, qwen3_moe_experts=%d, qwen3_moe_rms_norm=%d",
+                        "Installed unified MX wrappers: %d Linear, %d direct GPTQ Linear, %d attention (llama=%d, qwen3=%d, qwen3_moe=%d), qwen3_mlp=%d, qwen3_rms_norm=%d, qwen3_moe_experts=%d, qwen3_moe_rms_norm=%d",
                         unified_counts.get("linear", 0),
+                        unified_counts.get("direct_gptq_linear", 0),
                         unified_counts.get("attention", 0),
                         unified_counts.get("llama_attention", 0),
                         unified_counts.get("qwen3_attention", 0),
@@ -2151,21 +2373,21 @@ def main(
                         unified_counts.get("qwen3_moe_experts", 0),
                         unified_counts.get("qwen3_moe_rms_norm", 0),
                     )
+                    logger.info("Unified wrapper install complete in %.1fs", time.time() - t_unified)
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
                 logger.info("Quantization complete in %.1fs", time.time() - t0)
             finally:
                 if gptq_cache is not None:
                     gptq_cache.release()
 
-            # Release the guard before any final device move or phase-switch
-            # setup. Those steps can allocate temporary tensors (for example
-            # during module.to()), so holding the fixed reserve here can leave
-            # too little headroom and OOM before BFCL generation even starts.
-            gpu_memory_reserve.release()
-
+            t_move = time.time()
             if model_parallel:
                 model = move_to_gpu(model, model_parallel)
             else:
                 model.to(device_id)
+            logger.info("Model device placement complete in %.1fs", time.time() - t_move)
 
             # ------------------------------------------------------------------
             # Enable disaggregated quantization hook
@@ -2179,23 +2401,28 @@ def main(
                 switch_kwargs["model_name"] = model_name
                 switch_kwargs["weight_residency"] = decode_weight_residency
 
+            t_switch = time.time()
             switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
             switch.enable()
+            logger.info("Phase switch setup complete in %.1fs", time.time() - t_switch)
             logger.info("\n%s", switch.summary())
 
         # ------------------------------------------------------------------
         # Start the OpenAI-compatible server (hook fires on every request)
         # ------------------------------------------------------------------
         device_str = device_id if not model_parallel else "cuda"
-        app = _build_server_app(
-            model,
-            tokenizer,
-            device_str,
-            tool_mode=bfcl_tool_mode,
-            max_new_tokens=bfcl_max_new_tokens,
-            bfcl_adapter=bfcl_adapter_obj,
-        )
-        _start_server(app, server_host, server_port)
+        if bfcl_generate_mode == "cli":
+            app = _build_server_app(
+                model,
+                tokenizer,
+                device_str,
+                tool_mode=bfcl_tool_mode,
+                max_new_tokens=bfcl_max_new_tokens,
+                bfcl_adapter=bfcl_adapter_obj,
+            )
+            _start_server(app, server_host, server_port)
+        else:
+            logger.info("Skipping local OpenAI server; using in-process batched BFCL generation.")
 
         if persistent_trials:
             persistent_results = {
@@ -2219,21 +2446,44 @@ def main(
                         str(trial_spec["kv"]),
                         str(trial_spec["fp_setting"]),
                     )
+                    decode_phase, decode_meta = _decode_phase_from_tokens(
+                        str(trial_spec.get("decode_act", trial_spec["act"])),
+                        str(trial_spec.get("decode_kv", trial_spec["kv"])),
+                        str(trial_spec.get("decode_fp_setting", trial_spec["fp_setting"])),
+                    )
                     switch.phase_configs["prefill"] = prefill_phase
+                    switch.phase_configs["decode"] = decode_phase
                     precision_metadata["prefill"] = prefill_meta
+                    precision_metadata["decode"] = decode_meta
                     switch._on_phase_transition("prefill", None)
                     switch._phase[0] = "prefill"
 
-                gen_rc = _run_bfcl_generate(
-                    model_name=model_name,
-                    test_categories=bfcl_test_categories,
-                    host=server_host,
-                    port=server_port,
-                    result_dir=trial_result_dir,
-                    num_threads=bfcl_num_threads,
-                    limit=limit,
-                    model_alias=bfcl_model_alias,
-                )
+                if bfcl_generate_mode == "batched":
+                    gen_rc = _run_batched_bfcl_multiple_generate(
+                        model=model,
+                        tokenizer=tokenizer,
+                        device=device_str,
+                        result_dir=trial_result_dir,
+                        model_name=model_name,
+                        model_alias=bfcl_model_alias,
+                        bfcl_adapter=bfcl_adapter_obj,
+                        max_new_tokens=bfcl_max_new_tokens,
+                        limit=limit,
+                        batch_size=int(bfcl_batch_size),
+                        batch_length_bucket=bool(bfcl_batch_length_bucket),
+                        disable_thinking=bool(bfcl_disable_thinking),
+                    )
+                else:
+                    gen_rc = _run_bfcl_generate(
+                        model_name=model_name,
+                        test_categories=bfcl_test_categories,
+                        host=server_host,
+                        port=server_port,
+                        result_dir=trial_result_dir,
+                        num_threads=bfcl_num_threads,
+                        limit=limit,
+                        model_alias=bfcl_model_alias,
+                    )
                 if run_evaluate:
                     eval_rc, scores = _run_bfcl_evaluate(
                         model_name=model_name,
@@ -2257,11 +2507,14 @@ def main(
                     "bfcl_tool_mode": bfcl_tool_mode,
                     "bfcl_adapter": resolved_bfcl_adapter,
                     "bfcl_adapter_requested": bfcl_adapter,
+                    "bfcl_generate_mode": bfcl_generate_mode,
+                    "bfcl_batch_size": int(bfcl_batch_size) if bfcl_generate_mode == "batched" else None,
+                    "bfcl_batch_length_bucket": bool(bfcl_batch_length_bucket) if bfcl_generate_mode == "batched" else None,
+                    "bfcl_disable_thinking": bool(bfcl_disable_thinking) if bfcl_generate_mode == "batched" else None,
                     "model_family": model_family,
                     "bfcl_max_new_tokens": bfcl_max_new_tokens,
                     "decode_weight_mode": decode_weight_mode,
                     "decode_weight_residency": decode_weight_residency,
-                    "gpu_memory_reserve": gpu_memory_reserve.summary(),
                     "gptq_cache": gptq_cache_info,
                     "persistent_trial": {
                         "trial_id": trial_spec.get("trial_id", ""),
@@ -2272,6 +2525,16 @@ def main(
                 })
                 save_results(trial_log_dir, scores)
                 persistent_results["trials"].append(scores)
+                if persistent_progress_path:
+                    progress_path = Path(persistent_progress_path)
+                    progress_path.parent.mkdir(parents=True, exist_ok=True)
+                    with progress_path.open("a", encoding="utf-8") as f:
+                        f.write(json.dumps({
+                            "trial_id": trial_spec.get("trial_id", ""),
+                            "status": "done",
+                            "time": time.time(),
+                        }, sort_keys=True) + "\n")
+                        f.flush()
 
             if switch is not None:
                 switch.disable()
@@ -2280,17 +2543,33 @@ def main(
         # ------------------------------------------------------------------
         # Step 1: bfcl generate  (calls the local server)
         # ------------------------------------------------------------------
-        print("\n[1/2] Generating BFCL responses via local server...")
-        gen_rc = _run_bfcl_generate(
-            model_name      = model_name,
-            test_categories = bfcl_test_categories,
-            host            = server_host,
-            port            = server_port,
-            result_dir      = result_dir,
-            num_threads     = bfcl_num_threads,
-            limit           = limit,
-            model_alias     = bfcl_model_alias,
-        )
+        print("\n[1/2] Generating BFCL responses...")
+        if bfcl_generate_mode == "batched":
+            gen_rc = _run_batched_bfcl_multiple_generate(
+                model=model,
+                tokenizer=tokenizer,
+                device=device_str,
+                result_dir=result_dir,
+                model_name=model_name,
+                model_alias=bfcl_model_alias,
+                bfcl_adapter=bfcl_adapter_obj,
+                max_new_tokens=bfcl_max_new_tokens,
+                limit=limit,
+                batch_size=int(bfcl_batch_size),
+                batch_length_bucket=bool(bfcl_batch_length_bucket),
+                disable_thinking=bool(bfcl_disable_thinking),
+            )
+        else:
+            gen_rc = _run_bfcl_generate(
+                model_name      = model_name,
+                test_categories = bfcl_test_categories,
+                host            = server_host,
+                port            = server_port,
+                result_dir      = result_dir,
+                num_threads     = bfcl_num_threads,
+                limit           = limit,
+                model_alias     = bfcl_model_alias,
+            )
         if gen_rc != 0:
             logger.error("bfcl generate exited with code %d", gen_rc)
 
@@ -2306,12 +2585,17 @@ def main(
                 "bfcl_tool_mode": bfcl_tool_mode,
                 "bfcl_adapter": resolved_bfcl_adapter,
                 "bfcl_adapter_requested": bfcl_adapter,
+                "bfcl_generate_mode": bfcl_generate_mode,
+                "bfcl_batch_size": int(bfcl_batch_size) if bfcl_generate_mode == "batched" else None,
+                "bfcl_batch_length_bucket": bool(bfcl_batch_length_bucket) if bfcl_generate_mode == "batched" else None,
+                "bfcl_disable_thinking": bool(bfcl_disable_thinking) if bfcl_generate_mode == "batched" else None,
                 "model_family": model_family,
+                "attn_implementation_requested": requested_attn_implementation,
+                "attn_implementation": resolved_attn_implementation,
                 "bfcl_max_new_tokens": bfcl_max_new_tokens,
                 "decode_weight_mode": decode_weight_mode,
                 "decode_weight_residency": decode_weight_residency,
                 "precision_metadata": precision_metadata,
-                "gpu_memory_reserve": gpu_memory_reserve.summary(),
             }
             if resolved_gptq_config:
                 scores["gptq"] = {
@@ -2381,12 +2665,17 @@ def main(
         scores["bfcl_tool_mode"] = bfcl_tool_mode
         scores["bfcl_adapter"] = resolved_bfcl_adapter
         scores["bfcl_adapter_requested"] = bfcl_adapter
+        scores["bfcl_generate_mode"] = bfcl_generate_mode
+        scores["bfcl_batch_size"] = int(bfcl_batch_size) if bfcl_generate_mode == "batched" else None
+        scores["bfcl_batch_length_bucket"] = bool(bfcl_batch_length_bucket) if bfcl_generate_mode == "batched" else None
+        scores["bfcl_disable_thinking"] = bool(bfcl_disable_thinking) if bfcl_generate_mode == "batched" else None
         scores["model_family"] = model_family
+        scores["attn_implementation_requested"] = requested_attn_implementation
+        scores["attn_implementation"] = resolved_attn_implementation
         scores["bfcl_max_new_tokens"] = bfcl_max_new_tokens
         scores["decode_weight_mode"] = decode_weight_mode
         scores["decode_weight_residency"] = decode_weight_residency
         scores["precision_metadata"] = precision_metadata
-        scores["gpu_memory_reserve"] = gpu_memory_reserve.summary()
         if resolved_gptq_config:
             scores["gptq"] = {
                 "dataset": resolved_gptq_config.get("dataset"),
@@ -2406,7 +2695,9 @@ def main(
         _tmpdir_ctx.cleanup()
         return scores
     finally:
-        gpu_memory_reserve.release(log=False)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
