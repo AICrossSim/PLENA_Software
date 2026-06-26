@@ -15,3 +15,5 @@ site/
 **fast-hadamard-transform/
 **calib/
 .venv
+llama_results/
+llama_logs/

@@ -318,34 +318,50 @@ def _plot(rows, front, ppl_budget) -> None:
     good = [r for r in rows if not r.get("error") and r["cont_ppl"] < PPL_PENALTY / 2]
     if not good:
         return
-    fig, ax = plt.subplots(figsize=(9, 6))
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Background scatter: all RTN trials
     for fmt, color, lbl in (("mxint", "steelblue", "MXINT (RTN)"),
-                            ("mxfp", "indianred", "MXFP (RTN)")):
+                             ("mxfp",  "indianred",  "MXFP (RTN)")):
         pts = [r for r in good if r["fmt"] == fmt and not r.get("gptq")]
         if pts:
             ax.scatter([r["cost_mb_per_token"] for r in pts], [r["cont_ppl"] for r in pts],
-                       s=16, alpha=0.35, color=color, label=f"{lbl} ({len(pts)})")
-    gptq = [r for r in good if r.get("gptq")]
-    if gptq:
-        ax.scatter([r["cost_mb_per_token"] for r in gptq], [r["cont_ppl"] for r in gptq],
-                   s=70, marker="*", color="seagreen", edgecolor="k", zorder=5,
-                   label=f"MXINT + GPTQ ({len(gptq)})")
+                       s=18, alpha=0.3, color=color, label=lbl)
+
+    # GPTQ + rotation calibrated points
+    gptq_pts = [r for r in good if r.get("gptq")]
+    if gptq_pts:
+        ax.scatter([r["cost_mb_per_token"] for r in gptq_pts], [r["cont_ppl"] for r in gptq_pts],
+                   s=90, marker="*", color="seagreen", edgecolor="k", linewidth=0.5,
+                   zorder=5, label="MXINT + GPTQ + Rotation")
+
+    # Pareto front
     pf = sorted(front, key=lambda p: p["cost_mb_per_token"])
-    ax.plot([p["cost_mb_per_token"] for p in pf], [p["cont_ppl"] for p in pf],
-            "o-", color="darkorange", linewidth=2, markersize=5,
-            label=f"usable Pareto front ({len(pf)})", zorder=6)
+    if pf:
+        ax.plot([p["cost_mb_per_token"] for p in pf], [p["cont_ppl"] for p in pf],
+                "o-", color="darkorange", linewidth=2, markersize=6, zorder=6, label="Pareto front")
+
+    # Short readable labels: W4/KV4+GPTQ  (A always 8, so omitted for brevity)
     for p in pf:
-        ax.annotate(p["tag"], (p["cost_mb_per_token"], p["cont_ppl"]),
-                    fontsize=7, alpha=0.9, rotation=18, xytext=(3, 4), textcoords="offset points")
+        w  = str(p.get("W",  "")).replace("MXINT", "W")
+        kv = str(p.get("KV", "")).replace("MXINT", "KV")
+        suffix = "+GPTQ" if p.get("gptq") else ""
+        ax.annotate(f"{w}/{kv}{suffix}",
+                    xy=(p["cost_mb_per_token"], p["cont_ppl"]),
+                    xytext=(6, 4), textcoords="offset points",
+                    fontsize=8, color="darkorange")
+
+    ax.axhline(ppl_budget, ls="--", color="gray", alpha=0.6, linewidth=1,
+               label=f"PPL budget = {ppl_budget:g}")
     ax.set_yscale("log")
-    ax.set_ylim(min(r["cont_ppl"] for r in good) * 0.95, max(60.0, ppl_budget * 3.0))  # usable knee
-    ax.axhline(ppl_budget, ls=":", color="gray", alpha=0.7, label=f"usable budget = PPL {ppl_budget:g}")
-    ax.set_xlabel("MB / token")
-    ax.set_ylabel("Continuation Perplexity (Log)")
-    ax.set_title("Decode co-design search: Accuracy vs Decode cost\n"
-                 "Llama-3.2-1B")
-    ax.grid(True, alpha=0.3, which="both")
-    ax.legend(loc="upper right", fontsize=8)
+    ax.set_ylim(min(r["cont_ppl"] for r in good) * 0.9, max(60.0, ppl_budget * 3.0))
+    ax.set_xlabel("Decode memory traffic (MB / token)", fontsize=11)
+    ax.set_ylabel("Continuation Perplexity (log scale)", fontsize=11)
+    ax.set_title("PLENA Decode Chip: Accuracy vs Memory Bandwidth\n"
+                 "Llama-3.2-1B  ·  WikiText-2 continuation perplexity", fontsize=12)
+    ax.grid(True, alpha=0.25, which="both")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.85)
     fig.tight_layout()
     out = RESULTS_DIR / "pareto.png"
     fig.savefig(out, dpi=150)
