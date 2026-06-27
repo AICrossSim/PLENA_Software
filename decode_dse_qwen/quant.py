@@ -5,12 +5,13 @@ Per PLENA's datapath, only the HBM-resident tensors are quantised -- WEIGHTS and
 ACTIVATIONS stay high-precision FP (bf16) on-chip (they are the most quantisation-sensitive). So a
 precision point is per-component over weights + KV:
 
-    spec = {fmt,              # mxint or mxfp
-            block,            # group size for the shared scale
-            attn_w,           # q/k/v/o projection weight bits
-            ffn_w,            # gate/up/down projection weight bits
-            kv}               # KV-cache bits
-    widths are int (MXINT) or (exp,frac) tuples (MXFP). Activations are NOT quantised.
+    spec = {block,            # group size for the shared scale
+            w_fmt,            # weight format (mxint|mxfp), shared by attn + ffn weights
+            attn_w,           # q/k/v/o projection weight width
+            ffn_w,            # gate/up/down projection weight width
+            kv_fmt, kv}       # KV-cache format + width -- INDEPENDENT of the weights (mixed precision)
+    widths are int (MXINT) or (exp,frac) tuples (MXFP). Activations are NOT quantised. The weight and
+    KV formats are decoupled so the search can mix them (e.g. MXINT weights + MXFP KV), as PLENA allows.
 
 The attention is quantised in two pieces because chop can't replace a plain Qwen3 attention block
 (its dispatch has no `is_qwen3` branch): the LINEARS (q/k/v/o/gate/up/down) are weight-quantised by the
@@ -54,13 +55,13 @@ def width_label(fmt: str, width) -> str:
 
 
 def spec_tag(spec: dict) -> str:
-    """One-line human label, e.g. 'attnW:MXINT4 ffnW:MXINT3 kv:MXINT4 b32 mxint+gptq (act bf16)'."""
+    """One-line human label, e.g. 'attnW:MXINT4 ffnW:MXINT3 kv:MXFP_E4M3 b32 +gptq (act bf16)'."""
     g = "+gptq" if spec.get("gptq") else ""
     g += "+erry" if spec.get("clip_search_y") else ""
     g += "+rot" if spec.get("rotation") else ""
-    L = lambda x: width_label(spec["fmt"], x)
-    return (f"attnW:{L(spec['attn_w'])} ffnW:{L(spec['ffn_w'])} kv:{L(spec['kv'])} "
-            f"b{spec['block']} {spec['fmt']}{g} (act bf16)")
+    wf, kf = spec["w_fmt"], spec["kv_fmt"]
+    return (f"attnW:{width_label(wf, spec['attn_w'])} ffnW:{width_label(wf, spec['ffn_w'])} "
+            f"kv:{width_label(kf, spec['kv'])} b{spec['block']}{g} (act bf16)")
 
 
 def element_bits(fmt: str, width) -> int:
@@ -83,7 +84,7 @@ def effective_bits(fmt: str, width, block: int) -> float:
 def _linear_cfg(fmt: str, w, block: int, gptq: bool = False) -> dict:
     """chop WEIGHT-ONLY quantised-linear config. Per PLENA (datapath characteristic i), activations
     stay high-precision FP on-chip, so we OMIT the `data_in_*` keys -- chop's linear forward then skips
-    activation quantisation and runs F.linear on the bf16 activation. Only the weight is quantised."""
+    activation quantisation and runs F.linear on the bf16 (high-precision FP) activation. Weight only."""
     if fmt == "mxint":
         cfg = {"name": "mxint", "weight_block_size": block, "weight_width": int(w)}
     else:
@@ -96,18 +97,21 @@ def _linear_cfg(fmt: str, w, block: int, gptq: bool = False) -> dict:
 
 
 def build_pass_args(spec: dict, gptq: bool = False) -> dict:
-    """chop linear pass-args giving attention and FFN their OWN weight precision (per-component)."""
+    """chop linear pass-args: attention and FFN weights share the weight format `w_fmt` but keep their
+    OWN width (per-component). KV format is independent (`kv_fmt`, handled in attn_qconfig)."""
+    wf = spec["w_fmt"]
     return {
         "by": "regex_name",
-        RE_ATTN_PROJ: {"config": _linear_cfg(spec["fmt"], spec["attn_w"], spec["block"], gptq)},
-        RE_FFN_PROJ:  {"config": _linear_cfg(spec["fmt"], spec["ffn_w"], spec["block"], gptq)},
+        RE_ATTN_PROJ: {"config": _linear_cfg(wf, spec["attn_w"], spec["block"], gptq)},
+        RE_FFN_PROJ:  {"config": _linear_cfg(wf, spec["ffn_w"], spec["block"], gptq)},
     }
 
 
 def attn_qconfig(spec: dict) -> dict:
     """q-config for the in-place attention wrapper. Per PLENA, only the KV CACHE (HBM-resident) is
-    quantised; the qk/av matmul activations stay high-precision FP -> bypassed. Softmax/RoPE bypassed."""
-    fmt, block, kv = spec["fmt"], spec["block"], spec["kv"]
+    quantised -- in its OWN format `kv_fmt` (independent of the weights). The qk/av matmul activations
+    stay high-precision FP -> bypassed; softmax/RoPE bypassed."""
+    fmt, block, kv = spec["kv_fmt"], spec["block"], spec["kv"]
     if fmt == "mxint":
         kvc = {"data_in_block_size": block, "data_in_width": int(kv)}
     else:
@@ -118,19 +122,18 @@ def attn_qconfig(spec: dict) -> dict:
 
 
 def build_gptq_pass_args(recipe: dict, spec: dict) -> dict:
-    """MXINT + GPTQ (optionally +Erry clip via clip_search_y, +rotation) pass-args for `spec`.
-
-    The linears are flagged for GPTQ calibration; `spec["calib_file"]` routes calibration at a custom
-    dataset (held-out IFEval prompts for same-task calibration). Each precision owns a checkpoint dir
-    so cached GPTQ/rotation decisions never leak across configs.
+    """MXINT + GPTQ (optionally +Erry clip via clip_search_y, +rotation) pass-args for `spec`
     """
+    assert spec["w_fmt"] == "mxint", "GPTQ is MXINT-only (the paper's de-facto for weight quant)"
+    assert spec["attn_w"] == spec["ffn_w"], \
+        "GPTQ applies one global weight width to all layers, so attn_w must equal ffn_w"
     pa = build_pass_args(spec, gptq=True)
     ckpt = f"{_CKPT_ROOT}/{spec_tag(spec).replace(' ', '_').replace('/', '-')}"
 
     gptq = deepcopy(recipe.get("gptq", {}))
     gptq["checkpoint_dir"] = ckpt
     gptq.setdefault("weight_config", {})
-    gptq["weight_config"]["weight_width"] = int(spec["ffn_w"])   # GPTQ weight width (FFN dominates)
+    gptq["weight_config"]["weight_width"] = int(spec["attn_w"])   # uniform width (== ffn_w)
     gptq["weight_config"]["weight_block_size"] = int(spec["block"])
     if spec.get("clip_search_y") is not None:
         gptq["clip_search_y"] = bool(spec["clip_search_y"])
@@ -168,10 +171,10 @@ def decode_cost(dims: dict, spec: dict, *, batch: int, s_in: int, s_out: int) ->
     IFEval-with-thinking is short-prompt / long-output, so the KV term grows with the (large) output
     length -- the decode-heavy, capacity-pressured regime PLENA targets.
     """
-    fmt, block = spec["fmt"], spec["block"]
-    attn_b = effective_bits(fmt, spec["attn_w"], block)
-    ffn_b = effective_bits(fmt, spec["ffn_w"], block)
-    kv_b = effective_bits(fmt, spec["kv"], block)
+    block = spec["block"]
+    attn_b = effective_bits(spec["w_fmt"], spec["attn_w"], block)
+    ffn_b = effective_bits(spec["w_fmt"], spec["ffn_w"], block)
+    kv_b = effective_bits(spec["kv_fmt"], spec["kv"], block)
 
     attn_el, ffn_el, head_el = _component_elements(dims)
     weight_bytes = (attn_el * attn_b + ffn_el * ffn_b + head_el * 16) / 8   # lm_head at bf16

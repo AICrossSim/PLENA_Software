@@ -95,9 +95,13 @@ def install_attention_quant(model, spec: dict) -> int:
     chop's auto-dispatch can't reach these classes. For now only the qk/av matmuls stay high-precision FP (bypassed)."""
     from chop.nn.quantized.modules.qwen3.attention import (
         Qwen3AttentionMXInt, Qwen3AttentionMXFP, Qwen3AttentionMXIntRotate)
+    # the attention wrapper quantises only the KV cache, so its class follows kv_fmt (not the weights).
     rotate = bool(spec.get("rotation"))
-    cls = Qwen3AttentionMXIntRotate if rotate else \
-        {"mxint": Qwen3AttentionMXInt, "mxfp": Qwen3AttentionMXFP}[spec["fmt"]]
+    if rotate:
+        assert spec["kv_fmt"] == "mxint", "rotation is MXINT-only (Qwen3AttentionMXIntRotate)"
+        cls = Qwen3AttentionMXIntRotate
+    else:
+        cls = {"mxint": Qwen3AttentionMXInt, "mxfp": Qwen3AttentionMXFP}[spec["kv_fmt"]]
     qcfg = quant.attn_qconfig(spec)
     for layer in model.model.layers:
         a = layer.self_attn
@@ -218,8 +222,9 @@ def build_decode_cache(kv, spec: dict, decode):
     model's per-layer devices"""
     from transformers import DynamicCache
     cache = DynamicCache()
-    # any non-MX format (the bf16 gold) means identity -- keep the prefill KV as-is, no requant.
-    q = None if spec["fmt"] not in ("mxint", "mxfp") else _kv_quantizer(spec["fmt"], spec["kv"], spec["block"])
+    # the KV cache uses its own format (kv_fmt); any non-MX value (the bf16 gold) means identity.
+    kvf = spec["kv_fmt"]
+    q = None if kvf not in ("mxint", "mxfp") else _kv_quantizer(kvf, spec["kv"], spec["block"])
     dec_layers = decode.model.layers
     for i, (k, v) in enumerate(kv):
         dev = next(dec_layers[i].parameters()).device

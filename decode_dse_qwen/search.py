@@ -1,13 +1,15 @@
 """Decode-chip precision DSE for Qwen3-32B
 
-Bayesian (Optuna TPE) multi-objective search over the PER-COMPONENT precision space -- attention-
-weight, FFN-weight, and KV each searched independently (activations are pinned to 8-bit MX, since
-they stay on-chip and cost no HBM bandwidth) -- minimising (continuation-PPL proxy, decode MB/token).
+Bayesian (Optuna TPE) multi-objective search over the per-component precision space: the weight
+format (MXINT/MXFP, shared by attention+FFN), the KV format (independent -> mixed precision), and the
+three widths -- attention-weight, FFN-weight, KV -- minimising (continuation-PPL proxy, decode
+MB/token). Activations are NOT quantised: per PLENA they stay in high-precision FP (the model compute
+dtype) on-chip, costing no HBM bandwidth.
 
-The fast PPL proxy lets the search explore hundreds of points. Then GPTQ is applied to AGGRESSIVE
-low-bit configs (which RTN can't handle and never reach the front) to rescue them, with block-wise
-clip + selective rotation. Finally STRICT IFEval accuracy (prompt + instruction) is measured on the
-Pareto frontier + the rescued points.
+The fast PPL proxy lets the search explore hundreds of points; then GPTQ rescues AGGRESSIVE low-bit
+MXINT configs (which RTN can't handle, so they never reach the front) with block-wise clip + selective
+rotation. Finally STRICT IFEval accuracy (prompt + instruction) is measured on the Pareto frontier +
+the rescued points.
 """
 
 from __future__ import annotations
@@ -30,19 +32,24 @@ PPL_PENALTY = 1.0e6   # returned for a crashed trial so the study survives
 
 
 # search space
-def suggest_spec(trial) -> dict:
-    """Sample one per-component precision point: attention-weight, FFN-weight, and KV searched
-    independently"""
-    fmt = trial.suggest_categorical("fmt", ["mxint", "mxfp"])
-    block = trial.suggest_categorical("block", quant.BLOCK_SIZES)
-    # NOTE: param names are format-suffixed ("attn_w_mxint" vs "attn_w_mxfp") because Optuna forbids
-    # one categorical name having two value spaces (ints for MXINT, format-strings for MXFP).
+def _width(trial, name: str, fmt: str):
+    """Suggest one component's width in `fmt`'s value space. Param names are format-suffixed because
+    Optuna forbids one categorical name having two value spaces (ints for MXINT, strings for MXFP)."""
     if fmt == "mxint":
-        w = lambda n: trial.suggest_categorical(f"{n}_mxint", quant.MXINT_WIDTHS)
-    else:
-        F, keys = quant.MXFP_FORMATS, list(quant.MXFP_FORMATS)
-        w = lambda n: F[trial.suggest_categorical(f"{n}_mxfp", keys)]
-    return {"fmt": fmt, "block": block, "attn_w": w("attn_w"), "ffn_w": w("ffn_w"), "kv": w("kv")}
+        return trial.suggest_categorical(f"{name}_mxint", quant.MXINT_WIDTHS)
+    return quant.MXFP_FORMATS[trial.suggest_categorical(f"{name}_mxfp", list(quant.MXFP_FORMATS))]
+
+
+def suggest_spec(trial) -> dict:
+    """Sample one precision point. Weight FORMAT (`w_fmt`, shared by attn+ffn weights) and KV FORMAT
+    (`kv_fmt`) are independent -> mixed precision (like - MXINT weights + MXFP KV). Attention-weight,
+    FFN-weight, and KV WIDTHS are searched independently. Activations are NOT searched (bf16 on-chip)."""
+    block = trial.suggest_categorical("block", quant.BLOCK_SIZES)
+    w_fmt = trial.suggest_categorical("w_fmt", ["mxint", "mxfp"])
+    kv_fmt = trial.suggest_categorical("kv_fmt", ["mxint", "mxfp"])
+    return {"block": block, "w_fmt": w_fmt, "kv_fmt": kv_fmt,
+            "attn_w": _width(trial, "attn_w", w_fmt), "ffn_w": _width(trial, "ffn_w", w_fmt),
+            "kv": _width(trial, "kv", kv_fmt)}
 
 
 def _spec_json(spec: dict) -> dict:
@@ -95,14 +102,14 @@ class Objective:
 
 
 def enqueue_anchors(study):
-    """Seed known-good per-component configs so the front is populated from trial 0 (activations are
-    pinned, so anchors set only the searched axes: weights + KV + block + fmt)."""
-    for a in [   # keys must match the format-suffixed param names in suggest_spec
-        dict(fmt="mxint", block=32, attn_w_mxint=8, ffn_w_mxint=8, kv_mxint=8),   # near-lossless
-        dict(fmt="mxint", block=32, attn_w_mxint=4, ffn_w_mxint=4, kv_mxint=4),   # uniform W4
-        dict(fmt="mxint", block=32, attn_w_mxint=8, ffn_w_mxint=4, kv_mxint=8),   # cheap FFN only
-        dict(fmt="mxint", block=32, attn_w_mxint=4, ffn_w_mxint=8, kv_mxint=4),   # cheap attn + KV
-        dict(fmt="mxfp",  block=32, attn_w_mxfp="E4M3", ffn_w_mxfp="E2M1", kv_mxfp="E4M3"),
+    """Seed known-good configs so the front is populated from trial 0. Anchors set only the searched
+    params: block, w_fmt, kv_fmt, and the format-suffixed weight/KV widths (activations aren't searched)."""
+    for a in [   # keys must match the (format-suffixed) param names in suggest_spec
+        dict(block=32, w_fmt="mxint", kv_fmt="mxint", attn_w_mxint=8, ffn_w_mxint=8, kv_mxint=8),  # near-lossless
+        dict(block=32, w_fmt="mxint", kv_fmt="mxint", attn_w_mxint=4, ffn_w_mxint=4, kv_mxint=4),  # uniform W4
+        dict(block=32, w_fmt="mxint", kv_fmt="mxint", attn_w_mxint=8, ffn_w_mxint=4, kv_mxint=8),  # cheap FFN
+        dict(block=32, w_fmt="mxint", kv_fmt="mxfp",  attn_w_mxint=4, ffn_w_mxint=4, kv_mxfp="E4M3"),  # MIXED: MXINT w + MXFP KV
+        dict(block=32, w_fmt="mxfp",  kv_fmt="mxfp",  attn_w_mxfp="E4M3", ffn_w_mxfp="E4M3", kv_mxfp="E4M3"),
     ]:
         try:
             study.enqueue_trial(a, skip_if_exists=True)
@@ -137,8 +144,9 @@ def pareto_front(rows: list[dict]) -> list[dict]:
 
 
 def aggressive_gptq_specs(k: int, block: int, rotation: bool) -> list[dict]:
-    """The AGGRESSIVE low-bit MXINT configs GPTQ should try to RESCUE"""
-    grid = [{"fmt": "mxint", "block": block, "attn_w": w, "ffn_w": w, "kv": kv,
+    """Uniform weight width (GPTQ quantises all layers to one
+    width) + block-wise clip + selective rotation. Cheapest (most aggressive) first."""
+    grid = [{"block": block, "w_fmt": "mxint", "kv_fmt": "mxint", "attn_w": w, "ffn_w": w, "kv": kv,
              "gptq": True, "clip_search_y": True, "rotation": rotation}
             for w in (3, 4) for kv in (2, 3, 4)]
     grid.sort(key=lambda s: (s["ffn_w"], s["kv"]))   # ~cost order: lower weight + KV = cheaper
@@ -194,7 +202,7 @@ def ifeval_frontier(front_specs, tok, prompt_caches, dims, gpus_n, dtype, recipe
     # unquantised gold reference (bf16 decode chip)
     gpus = disagg_serve.select_gpus(gpus_n)
     gold = disagg_serve.load_model(dtype, gpus, attn_implementation="sdpa")
-    gold_spec = {"fmt": "bf16", "block": 32, "attn_w": 16, "ffn_w": 16, "kv": "bf16"}
+    gold_spec = {"block": 32, "w_fmt": "bf16", "kv_fmt": "bf16", "attn_w": 16, "ffn_w": 16, "kv": "bf16"}
     try:
         run("GOLD (unquantised bf16)", gold, gold_spec, gpus)
     finally:

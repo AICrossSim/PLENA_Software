@@ -2,7 +2,7 @@
 
 # Qwen3-32B Decode Precision DSE Pipeline
 # Pipeline: Optuna (TPE) -> Pareto Front -> GPTQ Rescue -> IFEval Verification
-# 
+
 # Run detached & monitor:
 #   nohup bash decode_dse_qwen/run_all.sh > decode_dse_qwen/results/run.out 2>&1 &
 
@@ -23,9 +23,9 @@ mkdir -p "$HF_DATASETS_CACHE" "$HF_HOME" "$NLTK_DATA" "$MPLCONFIGDIR" decode_dse
 .venv/bin/python -m decode_dse_qwen.search \
   --n-trials 300 \
   --decode-gpus 2 \
-  --chunks 48 --chunk-len 512 \
-  --refine-gptq 5 \
-  --ifeval-subset 64 --ifeval-topk 4 --ifeval-budget 32768 \
+  --chunks 64 --chunk-len 512 \
+  --refine-gptq 3 --gptq-rotation 1 \
+  --ifeval-subset 128 --ifeval-topk 5 --ifeval-budget 16384 \
   --ppl-budget 30 \
   --storage "sqlite:///$(pwd)/decode_dse_qwen/results/study.db"
 
