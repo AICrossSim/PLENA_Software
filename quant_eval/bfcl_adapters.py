@@ -14,15 +14,18 @@ from dataclasses import dataclass
 from typing import Any
 
 BFCL_ADAPTER_NAMES = ("auto", "qwen3_fc", "llama31_fc_legacy", "raw")
+MAX_LITERAL_PARSE_CHARS = 65536
 
 
 def _loads_json_or_literal(payload: str) -> Any:
     try:
         return json.loads(payload)
-    except (json.JSONDecodeError, RecursionError):
+    except (json.JSONDecodeError, RecursionError, MemoryError):
+        if len(payload) > MAX_LITERAL_PARSE_CHARS:
+            raise ValueError("Tool payload is too large for literal parsing")
         try:
             return ast.literal_eval(payload)
-        except (SyntaxError, ValueError, TypeError, RecursionError) as exc:
+        except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError) as exc:
             raise ValueError("Unable to parse tool payload") from exc
 
 
@@ -83,7 +86,7 @@ def _parse_payload_sequence(payload: str) -> list[dict[str, Any]]:
                 _append_openai_tool_call(tool_calls, item)
         else:
             _append_openai_tool_call(tool_calls, parsed)
-    except (json.JSONDecodeError, SyntaxError, ValueError, TypeError, RecursionError):
+    except (json.JSONDecodeError, SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
         return []
     return tool_calls
 
@@ -152,7 +155,7 @@ def _parse_tool_call_tags(text: str) -> tuple[list[dict[str, Any]], str]:
     for match in matches:
         try:
             _append_openai_tool_call(tool_calls, _loads_json_or_literal(match.strip()))
-        except (json.JSONDecodeError, SyntaxError, ValueError, TypeError, RecursionError):
+        except (json.JSONDecodeError, SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
             continue
     leftover = re.sub(pattern, "", text or "", flags=re.DOTALL).strip()
     return tool_calls, leftover

@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "search_space_qwen3.yaml"
 RESULT_FIELDS = [
     "trial_id",
+    "weight_precision",
     "act",
     "kv",
     "fp_setting",
@@ -62,6 +63,7 @@ RESULT_FIELDS = [
     "act_bits_proxy",
     "kv_bits_proxy",
     "fp_bits_proxy",
+    "weight_bits_proxy",
 ]
 
 
@@ -72,6 +74,7 @@ class Trial:
     kv: str
     fp_setting: str
     index: int
+    weight_precision: str = "MXINT_8"
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -104,24 +107,70 @@ def _safe_token(text: str) -> str:
     return text.replace("/", "_").replace("=", "-").replace(",", "_")
 
 
-def _make_trial_id(act: str, kv: str, fp: str) -> str:
-    stem = f"act-{_safe_token(act)}__kv-{_safe_token(kv)}__fp-{_safe_token(fp)}"
+def _default_weight_precision(cfg: dict[str, Any]) -> str:
+    gptq = cfg.get("gptq", {})
+    if gptq.get("dse_weight_precision"):
+        return str(gptq["dse_weight_precision"])
+    fmt = str(gptq.get("format", "mxint")).lower()
+    if fmt == "mxfp":
+        exp = gptq.get("weight_exponent_width")
+        frac = gptq.get("weight_frac_width")
+        if exp is not None and frac is not None:
+            return f"MXFP_E{int(exp)}M{int(frac)}"
+    return f"MXINT_{int(gptq.get('weight_width', 8))}"
+
+
+def _make_trial_id(weight: str, act: str, kv: str, fp: str, *, include_weight: bool) -> str:
+    pieces = []
+    if include_weight:
+        pieces.append(f"w-{_safe_token(weight)}")
+    pieces += [f"act-{_safe_token(act)}", f"kv-{_safe_token(kv)}", f"fp-{_safe_token(fp)}"]
+    stem = "__".join(pieces)
     return f"{stem}__{_short_hash(stem)}"
 
 
 def build_trials(cfg: dict[str, Any]) -> list[Trial]:
     space = cfg.get("search_space", {})
+    include_weight = "WEIGHT" in space
+    weights = _as_list(space["WEIGHT"]) if include_weight else [_default_weight_precision(cfg)]
     acts = _as_list(space.get("ACT", []))
     kvs = _as_list(space.get("KV", []))
     fps = _as_list(space.get("FP_SETTING", []))
     trials: list[Trial] = []
     idx = 0
-    for act in acts:
-        for kv in kvs:
-            for fp in fps:
-                trials.append(Trial(_make_trial_id(act, kv, fp), act, kv, fp, idx))
-                idx += 1
+    for weight in weights:
+        for act in acts:
+            for kv in kvs:
+                for fp in fps:
+                    trials.append(
+                        Trial(
+                            trial_id=_make_trial_id(
+                                weight,
+                                act,
+                                kv,
+                                fp,
+                                include_weight=include_weight,
+                            ),
+                            act=act,
+                            kv=kv,
+                            fp_setting=fp,
+                            index=idx,
+                            weight_precision=weight,
+                        )
+                    )
+                    idx += 1
     return trials
+
+
+def _group_trials_by_weight(trials: list[Trial]) -> list[list[Trial]]:
+    groups: list[list[Trial]] = []
+    by_weight: dict[str, list[Trial]] = {}
+    for trial in trials:
+        if trial.weight_precision not in by_weight:
+            by_weight[trial.weight_precision] = []
+            groups.append(by_weight[trial.weight_precision])
+        by_weight[trial.weight_precision].append(trial)
+    return groups
 
 
 def _parse_gptq_max_layers(value: str | None, default: Any) -> int | None:
@@ -204,6 +253,61 @@ def _fp_bits(token: str) -> int:
     return 0
 
 
+def _mxfp_exp_frac(token: str) -> tuple[int, int]:
+    if not token.startswith("MXFP_E"):
+        raise ValueError(f"Expected MXFP precision token, got {token!r}")
+    body = token.removeprefix("MXFP_E")
+    exp_s, frac_s = body.split("M", 1)
+    return int(exp_s), int(frac_s)
+
+
+def _cache_dir_for_weight(gptq: dict[str, Any], weight_precision: str) -> str | None:
+    cache_dirs = gptq.get("cache_dirs")
+    if isinstance(cache_dirs, dict) and weight_precision in cache_dirs:
+        return str(cache_dirs[weight_precision])
+    template = gptq.get("cache_dir_template")
+    if template:
+        lower = weight_precision.lower().replace("mxfp_", "mxfp_")
+        compact = lower.replace("mxfp_", "")
+        return str(template).format(
+            weight_precision=weight_precision,
+            weight_precision_lower=lower,
+            weight_precision_compact=compact,
+        )
+    if gptq.get("cache_dir"):
+        return str(gptq.get("cache_dir"))
+    return None
+
+
+def _cfg_for_trial_weight(cfg: dict[str, Any], trial: Trial) -> dict[str, Any]:
+    """Return a shallow config copy with GPTQ fields patched for trial weight."""
+    patched = dict(cfg)
+    gptq = dict(cfg.get("gptq", {}))
+    weight = trial.weight_precision
+    if weight.startswith("MXFP_E"):
+        exp, frac = _mxfp_exp_frac(weight)
+        gptq["format"] = "mxfp"
+        gptq["weight_width"] = _mx_bits(weight)
+        gptq["weight_exponent_width"] = exp
+        gptq["weight_frac_width"] = frac
+        gptq["dse_weight_precision"] = weight
+        gptq["dse_weight_block_size"] = gptq.get("dse_weight_block_size", gptq.get("weight_block_size", 32))
+    elif weight.startswith("MXINT_"):
+        gptq["format"] = "mxint"
+        gptq["weight_width"] = int(weight.rsplit("_", 1)[1])
+        gptq["dse_weight_precision"] = weight
+        gptq["dse_weight_block_size"] = gptq.get("dse_weight_block_size", gptq.get("weight_block_size", 32))
+        gptq.pop("weight_exponent_width", None)
+        gptq.pop("weight_frac_width", None)
+    else:
+        raise ValueError(f"Unsupported WEIGHT precision token: {weight!r}")
+    cache_dir = _cache_dir_for_weight(gptq, weight)
+    if cache_dir:
+        gptq["cache_dir"] = cache_dir
+    patched["gptq"] = gptq
+    return patched
+
+
 def _proxy_cost(act: str, kv: str, fp: str) -> tuple[int, int, int, int]:
     act_b = _mx_bits(act)
     kv_b = _mx_bits(kv)
@@ -267,13 +371,14 @@ def _upsert_csv(path: Path, row: dict[str, Any], lock: threading.Lock) -> None:
 
 def _write_design_space(path: Path, trials: list[Trial]) -> None:
     with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["trial_id", "index", "act", "kv", "fp_setting", "proxy_cost", "act_bits_proxy", "kv_bits_proxy", "fp_bits_proxy"])
+        writer = csv.DictWriter(f, fieldnames=["trial_id", "index", "weight_precision", "act", "kv", "fp_setting", "proxy_cost", "act_bits_proxy", "kv_bits_proxy", "fp_bits_proxy", "weight_bits_proxy"])
         writer.writeheader()
         for t in trials:
             pc, ab, kb, fb = _proxy_cost(t.act, t.kv, t.fp_setting)
             writer.writerow({
                 "trial_id": t.trial_id,
                 "index": t.index,
+                "weight_precision": t.weight_precision,
                 "act": t.act,
                 "kv": t.kv,
                 "fp_setting": t.fp_setting,
@@ -281,6 +386,7 @@ def _write_design_space(path: Path, trials: list[Trial]) -> None:
                 "act_bits_proxy": ab,
                 "kv_bits_proxy": kb,
                 "fp_bits_proxy": fb,
+                "weight_bits_proxy": _mx_bits(t.weight_precision),
             })
 
 
@@ -409,7 +515,8 @@ def _cleanup_trial_tmp(trial_dir: Path, compact: bool) -> None:
 def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int, args: argparse.Namespace) -> list[str]:
     model = cfg["model"]
     bfcl = cfg.get("bfcl", {})
-    gptq = cfg.get("gptq", {})
+    trial_cfg = _cfg_for_trial_weight(cfg, trial)
+    gptq = trial_cfg.get("gptq", {})
     runtime = cfg.get("runtime", {})
     model_parallel = _model_parallel_enabled(cfg)
     quant_config_is_none = _quant_config_is_none(model)
@@ -478,6 +585,14 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
             "--gptq_weight_block_size", str(gptq.get("weight_block_size", 32)),
             "--gptq_cali_batch_size", str(gptq.get("cali_batch_size", 1)),
         ]
+        if gptq.get("weight_exponent_width") is not None:
+            cmd += ["--gptq_weight_exponent_width", str(gptq.get("weight_exponent_width"))]
+        if gptq.get("weight_frac_width") is not None:
+            cmd += ["--gptq_weight_frac_width", str(gptq.get("weight_frac_width"))]
+        if gptq.get("dse_weight_precision") is not None:
+            cmd += ["--dse_weight_precision", str(gptq.get("dse_weight_precision"))]
+        if gptq.get("dse_weight_block_size") is not None:
+            cmd += ["--dse_weight_block_size", str(gptq.get("dse_weight_block_size"))]
         if bool(gptq.get("device_map_aware", False)):
             cmd += ["--gptq_device_map_aware", "true"]
     if not quant_config_is_none and gptq.get("cache_dir"):
@@ -496,7 +611,8 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
 def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, port: int, args: argparse.Namespace) -> dict[str, Any]:
     trial_dir.mkdir(parents=True, exist_ok=True)
     cmd = _base_command(cfg, trial, trial_dir, port, args)
-    gptq = cfg.get("gptq", {})
+    trial_cfg = _cfg_for_trial_weight(cfg, trial)
+    gptq = trial_cfg.get("gptq", {})
     runtime = cfg.get("runtime", {})
     parallel_mode = _parallel_mode(cfg)
     model_lifecycle = _model_lifecycle(cfg)
@@ -520,6 +636,7 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
 
     _write_json(trial_dir / "trial_config.json", {
         "trial": trial.__dict__,
+        "weight_precision": trial.weight_precision,
         "gpu": gpu,
         "visible_gpus": str(gpu),
         "parallel_mode": parallel_mode,
@@ -571,6 +688,7 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
     pc, ab, kb, fb = _proxy_cost(trial.act, trial.kv, trial.fp_setting)
     row = {
         "trial_id": trial.trial_id,
+        "weight_precision": trial.weight_precision,
         "act": trial.act,
         "kv": trial.kv,
         "fp_setting": trial.fp_setting,
@@ -600,6 +718,7 @@ def _run_trial(cfg: dict[str, Any], trial: Trial, trial_dir: Path, gpu: str, por
         "act_bits_proxy": ab,
         "kv_bits_proxy": kb,
         "fp_bits_proxy": fb,
+        "weight_bits_proxy": _mx_bits(trial.weight_precision),
     }
     _write_json(trial_dir / "status.json", row)
     if (trial_dir / "results.json").exists():
@@ -623,6 +742,9 @@ def _run_persistent_trial_group(
 ) -> list[dict[str, Any]]:
     if not pending:
         return []
+    group_weights = {trial.weight_precision for trial in pending}
+    if len(group_weights) != 1:
+        raise ValueError(f"Persistent trial group must use one weight precision, got {sorted(group_weights)}")
     model = cfg["model"]
     bfcl = cfg.get("bfcl", {})
     gptq = cfg.get("gptq", {})
@@ -673,6 +795,7 @@ def _run_persistent_trial_group(
         trial_dir.mkdir(parents=True, exist_ok=True)
         trial_specs.append({
             "trial_id": trial.trial_id,
+            "weight_precision": trial.weight_precision,
             "act": trial.act,
             "kv": trial.kv,
             "fp_setting": trial.fp_setting,
@@ -683,6 +806,7 @@ def _run_persistent_trial_group(
         })
         _write_json(trial_dir / "trial_config.json", {
             "trial": trial.__dict__,
+            "weight_precision": trial.weight_precision,
             "gpu": visible_gpus,
             "visible_gpus": visible_gpus,
             "parallel_mode": parallel_mode,
@@ -729,12 +853,16 @@ def _run_persistent_trial_group(
         gptq_seqlen=int(gptq.get("seqlen", 1024)),
         gptq_format=str(gptq.get("format", "mxint")),
         gptq_weight_width=int(gptq.get("weight_width", 8)),
+        gptq_weight_exponent_width=gptq.get("weight_exponent_width"),
+        gptq_weight_frac_width=gptq.get("weight_frac_width"),
         gptq_weight_block_size=int(gptq.get("weight_block_size", 32)),
         gptq_cali_batch_size=int(gptq.get("cali_batch_size", 1)),
         gptq_max_layers=gptq_max_layers,
         gptq_device_map_aware=bool(gptq.get("device_map_aware", False)),
         gptq_cache_dir=str(gptq.get("cache_dir", "")) or None,
         gptq_cache_mode=str(gptq.get("cache_mode", "off")),
+        dse_weight_precision=gptq.get("dse_weight_precision"),
+        dse_weight_block_size=gptq.get("dse_weight_block_size"),
         limit=limit,
         persistent_trials=trial_specs,
         persistent_progress_path=str(progress_jsonl) if progress_jsonl is not None else None,
@@ -755,6 +883,7 @@ def _run_persistent_trial_group(
         gptq_cache = scores.get("gptq_cache", {}) if isinstance(scores.get("gptq_cache"), dict) else {}
         row = {
             "trial_id": trial.trial_id,
+            "weight_precision": trial.weight_precision,
             "act": trial.act,
             "kv": trial.kv,
             "fp_setting": trial.fp_setting,
@@ -784,6 +913,7 @@ def _run_persistent_trial_group(
             "act_bits_proxy": ab,
             "kv_bits_proxy": kb,
             "fp_bits_proxy": fb,
+            "weight_bits_proxy": _mx_bits(trial.weight_precision),
         }
         _write_json(trial_dir / "status.json", row)
         rows.append(row)
@@ -801,19 +931,22 @@ def _run_persistent_trials(
         return
     if _parallel_mode(cfg) != "pp":
         raise ValueError("runtime.model_lifecycle='persistent' with multiworker should use the multiworker worker pool.")
-    rows = _run_persistent_trial_group(
-        cfg,
-        pending,
-        run_dir,
-        args,
-        visible_gpus=",".join(_split_csv(args.gpus) or ["0"]),
-        port=int(args.base_port),
-        parallel_mode="pp",
-        model_parallel=True,
-    )
     csv_lock = threading.Lock()
-    for row in rows:
-        _upsert_csv(results_csv, row, csv_lock)
+    visible_gpus = ",".join(_split_csv(args.gpus) or ["0"])
+    for group in _group_trials_by_weight(pending):
+        group_cfg = _cfg_for_trial_weight(cfg, group[0])
+        rows = _run_persistent_trial_group(
+            group_cfg,
+            group,
+            run_dir,
+            args,
+            visible_gpus=visible_gpus,
+            port=int(args.base_port),
+            parallel_mode="pp",
+            model_parallel=True,
+        )
+        for row in rows:
+            _upsert_csv(results_csv, row, csv_lock)
 
 
 def _failure_row_for_persistent_trial(
@@ -831,6 +964,7 @@ def _failure_row_for_persistent_trial(
     pc, ab, kb, fb = _proxy_cost(trial.act, trial.kv, trial.fp_setting)
     row = {
         "trial_id": trial.trial_id,
+        "weight_precision": trial.weight_precision,
         "act": trial.act,
         "kv": trial.kv,
         "fp_setting": trial.fp_setting,
@@ -860,10 +994,12 @@ def _failure_row_for_persistent_trial(
         "act_bits_proxy": ab,
         "kv_bits_proxy": kb,
         "fp_bits_proxy": fb,
+        "weight_bits_proxy": _mx_bits(trial.weight_precision),
     }
     _write_json(trial_dir / "status.json", row)
     _write_json(trial_dir / "trial_config.json", {
         "trial": trial.__dict__,
+        "weight_precision": trial.weight_precision,
         "gpu": gpu,
         "visible_gpus": gpu,
         "parallel_mode": _parallel_mode(cfg),
@@ -911,6 +1047,7 @@ def _completed_row_for_persistent_trial(
     status = "success" if gen_rc == 0 and eval_rc in {"", 0} else "failed"
     row = {
         "trial_id": trial.trial_id,
+        "weight_precision": trial.weight_precision,
         "act": trial.act,
         "kv": trial.kv,
         "fp_setting": trial.fp_setting,
@@ -940,11 +1077,13 @@ def _completed_row_for_persistent_trial(
         "act_bits_proxy": ab,
         "kv_bits_proxy": kb,
         "fp_bits_proxy": fb,
+        "weight_bits_proxy": _mx_bits(trial.weight_precision),
     }
     _write_json(trial_dir / "status.json", row)
     if not (trial_dir / "trial_config.json").exists():
         _write_json(trial_dir / "trial_config.json", {
             "trial": trial.__dict__,
+            "weight_precision": trial.weight_precision,
             "gpu": gpu,
             "visible_gpus": gpu,
             "parallel_mode": _parallel_mode(cfg),
@@ -985,18 +1124,27 @@ def _persistent_worker_process(
                 f"trials={len(trials)}, port={port}",
                 flush=True,
             )
-            rows = _run_persistent_trial_group(
-                cfg,
-                trials,
-                run_dir,
-                args,
-                visible_gpus=str(gpu),
-                port=port,
-                parallel_mode="multiworker",
-                model_parallel=False,
-                worker_idx=worker_idx,
-                progress_jsonl=progress_jsonl,
-            )
+            for group in _group_trials_by_weight(trials):
+                group_cfg = _cfg_for_trial_weight(cfg, group[0])
+                print(
+                    f"Worker {worker_idx}: loading weight={group[0].weight_precision}, "
+                    f"trials={len(group)}",
+                    flush=True,
+                )
+                rows.extend(
+                    _run_persistent_trial_group(
+                        group_cfg,
+                        group,
+                        run_dir,
+                        args,
+                        visible_gpus=str(gpu),
+                        port=port,
+                        parallel_mode="multiworker",
+                        model_parallel=False,
+                        worker_idx=worker_idx,
+                        progress_jsonl=progress_jsonl,
+                    )
+                )
             seen = {str(row.get("trial_id", "")) for row in rows}
             for trial in trials:
                 if trial.trial_id not in seen:

@@ -136,6 +136,8 @@ def main(
     gptq_seqlen: int = 1024,
     gptq_format: str = "mxint",
     gptq_weight_width: int = 8,
+    gptq_weight_exponent_width: int | None = None,
+    gptq_weight_frac_width: int | None = None,
     gptq_weight_block_size: int = 32,
     gptq_cali_batch_size: int = 1,
     gptq_max_layers: int | None = None,
@@ -242,7 +244,7 @@ def main(
         "prefill": prefill["metadata"],
         "decode": decode["metadata"],
         "dse_mx_block_size": dse_mx_block_size,
-        "dse_weight_precision": dse_weight_precision or (f"MXINT_{gptq_weight_width}" if gptq_dataset else "MXINT_8"),
+        "dse_weight_precision": dse_weight_precision or (f"MXINT_{gptq_weight_width}" if gptq_dataset and gptq_format.lower() == "mxint" else "MXINT_8"),
         "dse_weight_block_size": dse_weight_block_size if dse_weight_block_size is not None else (gptq_weight_block_size if gptq_dataset else None),
     }
     qwen3_default_precision_enabled = qwen_model_family and not quant_config_is_none
@@ -318,6 +320,8 @@ def main(
             seqlen=gptq_seqlen,
             fmt=gptq_format,
             weight_width=gptq_weight_width,
+            weight_exponent_width=gptq_weight_exponent_width,
+            weight_frac_width=gptq_weight_frac_width,
             weight_block_size=gptq_weight_block_size,
             cali_batch_size=gptq_cali_batch_size,
             max_layers=gptq_max_layers,

@@ -41,6 +41,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Sequence, Union
 
@@ -997,6 +998,8 @@ def _inject_gptq_config(
     seqlen: int,
     fmt: str,
     weight_width: int,
+    weight_exponent_width: int | None,
+    weight_frac_width: int | None,
     weight_block_size: int,
     cali_batch_size: int,
     max_layers: int | None,
@@ -1017,6 +1020,16 @@ def _inject_gptq_config(
         raise ValueError("gptq_cali_batch_size must be positive.")
 
     gptq_cfg = dict(pass_args.get("gptq", {}))
+    weight_config = {
+        **dict(gptq_cfg.get("weight_config", {})),
+        "weight_width": weight_width,
+        "weight_block_size": weight_block_size,
+    }
+    if weight_exponent_width is not None:
+        weight_config["weight_exponent_width"] = int(weight_exponent_width)
+    if weight_frac_width is not None:
+        weight_config["weight_frac_width"] = int(weight_frac_width)
+
     gptq_cfg.update({
         "model_name": model_name,
         "device": device_id,
@@ -1024,11 +1037,7 @@ def _inject_gptq_config(
         "nsamples": nsamples,
         "seqlen": seqlen,
         "format": fmt,
-        "weight_config": {
-            **dict(gptq_cfg.get("weight_config", {})),
-            "weight_width": weight_width,
-            "weight_block_size": weight_block_size,
-        },
+        "weight_config": weight_config,
         "cali_batch_size": cali_batch_size,
         "device_map_aware": bool(device_map_aware),
     })
@@ -1167,18 +1176,80 @@ class _GptqWeightCache:
     def load(self, model) -> int:
         from safetensors.torch import load_file
 
-        for layer_idx in self.expected_layers:
-            layer_state = load_file(str(self._layer_path(layer_idx)))
-            model_state = {
-                f"model.layers.{layer_idx}.{name}": value
-                for name, value in layer_state.items()
-            }
-            model.load_state_dict(model_state, strict=False)
+        decoder = getattr(model, "model", None)
+        layers = getattr(decoder, "layers", None)
+        direct_layer_load = layers is not None and all(
+            0 <= layer_idx < len(layers) for layer_idx in self.expected_layers
+        )
+        if direct_layer_load:
+            logger.info(
+                "Loading GPTQ cache directly into %d decoder layers with one-layer I/O prefetch",
+                len(self.expected_layers),
+            )
+        else:
+            logger.warning(
+                "Model does not expose model.layers for direct GPTQ cache loading; "
+                "falling back to whole-model state_dict loading."
+            )
+
+        started = time.perf_counter()
+        total = len(self.expected_layers)
+
+        # Keep only one layer prefetched: layer checkpoints are large for MoE
+        # models, so an unbounded parallel map would create a severe RAM spike.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="gptq-cache") as executor:
+            next_future = None
+            for position, layer_idx in enumerate(self.expected_layers, start=1):
+                layer_started = time.perf_counter()
+                if next_future is None:
+                    layer_state = load_file(str(self._layer_path(layer_idx)))
+                else:
+                    layer_state = next_future.result()
+
+                if position < total:
+                    next_layer_idx = self.expected_layers[position]
+                    next_future = executor.submit(
+                        load_file, str(self._layer_path(next_layer_idx))
+                    )
+                else:
+                    next_future = None
+
+                if direct_layer_load:
+                    incompatible = layers[layer_idx].load_state_dict(layer_state, strict=False)
+                    unexpected = list(getattr(incompatible, "unexpected_keys", ()))
+                    if unexpected:
+                        raise RuntimeError(
+                            f"GPTQ cache layer {layer_idx} has unexpected keys: "
+                            f"{unexpected[:8]}"
+                        )
+                else:
+                    model_state = {
+                        f"model.layers.{layer_idx}.{name}": value
+                        for name, value in layer_state.items()
+                    }
+                    incompatible = model.load_state_dict(model_state, strict=False)
+                    unexpected = list(getattr(incompatible, "unexpected_keys", ()))
+                    if unexpected:
+                        raise RuntimeError(
+                            f"GPTQ cache layer {layer_idx} has unexpected keys: "
+                            f"{unexpected[:8]}"
+                        )
+
+                del layer_state
+                if position == 1 or position == total or position % 5 == 0:
+                    logger.info(
+                        "Loaded GPTQ cache layer %d/%d (decoder layer %d) in %.1fs",
+                        position,
+                        total,
+                        layer_idx,
+                        time.perf_counter() - layer_started,
+                    )
         self.hit = True
         self.loaded_layers = len(self.expected_layers)
         logger.info(
-            "GPTQ cache hit: loaded %d cached layers, skipping GPTQ (key=%s)",
+            "GPTQ cache hit: loaded %d cached layers in %.1fs, skipping GPTQ (key=%s)",
             self.loaded_layers,
+            time.perf_counter() - started,
             self.key,
         )
         return self.loaded_layers
@@ -1483,7 +1554,7 @@ def _run_batched_bfcl_multiple_generate(
                             result_text = bfcl_adapter.return_text_from_tool_calls(tool_calls, raw_text=raw_text)
                         else:
                             result_text = bfcl_adapter.normalize_return_text(raw_text)
-                    except (RecursionError, ValueError, TypeError) as exc:
+                    except (RecursionError, ValueError, TypeError, MemoryError) as exc:
                         logger.warning(
                             "BFCL adapter failed for sample %s; preserving raw output for scoring: %s",
                             rows[idx].get("id"),
@@ -1671,6 +1742,8 @@ def main(
     gptq_seqlen:           int = 1024,
     gptq_format:           str = "mxint",
     gptq_weight_width:     int = 8,
+    gptq_weight_exponent_width: int | None = None,
+    gptq_weight_frac_width: int | None = None,
     gptq_weight_block_size:int = 32,
     gptq_cali_batch_size:  int = 1,
     gptq_max_layers:       int | None = None,
@@ -1763,6 +1836,8 @@ def main(
         gptq_seqlen: GPTQ calibration sequence length.
         gptq_format: GPTQ target format, for example ``"mxint"``.
         gptq_weight_width: GPTQ quantized weight width.
+        gptq_weight_exponent_width/gptq_weight_frac_width: GPTQ MXFP element
+            exponent/fraction widths when ``gptq_format="mxfp"``.
         gptq_weight_block_size: GPTQ quantized weight block size.
         gptq_cali_batch_size: GPTQ calibration batch size.
         gptq_max_layers: Optional layer cap for quick smoke tests.
@@ -1998,6 +2073,7 @@ def main(
     }
     if "all" in bypass_components:
         bypass_components.update({"attn", "ffn", "mlp", "rms_norm"})
+        bypass_components.discard("all")
     valid_bypass_components = {
         "attn",
         "attn_linear",
@@ -2265,6 +2341,8 @@ def main(
                 seqlen=gptq_seqlen,
                 fmt=gptq_format,
                 weight_width=gptq_weight_width,
+                weight_exponent_width=gptq_weight_exponent_width,
+                weight_frac_width=gptq_weight_frac_width,
                 weight_block_size=gptq_weight_block_size,
                 cali_batch_size=gptq_cali_batch_size,
                 max_layers=gptq_max_layers,

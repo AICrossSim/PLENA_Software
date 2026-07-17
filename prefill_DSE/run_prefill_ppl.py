@@ -354,6 +354,14 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, args: argp
             "--gptq_cali_batch_size", str(gptq.get("cali_batch_size", 1)),
             "--gptq_cache_mode", str(gptq_cache_mode),
         ]
+        if gptq.get("weight_exponent_width") is not None:
+            cmd += ["--gptq_weight_exponent_width", str(gptq.get("weight_exponent_width"))]
+        if gptq.get("weight_frac_width") is not None:
+            cmd += ["--gptq_weight_frac_width", str(gptq.get("weight_frac_width"))]
+        if gptq.get("dse_weight_precision") is not None:
+            cmd += ["--dse_weight_precision", str(gptq.get("dse_weight_precision"))]
+        if gptq.get("dse_weight_block_size") is not None:
+            cmd += ["--dse_weight_block_size", str(gptq.get("dse_weight_block_size"))]
         if bool(gptq.get("device_map_aware", False)):
             cmd += ["--gptq_device_map_aware", "true"]
     if not quant_config_is_none and gptq.get("cache_dir"):
