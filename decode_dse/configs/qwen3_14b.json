@@ -1,0 +1,173 @@
+{
+  "_comment": "Decode-chip DSE for Qwen3-14B. Full mixed-precision space: MXINT and MXFP searched on weights, KV and activations. The weights-stay-MXINT rule was derived on the shared prefill+decode chip; the dedicated decode chip re-derives it, since at equal element width the format is free on the HBM stream. GPTQ + Erry clip weights, selective rotation on activations/KV, task-aligned calibration. Search objectives are the analytic model's end-to-end TPS/TPOT on the fixed reference chip; co-design runs in Stage B.",
+  "model_name": "Qwen/Qwen3-14B",
+  "sim_model": "qwen3-14b",
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "local_files_only": true,
+  "output_dir": "results/decode_dse",
+  "reference_workload": {
+    "batch": 256,
+    "input_seq": 1024,
+    "output_seq": 3072,
+    "hbm_gen": "HBM2",
+    "hbm_channels": 32
+  },
+  "search": {
+    "weight_w": [
+      2,
+      3,
+      4,
+      8,
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "kv": [
+      "MXINT2",
+      "MXINT3",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "act_w": [
+      "MXINT2",
+      "MXINT3",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "block": [
+      16,
+      32
+    ],
+    "mixed_weight": false,
+    "front_fp_setting": [
+      null,
+      [
+        3,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        6,
+        5
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        4,
+        7
+      ],
+      [
+        8,
+        5
+      ]
+    ],
+    "fp_setting_attention": true,
+    "quant_attn_matmuls": true
+  },
+  "search_budget": 400,
+  "sampler": "nsga2",
+  "use_rotation": true,
+  "fp_ppl_tol": 0.01,
+  "gptq": {
+    "nsamples": 64,
+    "seqlen": 1024,
+    "cali_batch_size": 8
+  },
+  "eval_ppl_nsamples": 40,
+  "eval_ppl_seqlen": 2048,
+  "tasks": [
+    "gsm8k",
+    "ifeval"
+  ],
+  "task_limit": 250,
+  "task_batch_size": 8,
+  "front_size": 6,
+  "hardware_space": {
+    "MLEN": [
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024
+    ],
+    "BLEN": [
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "HLEN": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "BATCH": [
+      1,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "HBM_CHANNELS": [
+      8,
+      16,
+      32,
+      64,
+      128
+    ],
+    "hbm_gen": "HBM2"
+  },
+  "n_chips": 1,
+  "baseline_hbm_channels": 32,
+  "seed": 0,
+  "_gpu_comment": "Shared A6000s: each trial picks the freest GPU at spawn. RTN PPL-only workers collapse the FP bank (~1x model resident, ~19 GiB peak); GPTQ/rotation + task workers keep both phase banks (~2x model + generation KV).",
+  "gpu_min_free_mb": 21000,
+  "gpu_min_free_mb_calibrated": 36000,
+  "_scratch_comment": "GPTQ/rotation weight banks are ~14 GiB each (per-layer safetensors). Root /tmp has only ~16 GiB free — too small for even one bank, which is what caused the 'No space left on device' Stage-2 failures. /home has ~96 GiB free and is writable; banks are transient (cleared after use) so peak stays ~1-2 banks.",
+  "scratch_dir": "/home/sr1325/decode_dse_scratch",
+  "reference_chip": {
+    "MLEN": 2048,
+    "BLEN": 32,
+    "VLEN": 2048,
+    "HLEN": 128
+  },
+  "bw_model": "calibrated",
+  "front_fp_setting": [
+    null,
+    [
+      5,
+      6
+    ],
+    [
+      4,
+      7
+    ]
+  ],
+  "trust_remote_code": true,
+  "out_dir": "results/decode_dse/Qwen3-14B"
+}

@@ -1,0 +1,146 @@
+{
+  "_comment": "Decode-chip DSE for Llama-3.2-1B. Same recipe and search space as llama3_8b (MXINT weights + GPTQ + Erry clip, selective rotation on activations/KV, task-aligned calibration); small enough to run every recipe end to end.",
+  "model_name": "meta-llama/Llama-3.2-1B-Instruct",
+  "sim_model": "llama-3.2-1b",
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "local_files_only": true,
+  "output_dir": "results/decode_dse",
+  "reference_workload": {
+    "batch": 4,
+    "input_seq": 1024,
+    "output_seq": 3072
+  },
+  "search": {
+    "weight_w": [
+      2,
+      3,
+      4,
+      8,
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "kv": [
+      "MXINT2",
+      "MXINT3",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "act_w": [
+      "MXINT2",
+      "MXINT3",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "block": [
+      16,
+      32
+    ],
+    "mixed_weight": false,
+    "front_fp_setting": [
+      null,
+      [
+        3,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        6,
+        5
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        4,
+        7
+      ],
+      [
+        8,
+        5
+      ]
+    ],
+    "fp_setting_attention": true,
+    "quant_attn_matmuls": true
+  },
+  "search_budget": 400,
+  "sampler": "nsga2",
+  "use_rotation": true,
+  "fp_ppl_tol": 0.01,
+  "gptq": {
+    "nsamples": 64,
+    "seqlen": 1024,
+    "cali_batch_size": 8
+  },
+  "eval_ppl_nsamples": 40,
+  "eval_ppl_seqlen": 2048,
+  "tasks": [
+    "gsm8k",
+    "ifeval"
+  ],
+  "task_limit": 250,
+  "task_batch_size": 16,
+  "front_size": 6,
+  "hardware_space": {
+    "MLEN": [
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024
+    ],
+    "BLEN": [
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "HLEN": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "BATCH": [
+      1,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "HBM_CHANNELS": [
+      8,
+      16,
+      32,
+      64,
+      128
+    ],
+    "hbm_gen": "HBM2"
+  },
+  "n_chips": 1,
+  "baseline_hbm_channels": 32,
+  "seed": 0
+}

@@ -39,10 +39,11 @@ bfcl = [
     "ddgs",
 ]
 dse = [
+    "optuna>=4.0",
     "botorch>=0.11",
     "gpytorch>=1.11",
-    # plena-simulator imported in-process via sys.path injection
-    # (upstream has broken git submodules — cannot pip-install yet).
+    "toml",
+    "pydantic>=2",
 ]
 
 [[tool.uv.index]]
@@ -53,7 +54,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
-mase = { git = "https://github.com/DeepWok/mase.git", branch = "releases/plena-experiments" }
+mase = { git = "https://github.com/DeepWok/mase.git", branch = "sr1325/decode-phase-quant" }
 
 [tool.uv]
 no-build-isolation-package = ["fast-hadamard-transform"]
