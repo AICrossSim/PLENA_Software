@@ -10,7 +10,9 @@
   "reference_workload": {
     "batch": 4,
     "input_seq": 512,
-    "output_seq": 3072
+    "output_seq": 3072,
+    "hbm_gen": "HBM2",
+    "hbm_channels": 32
   },
   "search": {
     "weight_w": [
@@ -73,7 +75,7 @@
     "ifeval"
   ],
   "task_limit": 250,
-  "task_batch_size": 4,
+  "task_batch_size": 8,
   "front_size": 6,
   "hardware_space": {
     "MLEN": [
@@ -119,5 +121,24 @@
   },
   "n_chips": 1,
   "baseline_hbm_channels": 32,
-  "seed": 0
+  "seed": 0,
+  "scratch_dir": "/home/sr1325/decode_dse_scratch",
+  "_scratch_comment": "Qwen3-32B weight banks are ~28 GiB each; scratch_dir MUST be a volume with >=200 GiB free.",
+  "gpu_min_free_mb": 45000,
+  "gpu_min_free_mb_calibrated": 90000,
+  "_gpu_comment": "B200 183GB: a 32B calibrated trial needs ~90GB",
+  "max_parallel_points": 4,
+  "doomed_ppl_abs": 100.0,
+  "doomed_ppl_ratio": 3.0,
+  "reference_chip": {
+    "MLEN": 2048,
+    "BLEN": 32,
+    "VLEN": 2048,
+    "HLEN": 128
+  },
+  "bw_model": "calibrated",
+  "runtime": {
+    "persistent": true,
+    "_persistent_comment": "Stage-1 loads the 32B model ONCE and scores each RTN/PPL spec by deepcopy->quantise->eval->discard (validated byte-identical to the subprocess path. If host RAM is tight, set false to use the subprocess path. GPTQ/rotation front points always run as subprocesses."
+  }
 }

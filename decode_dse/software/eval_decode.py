@@ -132,20 +132,18 @@ def evaluate_fp_reference(cfg: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def evaluate_decode_point(cfg: argparse.Namespace) -> dict[str, Any]:
-    """Quantise for one decode precision and return an accuracy result row."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+def _quant_and_eval(model, tokenizer, spec, cfg: argparse.Namespace) -> dict[str, Any]:
+    """Quantise a LOADED FP model in-place per ``spec`` and score it (PPL + tasks).
+
+    The model is CONSUMED (module replacement mutates it), so a caller that reuses
+    a base model across specs must pass a fresh ``copy.deepcopy`` each time. This
+    is the shared core of the fresh-subprocess path and the PersistentEvaluator,
+    so both produce identical rows for identical (model, spec)."""
     from chop.passes.module.transforms.gptq.data_utils import get_loaders
     from chop.passes.module.transforms.quantize.quantize import (
-        install_phase_context_pre_hooks,
-        quantize_module_transform_pass,
+        install_phase_context_pre_hooks, quantize_module_transform_pass,
     )
-    from chop.passes.module.transforms.quantize.rotation_search import (
-        _compute_calibration_perplexity,
-    )
-
-    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[cfg.dtype]
-    spec = build_spec(cfg)
+    from chop.passes.module.transforms.quantize.rotation_search import _compute_calibration_perplexity
 
     row: dict[str, Any] = {
         "tag": spec.tag,
@@ -154,23 +152,10 @@ def evaluate_decode_point(cfg: argparse.Namespace) -> dict[str, Any]:
         "kv_bits": round(eff_bits(spec.kv_fmt, spec.kv, spec.kv_block), 4),
         "act_bits": round(eff_bits(spec.act_fmt, spec.act_w, spec.act_block), 4) if spec.act_w is not None else 16.0,
         "w_fmt": spec.w_fmt, "kv_fmt": spec.kv_fmt, "act_fmt": spec.act_fmt,
-        "block": spec.weight_block,
-        "use_gptq": spec.use_gptq, "use_rotation": spec.use_rotation,
-        "cont_ppl": "", "prefill_ppl": "", "gsm8k": "", "ifeval": "",
-        "runtime_sec": "", "error": "",
+        "block": spec.weight_block, "use_gptq": spec.use_gptq, "use_rotation": spec.use_rotation,
+        "cont_ppl": "", "prefill_ppl": "", "gsm8k": "", "ifeval": "", "runtime_sec": "", "error": "",
     }
-
     t0 = time.time()
-    load_kwargs = {"local_files_only": cfg.local_files_only, "trust_remote_code": cfg.trust_remote_code}
-    if cfg.hf_token:
-        load_kwargs["token"] = cfg.hf_token
-    # Softmax/rope FP_SETTING and qk/av quantisation live inside eager attention.
-    if spec.needs_eager:
-        load_kwargs["attn_implementation"] = "eager"
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, **load_kwargs)
-    model = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=dtype, **load_kwargs)
-    model = model.eval()
-
     # GPTQ/rotation calibrate with on-device forwards, so the model goes on the
     # GPU for the pass. RTN needs no forwards: the model stays on CPU while the
     # bank build streams weight chunks through the GPU (MASE_PHASE_BANK_DEVICE),
@@ -179,25 +164,18 @@ def evaluate_decode_point(cfg: argparse.Namespace) -> dict[str, Any]:
         os.environ.setdefault("MASE_PHASE_BANK_DEVICE", cfg.device)
     if spec.gptq_weights:
         model = model.to(cfg.device)
-
-    # Task-aligned calibration: the calib set (wikitext2 for PPL, a task-token
-    # file for a task) + Erry clip drive the decode weight bank.
     gptq_cfg: dict[str, Any] = {
         "dataset": cfg.calib_dataset, "nsamples": cfg.gptq_nsamples,
         "seqlen": cfg.gptq_seqlen, "cali_batch_size": cfg.gptq_cali_batch_size,
         "clip_search_y": cfg.clip_search_y, "max_layers": cfg.gptq_max_layers,
         "hf_token": cfg.hf_token, "checkpoint_dir": cfg.gptq_checkpoint_dir,
     }
-    pass_args = build_decode_pass_args(
-        cfg.model_name, cfg.device, spec, gptq_cfg if spec.gptq_weights else None
-    )
-
+    pass_args = build_decode_pass_args(cfg.model_name, cfg.device, spec,
+                                       gptq_cfg if spec.gptq_weights else None)
     model, _ = quantize_module_transform_pass(model, pass_args)
 
     # Decode-PPL-only trials never score the FP prefill path, so the FP weight
     # bank is dead weight: fold the decode bank into the parameters and drop it.
-    # This halves resident VRAM (~2x model -> ~1x), the difference between fitting
-    # and OOMing on a shared 48 GB GPU.
     tasks = [t for t in (cfg.tasks or "").split(",") if t.strip()]
     if not tasks and not cfg.eval_prefill_ppl:
         for m in model.modules():
@@ -207,26 +185,72 @@ def evaluate_decode_point(cfg: argparse.Namespace) -> dict[str, Any]:
     model = model.to(cfg.device).eval()
     install_phase_context_pre_hooks(model)
     row["calib"] = cfg.calib_dataset
-
-    # Perplexity: forced-decode (and optionally the forced-prefill FP reference).
     if cfg.eval_ppl:
-        loader = get_loaders(
-            "wikitext2", nsamples=cfg.eval_ppl_nsamples, seed=0,
-            seqlen=cfg.eval_ppl_seqlen, model=cfg.model_name, hf_token=cfg.hf_token,
-        )
+        loader = get_loaders("wikitext2", nsamples=cfg.eval_ppl_nsamples, seed=0,
+                             seqlen=cfg.eval_ppl_seqlen, model=cfg.model_name, hf_token=cfg.hf_token)
         if cfg.eval_prefill_ppl:
             row["prefill_ppl"] = round(_compute_calibration_perplexity(
                 model, loader, cfg.device, label="prefill_fp", score_phase="prefill"), 4)
         row["cont_ppl"] = round(_compute_calibration_perplexity(
             model, loader, cfg.device, label="decode_quant", score_phase="decode"), 4)
-
     if tasks:
-        scores = _run_tasks(model, tokenizer, tasks, cfg.task_limit, cfg.task_batch_size)
-        for t, v in scores.items():
+        for t, v in _run_tasks(model, tokenizer, tasks, cfg.task_limit, cfg.task_batch_size).items():
             row[t] = round(v, 4)
-
     row["runtime_sec"] = round(time.time() - t0, 1)
     return row
+
+
+def evaluate_decode_point(cfg: argparse.Namespace) -> dict[str, Any]:
+    """Load, quantise for one decode precision, and return an accuracy row."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[cfg.dtype]
+    spec = build_spec(cfg)
+    load_kwargs = {"local_files_only": cfg.local_files_only, "trust_remote_code": cfg.trust_remote_code}
+    if cfg.hf_token:
+        load_kwargs["token"] = cfg.hf_token
+    if spec.needs_eager:  # softmax/rope FP_SETTING and qk/av quant live in eager attention
+        load_kwargs["attn_implementation"] = "eager"
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, **load_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=dtype, **load_kwargs).eval()
+    return _quant_and_eval(model, tokenizer, spec, cfg)
+
+
+class PersistentEvaluator:
+    """Load the FP model ONCE, then score many precision specs by
+    deepcopy -> quantise -> eval -> discard. A fresh copy per spec means the
+    result is byte-identical to a fresh subprocess (no weight leakage), while
+    skipping the per-trial ``from_pretrained`` reload -- the dominant cost for
+    large models. Scoped to the RTN/PPL screen (SDPA, no eager); GPTQ/rotation 
+    front points still run as subprocesses.
+    """
+
+    def __init__(self, cfg: argparse.Namespace):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self.cfg = cfg
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[cfg.dtype]
+        lk = {"local_files_only": cfg.local_files_only, "trust_remote_code": cfg.trust_remote_code}
+        if cfg.hf_token:
+            lk["token"] = cfg.hf_token
+        self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, **lk)
+        # SDPA (no eager): the persistent path is the RTN screen; eager specs use a subprocess.
+        self._pristine = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=dtype, **lk).eval()
+        if cfg.device.startswith("cuda") and torch.cuda.is_available():
+            os.environ.setdefault("MASE_PHASE_BANK_DEVICE", cfg.device)
+
+    def evaluate(self, spec) -> dict[str, Any]:
+        import copy
+        import gc
+        if spec.needs_eager:
+            raise ValueError("PersistentEvaluator is for the SDPA/RTN screen; eager specs need a subprocess.")
+        model = copy.deepcopy(self._pristine)   # fresh FP model -> no leakage between specs
+        try:
+            return _quant_and_eval(model, self.tokenizer, spec, self.cfg)
+        finally:
+            del model
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _parse_args() -> argparse.Namespace:

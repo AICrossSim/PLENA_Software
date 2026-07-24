@@ -488,6 +488,43 @@ def _process_front_point(cfg, idx, n_front, fr, pt, *, front_fps, tasks, fp_tol,
     return merged
 
 
+def _persistent_base_cfg(cfg: dict) -> argparse.Namespace:
+    """The eval-worker cfg the PersistentEvaluator uses for the RTN/PPL
+    screen: wikitext2 perplexity, no tasks, no GPTQ (RTN), no prefill ref."""
+    g = cfg.get("gptq", {})
+    return argparse.Namespace(
+        model_name=cfg["model_name"], device=cfg.get("device", "cuda:0"),
+        dtype=cfg.get("dtype", "bfloat16"),
+        local_files_only=bool(cfg.get("local_files_only", True)),
+        trust_remote_code=bool(cfg.get("trust_remote_code", False)),
+        hf_token=cfg.get("hf_token"),
+        calib_dataset="wikitext2", clip_search_y=False,
+        gptq_nsamples=int(g.get("nsamples", 128)), gptq_seqlen=int(g.get("seqlen", 2048)),
+        gptq_cali_batch_size=int(g.get("cali_batch_size", 8)), gptq_max_layers=g.get("max_layers"),
+        gptq_checkpoint_dir=None, eval_ppl=True, eval_prefill_ppl=False,
+        eval_ppl_nsamples=int(cfg.get("eval_ppl_nsamples", 40)),
+        eval_ppl_seqlen=int(cfg.get("eval_ppl_seqlen", 2048)),
+        tasks="", task_limit=cfg.get("task_limit"),
+        task_batch_size=int(cfg.get("task_batch_size", 8)),
+    )
+
+
+def _persistent_record(ev, spec, oj: Path) -> dict[str, Any]:
+    """Score one RTN/PPL spec on the persistent model (in-process, no reload) and
+    write the same JSON the subprocess path writes, so caching/resume is identical.
+    A spec that raises is recorded as an error row (not cached as valid) so it
+    re-tries on a rerun instead of aborting the study."""
+    try:
+        row = ev.evaluate(spec)
+    except Exception as e:
+        import torch as _t
+        if _t.cuda.is_available():
+            _t.cuda.empty_cache()
+        row = {"tag": spec.tag, "cont_ppl": "", "error": f"{type(e).__name__}: {str(e)[:200]}"}
+    oj.write_text(json.dumps(row))
+    return row
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Decode-accuracy DSE")
     ap.add_argument("config", help="path to a decode DSE config JSON")
@@ -538,6 +575,19 @@ def main() -> None:
     tag_to_pt: dict[str, dict] = {}
     tag_to_row: dict[str, dict] = {}
 
+    # Loads the FP model ONCE and scores each RTN/PPL spec by
+    # deepcopy -> quantise -> eval -> discard (byte-identical to a fresh subprocess,
+    # no per-trial reload). GPTQ/rotation front points still run as subprocesses.
+    persistent_ev = None
+    if cfg.get("runtime", {}).get("persistent") and str(cfg.get("device", "cuda:0")).startswith("cuda"):
+        gpu = _pick_gpu(int(cfg.get("gpu_min_free_mb", 21000)))
+        if gpu is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+        from decode_dse.software.eval_decode import PersistentEvaluator
+        persistent_ev = PersistentEvaluator(_persistent_base_cfg(cfg))
+        print(f"[stage 1] persistent model loaded (GPU {gpu}); deepcopy per spec, no per-trial reload",
+              flush=True)
+
     def _record(pt: dict) -> dict:
         """Evaluate one precision point (cached by tag); append + checkpoint.
         Error rows are cached too — resampling a failed point must return its
@@ -550,8 +600,11 @@ def main() -> None:
         legacy = trial_dir / f"rtn__{spec.tag}.json"   # pre-fix cache name (double prefix)
         row = _cached(oj) or _cached(legacy)
         if row is None:
-            row = _run_trial(cfg, spec, calib_dataset="wikitext2", tasks="", eval_ppl=True,
-                             clip=False, gptq_ckpt=None, out_json=oj)
+            if persistent_ev is not None:
+                row = _persistent_record(persistent_ev, spec, oj)
+            else:
+                row = _run_trial(cfg, spec, calib_dataset="wikitext2", tasks="", eval_ppl=True,
+                                 clip=False, gptq_ckpt=None, out_json=oj)
         row["tag"] = row.get("tag") or spec.tag
         row.setdefault("fp_setting", None)
         if not row.get("error") and row.get("cont_ppl") not in ("", None):
@@ -595,7 +648,7 @@ def main() -> None:
           f"FP_SETTING sweep={front_fps} (cheapest within {fp_tol:.1%} PPL); "
           f"tasks={tasks} (task-aligned calib, eager)", flush=True)
 
-    # Stage 2 runs the front points in parallel across the free GPUs (freest
+    # Runs the front points in parallel across the free GPUs (freest
     # first). Each point is pinned to one GPU and builds its own tag-suffixed
     # banks, so parallel points never race on a shared bank; a doomed precision
     # skips the sweep + tasks. Task calibrations are built once up front.
