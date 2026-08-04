@@ -1,21 +1,34 @@
-"""Decode-chip DSE for disaggregated serving on PLENA.
+"""Decode-only precision, accuracy, and hardware co-design interfaces."""
 
-Two stages, deliberately decoupled:
-
-* ``decode_dse.software`` — measures decode-phase accuracy (perplexity + GSM8K
-  + IFEval) of MXINT/MXFP decode quantisation while the prefill chip stays
-  FP16, and writes the precision-vs-accuracy front to a CSV.
-* ``decode_dse.hardware`` — an Optuna co-design search that maximises TPS and
-  minimises TPOT on the PLENA decode-chip analytic model, per precision point.
-
-The two meet at the CSV: hardware co-design reads the accuracy front and reports
-the joint precision x hardware trade-off.
-"""
-
+from decode_dse.legality import (
+    CrossStackCapability,
+    PackedKVRuntimeTarget,
+    StackValidity,
+    constrain_stack_validity,
+    evaluate_profile_legality,
+    evaluate_stack_capability,
+)
+from decode_dse.profiles import DecodePrecisionProfile, enumerate_decode_profiles
 from decode_dse.simulator_bridge import (
+    CompilerTracePointDescriptor,
+    CompilerTraceRequestBinder,
     DecodeMetrics,
     DecodeSimulator,
     Precision,
 )
 
-__all__ = ["DecodeSimulator", "DecodeMetrics", "Precision"]
+__all__ = [
+    "CrossStackCapability",
+    "CompilerTracePointDescriptor",
+    "CompilerTraceRequestBinder",
+    "DecodeMetrics",
+    "DecodePrecisionProfile",
+    "DecodeSimulator",
+    "PackedKVRuntimeTarget",
+    "Precision",
+    "StackValidity",
+    "constrain_stack_validity",
+    "enumerate_decode_profiles",
+    "evaluate_profile_legality",
+    "evaluate_stack_capability",
+]

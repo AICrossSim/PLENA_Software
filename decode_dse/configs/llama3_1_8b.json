@@ -1,20 +1,20 @@
 {
-  "_comment": "Deterministic decode-only precision sweep for Qwen3-32B.",
-  "model_name": "Qwen/Qwen3-32B",
-  "model_revision": "9216db5781bf21249d130ec9da846c4624c16137",
-  "tokenizer_revision": "9216db5781bf21249d130ec9da846c4624c16137",
-  "sim_model": "qwen3-32b",
+  "_comment": "Deterministic decode-only precision sweep for Llama-3.1-8B-Instruct.",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "model_revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+  "tokenizer_revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+  "sim_model": "llama-3.1-8b",
   "model_architecture": {
-    "hidden_size": 5120,
-    "intermediate_size": 25600,
-    "num_hidden_layers": 64,
-    "num_attention_heads": 64,
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
     "num_key_value_heads": 8,
     "head_dim": 128,
-    "vocab_size": 151936,
+    "vocab_size": 128256,
     "tie_word_embeddings": false,
     "attention_bias": false,
-    "use_qk_norm": true
+    "use_qk_norm": false
   },
   "model_placement": {
     "policy": "single_device",
@@ -46,7 +46,7 @@
     "cache_dir": "/data/datasets"
   },
   "executor": {
-    "sample_bundle": "workspace://inputs/qwen3_32b_samples.json",
+    "sample_bundle": "workspace://inputs/llama3_1_8b_samples.json",
     "prefill_artifact_root": "workspace://artifacts/prefill_bf16",
     "admission_artifact_root": "workspace://artifacts/decode_admission",
     "stack_validity_manifest": "workspace://stack_validity.json",
@@ -83,74 +83,13 @@
     "hbm_channels": 32
   },
   "search": {
-    "weight_w": [
-      "MXINT2",
-      "MXINT4",
-      "MXINT8",
-      "E1M2",
-      "E2M1",
-      "E3M4",
-      "E4M3",
-      "E5M2"
-    ],
-    "kv": [
-      "MXINT2",
-      "MXINT4",
-      "MXINT8",
-      "E1M2",
-      "E2M1",
-      "E3M4",
-      "E4M3",
-      "E5M2"
-    ],
-    "act_w": [
-      "MXINT2",
-      "MXINT4",
-      "MXINT8",
-      "E1M2",
-      "E2M1",
-      "E3M4",
-      "E4M3",
-      "E5M2"
-    ],
-    "block": [
-      8
-    ],
+    "weight_w": ["MXINT2", "MXINT4", "MXINT8", "E1M2", "E2M1", "E3M4", "E4M3", "E5M2"],
+    "kv": ["MXINT2", "MXINT4", "MXINT8", "E1M2", "E2M1", "E3M4", "E4M3", "E5M2"],
+    "act_w": ["MXINT2", "MXINT4", "MXINT8", "E1M2", "E2M1", "E3M4", "E4M3", "E5M2"],
+    "block": [8],
     "mixed_weight": false,
-    "front_fp_setting": [
-      [
-        3,
-        2
-      ],
-      [
-        2,
-        3
-      ],
-      [
-        6,
-        5
-      ],
-      [
-        5,
-        6
-      ],
-      [
-        4,
-        7
-      ],
-      [
-        8,
-        5
-      ]
-    ],
-    "vector_fp": [
-      "FP_E3M2",
-      "FP_E2M3",
-      "FP_E6M5",
-      "FP_E5M6",
-      "FP_E4M7",
-      "FP_E8M5"
-    ],
+    "front_fp_setting": [[3, 2], [2, 3], [6, 5], [5, 6], [4, 7], [8, 5]],
+    "vector_fp": ["FP_E3M2", "FP_E2M3", "FP_E6M5", "FP_E5M6", "FP_E4M7", "FP_E8M5"],
     "include_vector_bf16_controls": true,
     "include_bf16_reference": true,
     "expected_quantized_profiles": 3072,
@@ -182,7 +121,7 @@
     "calibration_batch_size": 8,
     "calibration_seed": 20260725,
     "sample_selection_seed": 20260725,
-    "gpu_min_free_mb": 90000,
+    "gpu_min_free_mb": 36000,
     "max_cpu_cache_gib": 24,
     "calibration_data": {
       "dataset_name": "Salesforce/wikitext",
@@ -195,8 +134,6 @@
     }
   },
   "publication": {
-    "chat_template_asset": "decode_dse/configs/publication_chat_template.json",
-    "chat_template_sha256": "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8",
     "benchmark_datasets": {
       "wikitext2": {
         "dataset_name": "Salesforce/wikitext",
@@ -244,80 +181,20 @@
   },
   "eval_ppl_nsamples": 32,
   "eval_ppl_seqlen": 2048,
-  "tasks": [
-    "gsm8k",
-    "ifeval"
-  ],
+  "tasks": ["gsm8k", "ifeval"],
   "task_batch_size": 8,
   "front_size": 6,
   "hardware_space": {
-    "MLEN": [
-      16,
-      32,
-      64,
-      128,
-      256,
-      512,
-      1024,
-      2048,
-      4096
-    ],
-    "BLEN": [
-      2,
-      4,
-      8,
-      16,
-      32,
-      64
-    ],
-    "HLEN": [
-      16,
-      32,
-      64,
-      128
-    ],
-    "BATCH": [
-      1,
-      4,
-      8,
-      16,
-      32,
-      64,
-      128,
-      256
-    ],
-    "HBM_CHANNELS": [
-      8,
-      16,
-      32
-    ],
+    "MLEN": [16, 32, 64, 128, 256, 512, 1024, 2048, 4096],
+    "BLEN": [2, 4, 8, 16, 32, 64],
+    "HLEN": [16, 32, 64, 128],
+    "BATCH": [1, 4, 8, 16, 32, 64, 128, 256],
+    "HBM_CHANNELS": [8, 16, 32],
     "HBM_GENERATION": "HBM2",
-    "CHIP_COUNT": [
-      1,
-      2,
-      4,
-      8,
-      16
-    ],
-    "TP": [
-      1,
-      2,
-      4,
-      8,
-      16
-    ],
-    "KVP": [
-      1,
-      2,
-      4,
-      8,
-      16
-    ],
-    "LINK_PORTS": [
-      1,
-      2,
-      4
-    ],
+    "CHIP_COUNT": [1, 2, 4, 8, 16],
+    "TP": [1, 2, 4, 8, 16],
+    "KVP": [1, 2, 4, 8, 16],
+    "LINK_PORTS": [1, 2, 4],
     "SRAM_POLICY": [
       "streaming",
       "projection_resident",
@@ -326,14 +203,8 @@
       "kv_resident_75",
       "kv_resident_100"
     ],
-    "KV_HEAD_REUSE": [
-      false,
-      true
-    ],
-    "DRAIN_OVERLAPPED": [
-      false,
-      true
-    ],
+    "KV_HEAD_REUSE": [false, true],
+    "DRAIN_OVERLAPPED": [false, true],
     "FP_SRAM_DEPTH": 512,
     "RESOURCE_BUDGET": {
       "reference_system": "A100x4",
@@ -345,13 +216,7 @@
   "hbm_sensitivity": {
     "schema_version": "decode-hbm-sensitivity/v2",
     "source_profile_count": 4,
-    "generations": [
-      "HBM2",
-      "HBM2E",
-      "HBM3",
-      "HBM3E",
-      "HBM4"
-    ],
+    "generations": ["HBM2", "HBM2E", "HBM3", "HBM3E", "HBM4"],
     "preserve_geometry_batch_channels": true,
     "cross_generation_ranking": false
   },
@@ -360,12 +225,7 @@
     "warmup_steps": 16,
     "measured_steps": 128,
     "repetitions": 3,
-    "batch_sizes": [
-      1,
-      2,
-      4,
-      8
-    ],
+    "batch_sizes": [1, 2, 4, 8],
     "precision": "BF16",
     "q_len": 1,
     "first_gpu_only": true,
@@ -424,8 +284,7 @@
   "baseline_hbm_channels": 32,
   "seed": 0,
   "scratch_dir": "workspace://scratch",
-  "_scratch_comment": "Cross-process weight-bank construction locks and refinement checkpoints use this path.",
-  "gpu_min_free_mb": 70000,
+  "gpu_min_free_mb": 24000,
   "max_parallel_points": 2,
   "compiler_trace_preflight": {
     "schema_version": "decode-compiler-trace-preflight/v1",
