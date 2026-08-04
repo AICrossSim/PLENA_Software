@@ -1,7 +1,6 @@
 # Table 6 — MXINT Full System — GPTQ + Err_y Clip (no rotation)
 # Everything quantized: weights of 7 linears (GPTQ + Err_y clip) + activations of
 # all 9 GEMMs + KV cache (RTN on the activation side).
-# Expected PPL on Llama-3-8B (wikitext): 7.60
 
 by = "regex_name"
 

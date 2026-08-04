@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table 6 — Llama-3-8B  MXINT Full System — GPTQ + Err_y Clip + Selective Rotation (BEST)
+# Table 6 — Llama-3-8B MXINT Full System — GPTQ + Err_y Clip + Selective Rotation
 # Reuses Table 5 mxint w4a16kv16 GPTQ checkpoint — same [gptq] block.
 # Usage: DEVICE=cuda:N bash plena_experiments/table6/scripts/w4a4kv4/erry_clip_selrot.sh
 MODEL="meta-llama/Meta-Llama-3-8B"

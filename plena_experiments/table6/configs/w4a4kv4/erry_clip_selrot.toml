@@ -1,7 +1,6 @@
-# Table 6 — MXINT Full System — GPTQ + Err_y Clip + Selective Rotation (BEST)
+# Table 6 — MXINT Full System — GPTQ + Err_y Clip + Selective Rotation
 # Everything quantized: weights of 7 linears (GPTQ + Err_y clip) + activations of
 # all 9 GEMMs + KV cache + selective Hadamard rotation on the winning matmul subset.
-# Expected PPL on Llama-3-8B (wikitext): 7.22  (matches Table 5 4/4/4 PLENA(ours))
 
 by = "regex_name"
 

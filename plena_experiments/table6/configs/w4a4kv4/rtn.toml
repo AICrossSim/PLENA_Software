@@ -1,6 +1,5 @@
 # Table 6 — MXINT Full System — RTN (no GPTQ, no rotation)
 # Everything quantized: weights of 7 linears + activations of all 9 GEMMs + KV cache.
-# Expected PPL on Llama-3-8B (wikitext): 8.28
 
 by = "regex_name"
 
