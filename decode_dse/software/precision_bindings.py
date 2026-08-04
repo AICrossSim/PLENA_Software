@@ -1,26 +1,9 @@
-"""Decode-only quantisation configs for the MASE phase-split quantize pass.
-
-Produces the ``pass_args`` that :func:`quantize_module_transform_pass` consumes,
-so that:
-
-* prefill runs unquantised (the separate prefill chip): each module uses the
-  ``{"decode": {...}}`` shorthand, which the normaliser expands to
-  ``prefill={"bypass": True}, decode_policy="quantized"``;
-* decode runs MXINT/MXFP weights + KV cache, activations computed low-precision
-  (stored bf16 on-chip);
-* KV handoff defaults to ``decode_format`` — prefill quantises its KV writes into
-  the decode chip's KV format.
-
-attn and ffn share the weight format but keep independent widths (mixed
-precision); KV has its own format. In GPTQ mode all linears share one weight
-width (GPTQ calibrates one width per pass), so ``attn_w`` must equal ``ffn_w``;
-RTN mode lets them differ.
-"""
+"""Decode-only precision bindings for the MASE phase-split quantize pass."""
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 # Attention vs FFN projections, split so each can carry an independent weight
@@ -29,29 +12,42 @@ def parse_prec_token(tok: Any) -> tuple[str, Any]:
     """Parse a precision token into (format, width).
 
     ``4`` or ``"MXINT4"`` -> ("mxint", 4); ``"E2M1"`` -> ("mxfp", (2, 1)).
-    Widths >= 16 (or ``None``) mean unquantised -> ("mxint", None).
+    Width 16 (or ``None``) means unquantised -> ("mxint", None).
     """
+    def parse_integer_width(value: int) -> tuple[str, int | None]:
+        if value == 16:
+            return ("mxint", None)
+        if value not in (2, 4, 8):
+            raise ValueError("MXINT width must be 2, 4, 8, or unquantized 16")
+        return ("mxint", value)
+
     if tok is None:
         return ("mxint", None)
     if isinstance(tok, int):
-        return ("mxint", None if tok >= 16 else tok)
+        return parse_integer_width(tok)
     s = str(tok).upper()
     if s.startswith("MXINT"):
-        w = int(s[5:])
-        return ("mxint", None if w >= 16 else w)
+        return parse_integer_width(int(s[5:]))
     if s.startswith("E") and "M" in s:
         e, m = s[1:].split("M")
         return ("mxfp", (int(e), int(m)))
     if s.isdigit():
         return parse_prec_token(int(s))
-    raise ValueError(f"unrecognised precision token {tok!r} (use e.g. 4, 'MXINT4', 'E2M1').")
+    raise ValueError(
+        f"unrecognised precision token {tok!r} "
+        "(use e.g. 4, 'MXINT4', 'E2M1')."
+    )
 
 
 _ATTN_LINEAR_RE = r"model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$"
 _FFN_LINEAR_RE = r"model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)$"
 _SELF_ATTN_RE = r"model\.layers\.\d+\.self_attn$"
 _MLP_RE = r"model\.layers\.\d+\.mlp$"
-_RMSNORM_RE = r"model\.layers\.\d+\.(input_layernorm|post_attention_layernorm)$"
+_DECODER_LAYER_RE = r"model\.layers\.\d+$"
+_RMSNORM_RE = (
+    r"(model\.layers\.\d+\.(input_layernorm|post_attention_layernorm|"
+    r"self_attn\.(q_norm|k_norm))|model\.norm)$"
+)
 
 
 @dataclass(frozen=True)
@@ -70,24 +66,74 @@ class DecodeQuantSpec:
     kv: Any = 4
     w_fmt: str = "mxint"
     kv_fmt: str = "mxint"
-    weight_block: int = 32
-    kv_block: int = 32
+    key_kv: Any | None = None
+    value_kv: Any | None = None
+    key_kv_fmt: str | None = None
+    value_kv_fmt: str | None = None
+    weight_block: int = 8
+    kv_block: int = 8
     act_w: Any = 8
     act_fmt: str = "mxint"
-    act_block: int = 32
+    act_block: int = 8
     use_gptq: bool = False
     use_rotation: bool = False  # selective phase-aware rotation (decode-only) — subsumes GPTQ
-    fp_setting: tuple[int, int] | None = None  # vector-unit minifloat (SiLU/RMSNorm, +softmax/rope if below)
-    fp_setting_attention: bool = False  # extend FP_SETTING to softmax/rope (needs eager); else SDPA-safe
-    quant_attn_internals: bool = False  # qk/av GEMM quantisation — needs eager attention
+    fp_setting: str | tuple[int, int] | None = "BF16"
+    fp_setting_attention: bool = True
+    quant_attn_internals: bool = True
+    matrix_mlen: int = 1024
 
     def __post_init__(self):
-        if self.gptq_weights and self.attn_w != self.ffn_w:
+        def validate_integer(role: str, fmt: str | None, width: Any) -> None:
+            if fmt != "mxint" or width is None:
+                return
+            value = int(width)
+            if value not in (2, 4, 8) and value < 16:
+                raise ValueError(
+                    f"{role} MXINT width must be 2, 4, 8, or unquantized"
+                )
+
+        if self.attn_w != self.ffn_w:
             raise ValueError(
-                "Calibrated weights (GPTQ/rotation) use a single weight width per "
-                f"pass, so attn_w must equal ffn_w (got {self.attn_w} vs {self.ffn_w}). "
-                "Use RTN (use_gptq=use_rotation=False) for mixed attn/FFN weight precision."
+                "attention and FFN must share one global weight precision"
             )
+        validate_integer("weight", self.w_fmt, self.attn_w)
+        validate_integer("activation", self.act_fmt, self.act_w)
+        validate_integer("KV", self.kv_fmt, self.kv)
+        for name, block in (
+            ("weight_block", self.weight_block),
+            ("act_block", self.act_block),
+            ("kv_block", self.kv_block),
+        ):
+            if block not in (8, 16, 32):
+                raise ValueError(f"{name} must be 8, 16, or 32")
+        split_values = (
+            self.key_kv,
+            self.value_kv,
+            self.key_kv_fmt,
+            self.value_kv_fmt,
+        )
+        if any(value is not None for value in split_values) and not all(
+            value is not None for value in split_values
+        ):
+            raise ValueError(
+                "split KV precision requires key/value formats and widths"
+            )
+        if all(value is not None for value in split_values):
+            validate_integer("key KV", self.key_kv_fmt, self.key_kv)
+            validate_integer("value KV", self.value_kv_fmt, self.value_kv)
+        if self.fp_setting is not None:
+            _vector_token(self.fp_setting)
+        if self.fp_setting is not None and not self.fp_setting_attention:
+            raise ValueError("vector precision must cover qk_norm, RoPE, and softmax")
+        if self.act_w is not None and not self.quant_attn_internals:
+            raise ValueError("activation precision must cover QK and PV inputs")
+        if (
+            isinstance(self.matrix_mlen, bool)
+            or not isinstance(self.matrix_mlen, int)
+            or self.matrix_mlen <= 0
+            or self.matrix_mlen % 8
+        ):
+            raise ValueError("matrix_mlen must be a positive multiple of 8")
 
     @property
     def gptq_weights(self) -> bool:
@@ -97,25 +143,80 @@ class DecodeQuantSpec:
 
     @property
     def needs_eager(self) -> bool:
-        """Quantising softmax/rope (FP_SETTING on attention) or the qk/av matmuls
-        requires eager attention (SDPA hides those internals). FP_SETTING on just
-        MLP+RMSNorm stays SDPA-friendly."""
-        return (self.fp_setting is not None and self.fp_setting_attention) or self.quant_attn_internals
+        """Return whether the configured decode semantics require eager attention."""
+        return self.act_w is not None or self.fp_setting is not None
+
+    @property
+    def split_kv(self) -> bool:
+        """Return whether K and V use explicit role-specific formats."""
+
+        return self.key_kv is not None
+
+    @property
+    def key_kv_precision(self) -> tuple[str, Any]:
+        """Return the K-cache format and width."""
+
+        if self.split_kv:
+            return str(self.key_kv_fmt), self.key_kv
+        return self.kv_fmt, self.kv
+
+    @property
+    def value_kv_precision(self) -> tuple[str, Any]:
+        """Return the V-cache format and width."""
+
+        if self.split_kv:
+            return str(self.value_kv_fmt), self.value_kv
+        return self.kv_fmt, self.kv
 
     @property
     def tag(self) -> str:
         method = "rot" if self.use_rotation else "gptq" if self.use_gptq else "rtn"
-        fp = f"_fp{self.fp_setting[0]}-{self.fp_setting[1]}" if self.fp_setting else ""
+        if isinstance(self.fp_setting, tuple):
+            fp_token = f"E{self.fp_setting[0]}M{self.fp_setting[1]}"
+        else:
+            fp_token = self.fp_setting
+        fp = f"_fp-{fp_token}" if fp_token else ""
         act = _wtok(self.act_fmt, self.act_w) if self.act_w is not None else "i16"
+        key_fmt, key_width = self.key_kv_precision
+        value_fmt, value_width = self.value_kv_precision
+        kv = (
+            f"__k-{_wtok(key_fmt, key_width)}__v-{_wtok(value_fmt, value_width)}"
+            if self.split_kv
+            else f"__kv-{_wtok(self.kv_fmt, self.kv)}"
+        )
         return (
             f"{method}__aw-{_wtok(self.w_fmt, self.attn_w)}"
             f"__fw-{_wtok(self.w_fmt, self.ffn_w)}"
-            f"__kv-{_wtok(self.kv_fmt, self.kv)}__a-{act}__b{self.weight_block}{fp}"
+            f"{kv}__a-{act}__b{self.weight_block}{fp}"
         )
 
 
 # One 8-bit shared scale per MX block (E8M0)
 _SCALE_BITS = 8
+_MATRIX_SEMANTICS = {
+    "schema_version": "plena-matrix-semantics",
+    "block_size": 8,
+    "mxint_rule": "block8_range_safe_scale_widened_mac_max_shift16_rne_vector",
+    "mxint_max_shift": 16,
+    "mxint_vector_rounding": "round_to_nearest_even",
+    "mxint_partial_conversion": (
+        "per_mm_ic_integer_reduction_to_vector_storage_fp"
+    ),
+    "mxint_cross_instruction_accumulation": (
+        "signed_fixed16_16_wraparound"
+    ),
+    "mxfp_rule": "product_cast_to_m_fp_then_fixed16_16_bank",
+    "m_fp_format_binding": "profile.vector_format",
+    "matrix_storage_fp_binding": "profile.vector_format",
+    "matrix_instruction_k_partition": "MLEN",
+    "qk_logical_k_partition": "HLEN",
+    "fixed_accumulator_integer_bits": 16,
+    "fixed_accumulator_fraction_bits": 16,
+    "accumulator_rule": "plena_fixed16_16_accumulate_truncate",
+    "output_rule": "truncate_to_vector_format",
+    "mixed_family_rule": "deployment_unsupported_without_trace_evidence",
+    "mixed_family_deployment_supported": False,
+}
 
 
 def eff_bits(fmt: str, width: Any, block: int) -> float:
@@ -165,46 +266,140 @@ def _linear_decode(spec: DecodeQuantSpec, weight_width: Any) -> dict[str, Any]:
     cfg: dict[str, Any] = dict(_weight_keys(spec.w_fmt, weight_width, spec.weight_block))
     if spec.act_w is not None:
         cfg.update(_act_keys(spec.act_fmt, spec.act_w, spec.act_block))
+    cfg.update(
+        _matrix_contract(
+            spec.act_fmt if spec.act_w is not None else "bf16",
+            spec.w_fmt,
+            spec.fp_setting or "BF16",
+            block_sizes=(
+                spec.weight_block,
+                spec.act_block if spec.act_w is not None else spec.weight_block,
+            ),
+            matrix_mlen=spec.matrix_mlen,
+        )
+    )
     if spec.gptq_weights:
         # The decode weight bank comes from GPTQ/rotation; don't RTN it again.
         cfg["gptq"] = True
     return cfg
 
 
-def _fp_stage_keys(fp_setting: tuple[int, int]) -> dict[str, Any]:
-    """Vector-unit minifloat width for one attention stage (softmax / rope)."""
-    e, m = fp_setting
-    return {"data_in_exponent_width": e, "data_in_frac_width": m}
+def _vector_token(fp_setting: str | tuple[int, int]) -> str:
+    """Return the canonical vector-format token."""
+    if isinstance(fp_setting, tuple):
+        return f"FP_E{int(fp_setting[0])}M{int(fp_setting[1])}"
+    token = str(fp_setting).upper()
+    if token == "BF16":
+        return token
+    if token.startswith("FP_E") and "M" in token:
+        return token
+    if token.startswith("E") and "M" in token:
+        return f"FP_{token}"
+    raise ValueError(f"unsupported vector format {fp_setting!r}")
+
+
+def _fp_stage_keys(fp_setting: str | tuple[int, int]) -> dict[str, Any]:
+    """Return one vector-stage precision config."""
+    return {
+        "format": _vector_token(fp_setting),
+        "data_in_is_finite": False,
+        "data_in_round_mode": "rn",
+    }
+
+
+def _matrix_contract(
+    left_family: str,
+    right_family: str,
+    output_format: str | tuple[int, int],
+    *,
+    block_sizes: tuple[int, ...],
+    matrix_mlen: int,
+) -> dict[str, Any]:
+    """Return the strict matrix-output oracle contract for one operand pair."""
+    unique_blocks = set(block_sizes)
+    if len(unique_blocks) != 1:
+        raise ValueError("matrix operands must use one shared MX block size")
+    quantization_block_size = unique_blocks.pop()
+    if quantization_block_size not in (8, 16, 32):
+        raise ValueError("matrix quantization block must be 8, 16, or 32")
+    family_pair = (left_family, right_family)
+    if family_pair == ("mxint", "mxint"):
+        family_binding = _MATRIX_SEMANTICS["mxint_rule"]
+    elif family_pair == ("mxfp", "mxfp"):
+        family_binding = _MATRIX_SEMANTICS["mxfp_rule"]
+    else:
+        family_binding = _MATRIX_SEMANTICS["mixed_family_rule"]
+    return {
+        "accumulator_rule": _MATRIX_SEMANTICS["accumulator_rule"],
+        "output_rule": _MATRIX_SEMANTICS["output_rule"],
+        "output_format": _vector_token(output_format),
+        "operand_family_binding": family_binding,
+        "matrix_semantics": dict(_MATRIX_SEMANTICS),
+        "quantization_block_size": quantization_block_size,
+        "native_datapath": quantization_block_size == 8,
+        "numerical_trace_conformance": "not_run",
+        "matrix_oracle_scope": "instruction_partitioned_numerical_oracle",
+        "matrix_mlen": matrix_mlen,
+    }
 
 
 def _attn_decode(spec: DecodeQuantSpec) -> dict[str, Any]:
-    """Decode config for a self-attention block.
+    """Bind A to attention inputs and KV only to cached matrix operands."""
+    matrix_input = (
+        _act_keys(spec.act_fmt, spec.act_w, spec.act_block)
+        if spec.act_w is not None
+        else {"bypass": True}
+    )
+    fp = (
+        _fp_stage_keys(spec.fp_setting)
+        if spec.fp_setting is not None
+        else {"bypass": True}
+    )
+    key_fmt, key_width = spec.key_kv_precision
+    value_fmt, value_width = spec.value_kv_precision
 
-    - kv_cache: always quantised at the KV precision (streamed from HBM).
-    - qk/av matmuls: MXINT at the KV width when ``quant_attn_internals`` (the
-      GEMM-side attention quantisation); else bypassed (SDPA-friendly).
-    - softmax/rope: the FP_SETTING vector-unit minifloat when ``fp_setting`` is
-      set; else bypassed. Quantising these needs eager attention
-    """
-    qk = _act_keys(spec.kv_fmt, spec.kv, spec.kv_block) if spec.quant_attn_internals else {"bypass": True}
-    use_fp_attn = spec.fp_setting is not None and spec.fp_setting_attention
-    fp = _fp_stage_keys(spec.fp_setting) if use_fp_attn else {"bypass": True}
+    def matrix_config(cache_format: str) -> dict[str, Any]:
+        config = dict(matrix_input)
+        config.update(
+            _matrix_contract(
+                spec.act_fmt,
+                cache_format,
+                spec.fp_setting or "BF16",
+                block_sizes=(spec.act_block, spec.kv_block),
+                matrix_mlen=spec.matrix_mlen,
+            )
+        )
+        return config
+
+    if spec.split_kv:
+        kv_cache = {
+            "key": _act_keys(key_fmt, key_width, spec.kv_block),
+            "value": _act_keys(value_fmt, value_width, spec.kv_block),
+        }
+    else:
+        kv_cache = _act_keys(spec.kv_fmt, spec.kv, spec.kv_block)
     return {
-        "qk_matmul": dict(qk),
-        "av_matmul": dict(qk),
+        "qk_norm": dict(fp),
+        "qk_matmul": matrix_config(key_fmt),
+        "av_matmul": matrix_config(value_fmt),
         "softmax": dict(fp),
         "rope": dict(fp),
-        "kv_cache": _act_keys(spec.kv_fmt, spec.kv, spec.kv_block),
+        "kv_cache": kv_cache,
     }
 
 
-def _fp_setting_keys(fp_setting: tuple[int, int]) -> dict[str, Any]:
-    """Plain-minifloat vector-unit widths (SiLU / RMSNorm), symmetric weight+act."""
-    e, m = fp_setting
-    return {
-        "weight_exponent_width": e, "weight_frac_width": m,
-        "data_in_exponent_width": e, "data_in_frac_width": m,
-    }
+def _fp_setting_keys(
+    fp_setting: str | tuple[int, int],
+) -> dict[str, Any]:
+    """Return vector config shared by norms, gates, and residuals."""
+    config = _fp_stage_keys(fp_setting)
+    config.update(
+        {
+            "weight_is_finite": False,
+            "weight_round_mode": "rn",
+        }
+    )
+    return config
 
 
 def build_decode_pass_args(
@@ -219,12 +414,14 @@ def build_decode_pass_args(
     prefill unquantised and sets ``decode_policy="quantized"`` automatically.
     """
     wname = spec.w_fmt  # "mxint" | "mxfp"
-    kname = spec.kv_fmt
-
     pass_args: dict[str, Any] = {
         "by": "regex_name",
         _SELF_ATTN_RE: {
-            "config": {"name": kname, "decode": _attn_decode(spec)},
+            "config": {
+                "name": spec.act_fmt,
+                "kv_cache_handoff": "fp",
+                "decode": _attn_decode(spec),
+            },
         },
         _ATTN_LINEAR_RE: {
             "config": {"name": wname, "decode": _linear_decode(spec, spec.attn_w)},
@@ -236,6 +433,9 @@ def build_decode_pass_args(
 
     if spec.fp_setting is not None:
         fp = _fp_setting_keys(spec.fp_setting)
+        pass_args[_DECODER_LAYER_RE] = {
+            "config": {"name": "minifloat", "decode": dict(fp)}
+        }
         pass_args[_MLP_RE] = {"config": {"name": "minifloat", "decode": dict(fp)}}
         pass_args[_RMSNORM_RE] = {"config": {"name": "minifloat", "decode": dict(fp)}}
 
