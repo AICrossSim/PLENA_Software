@@ -17,3 +17,5 @@ site/
 .venv
 llama_results/
 llama_logs/
+.pytest_cache/
+*.vcd
