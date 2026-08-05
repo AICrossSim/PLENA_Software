@@ -30,7 +30,7 @@ Per-table configs and run scripts live under `plena_experiments/`.
 
 ### Key dependencies
 
-- **mase** (`mase[mx-ptq]`) — quantization framework. Provides `quantize_module_transform_pass`, GPTQ, rotation search. Pinned via `[tool.uv.sources]` to the `releases/plena-experiments` branch of `DeepWok/mase`.
+- **mase** (`mase[mx-ptq]`) — quantization framework. Provides `quantize_module_transform_pass`, GPTQ, rotation search. Pinned via `[tool.uv.sources]` to the `sr1325/decode-phase-quant` branch of `DeepWok/mase`.
 - **fast-hadamard-transform** — Hadamard kernels used by rotation search. Pulled transitively as a git dep; built with `no-build-isolation`.
 
 ## Online DSE (hardware design-space exploration)
