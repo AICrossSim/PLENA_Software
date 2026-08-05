@@ -2997,7 +2997,7 @@ wheels = [
 [[package]]
 name = "mase"
 version = "1.0.0"
-source = { git = "https://github.com/DeepWok/mase.git?branch=releases%2Fplena-experiments#cb963b83149e1f00d53c700efd22772237d74ea2" }
+source = { git = "https://github.com/DeepWok/mase.git?branch=sr1325%2Fdecode-phase-quant#3fe1663e49be884034d17b6988a6f609cd633445" }
 dependencies = [
     { name = "absl-py" },
     { name = "accelerate" },
@@ -5383,6 +5383,9 @@ docs = [
 dse = [
     { name = "botorch" },
     { name = "gpytorch" },
+    { name = "optuna" },
+    { name = "pydantic" },
+    { name = "toml" },
 ]
 evalplus = [
     { name = "evalplus" },
@@ -5409,12 +5412,15 @@ requires-dist = [
     { name = "jsonargparse" },
     { name = "lm-eval", specifier = ">=0.4" },
     { name = "markdownify", marker = "extra == 'bfcl'" },
-    { name = "mase", extras = ["mx-ptq"], git = "https://github.com/DeepWok/mase.git?branch=releases%2Fplena-experiments" },
+    { name = "mase", extras = ["mx-ptq"], git = "https://github.com/DeepWok/mase.git?branch=sr1325%2Fdecode-phase-quant" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6" },
     { name = "mkdocs-jupyter", marker = "extra == 'docs'", specifier = ">=0.25" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
     { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.25" },
+    { name = "optuna", marker = "extra == 'dse'", specifier = ">=4.0" },
+    { name = "pydantic", marker = "extra == 'dse'", specifier = ">=2" },
     { name = "stop-sequencer", marker = "extra == 'evalplus'" },
+    { name = "toml", marker = "extra == 'dse'" },
     { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm" },
