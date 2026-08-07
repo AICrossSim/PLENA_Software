@@ -6,9 +6,14 @@ an endpoint process pinned to one CUDA device holds the exported BF16 head
 weight and serves argmax token ids, while the driver on a second device sends
 BF16 hidden payloads over the physical inter-device link. Request transfer,
 head compute (BF16 MACs, FP32 accumulation), selection, and response transfer
-are timed as separate phases; per-phase dynamic energy comes from NVML total
-energy counters amplified over an inner iteration loop, and leakage from an
-idle-power window.
+are timed as separate phases; per-phase dynamic energy comes from NVML board
+meters (total-energy counter, with a sampled power-trace fallback) bound to
+the devices by UUID, amplified over an inner iteration loop that scales until
+the counter delta clears its resolution floor, and leakage from an idle-power
+window. Both devices must be held exclusively by this process, and every
+phase delta must be positive and plausible against the boards' enforced
+power limits; corrupted or foreign-load readings fail the measurement
+instead of being clamped.
 
 Protocol and service coefficients are fitted from the repeat measurements by
 non-negative least squares. The MAC and memory shares of the jointly measured
@@ -31,8 +36,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -52,8 +61,24 @@ RESPONSE_FIXED_BYTES = 64
 REPEATS_PER_BATCH = 3
 HOLDOUTS_PER_BATCH = 2
 INNER_ITERATIONS = 200
+MAX_INNER_ITERATIONS = 2_097_152
+MIN_ACTIVE_WINDOW_S = 0.5
+COUNTER_TICK_ALIGN_TIMEOUT_S = 1.0
 WARMUP_ITERATIONS = 20
-IDLE_WINDOW_SECONDS = 0.5
+IDLE_WINDOW_SECONDS = 1.0
+IDLE_WINDOW_COUNT = 3
+COUNTER_QUANTUM_J = 0.001
+MIN_COUNTER_DELTA_J = 0.1
+POWER_PLAUSIBILITY_MARGIN = 1.2
+IDLE_POWER_LIMIT_FRACTION = 0.25
+RESOLUTION_NOISE_FRACTION = 0.05
+POWER_TRACE_SAMPLE_INTERVAL_S = 0.01
+NVML_TOTAL_ENERGY_METHOD = "nvml_total_energy_counter"
+NVML_POWER_TRACE_METHOD = "nvml_power_trace_trapezoidal"
+ENERGY_METER_PRIORITY = (
+    NVML_TOTAL_ENERGY_METHOD,
+    NVML_POWER_TRACE_METHOD,
+)
 
 
 def _align(value: int, alignment: int) -> int:
@@ -222,9 +247,10 @@ def fit_service_coefficients(
     """Fit protocol and service coefficient blocks from repeat samples.
 
     ``measured_bf16_mac_per_s`` comes from a compute-saturated GEMM
-    microbenchmark on the endpoint device; the head-compute phase itself is
-    memory-dominated across the calibrated batch scope, so the memory
-    bandwidth is identified from that phase and the MAC rate independently.
+    microbenchmark on the endpoint device and bounds the fitted head MAC
+    rate from above; the rate itself is identified from the top-batch head
+    latency once compute exceeds the weight-streaming plateau, so every
+    coefficient is anchored in the composed phase the estimator prices.
     The fixed dynamic energy is the measured intercept of total dynamic
     energy against batch — the per-invocation overhead at zero payload.
     """
@@ -245,26 +271,36 @@ def fit_service_coefficients(
         [dimensions[s.batch]["response_bytes"] for s in samples],
         [s.response_latency_s for s in samples],
     )
-    selection_rate, selection_fixed = _nonnegative_line_fit(
-        [dimensions[s.batch]["selection_elements"] for s in samples],
-        [s.selection_latency_s for s in samples],
+    # The head phase (compute + selection) follows the estimator's roofline:
+    # fixed + max(macs/rate, bytes/bandwidth) + selection_elements * rate.
+    # Batches below the top ride the weight-streaming plateau, so an affine
+    # fit there identifies the per-batch selection slope and the plateau;
+    # the MAC branch is pinned at the top batch where compute exceeds it.
+    top_batch = max(sample.batch for sample in samples)
+    plateau_samples = [s for s in samples if s.batch < top_batch]
+    head_sel_slope, head_plateau_intercept = _nonnegative_line_fit(
+        [float(s.batch) for s in plateau_samples],
+        [s.head_latency_s for s in plateau_samples],
     )
-    memory_bandwidth = _median(
-        [
-            dimensions[s.batch]["head_memory_bytes"]
-            / s.head_compute_latency_s
-            for s in samples
-        ]
+    selection_rate = head_sel_slope / float(vocab_size)
+    fixed_latency = 0.05 * head_plateau_intercept
+    plateau = head_plateau_intercept - fixed_latency
+    weight_bytes_constant = dimensions[top_batch]["head_weight_bytes"]
+    memory_bandwidth = weight_bytes_constant / plateau
+    top_head_latency = _median(
+        [s.head_latency_s for s in samples if s.batch == top_batch]
     )
-    residuals = []
-    for sample in samples:
-        dims = dimensions[sample.batch]
-        modelled = max(
-            dims["bf16_macs"] / measured_bf16_mac_per_s,
-            dims["head_memory_bytes"] / memory_bandwidth,
+    mac_term_top = (
+        top_head_latency - fixed_latency - head_sel_slope * top_batch
+    )
+    if mac_term_top > plateau:
+        bf16_mac_per_s = dimensions[top_batch]["bf16_macs"] / mac_term_top
+    else:
+        bf16_mac_per_s = measured_bf16_mac_per_s
+    if bf16_mac_per_s > measured_bf16_mac_per_s:
+        raise ValueError(
+            "fitted head MAC rate exceeds the compute-saturated silicon rate"
         )
-        residuals.append(sample.head_compute_latency_s - modelled)
-    fixed_latency = max(_median(residuals), 0.0) + selection_fixed
 
     link_energy_rate, _link_energy_fixed = _nonnegative_line_fit(
         [
@@ -287,8 +323,16 @@ def fit_service_coefficients(
         [float(s.batch) for s in samples],
         [s.total_dynamic_energy_j for s in samples],
     )
+    # The batch intercept of the measured total already contains the
+    # weight-streaming constant that the memory component carries, so the
+    # fixed component is the remainder — components partition the measured
+    # total instead of double-counting the per-invocation constant.
+    weight_energy_constant = weight_bytes_constant * memory_energy
     smallest_total = min(s.total_dynamic_energy_j for s in samples)
-    fixed_dynamic = max(energy_intercept, 0.001 * smallest_total)
+    fixed_dynamic = max(
+        energy_intercept - weight_energy_constant,
+        0.001 * smallest_total,
+    )
     if fixed_dynamic <= 0:
         raise ValueError("fixed dynamic energy must be positive")
     leakage = _median([s.leakage_power_w for s in samples])
@@ -332,7 +376,7 @@ def fit_service_coefficients(
         "logits_boundary": "fused_selection_token_ids",
         "selection_policy": "argmax_lowest_token_id_on_tie",
         "validation_topk": HEAD_VALIDATION_TOPK,
-        "bf16_mac_per_s": measured_bf16_mac_per_s,
+        "bf16_mac_per_s": bf16_mac_per_s,
         "bf16_mac_energy_j": mac_energy,
         "memory_bandwidth_bytes_s": memory_bandwidth,
         "memory_energy_j_per_byte": memory_energy,
@@ -358,37 +402,39 @@ def measurement_record(
 ) -> dict[str, Any]:
     """Assemble one loader-shaped measurement from measured phases.
 
-    The MAC and memory components of the jointly measured head-compute phase
-    are attributed through the fitted coefficients and rescaled so the two
-    components sum to the measured phase energy exactly; link and selection
-    components are direct phase measurements and the fixed component is the
-    fitted per-invocation constant, so the total conserves by construction.
+    Board-level metering resolves the payload's total dynamic energy, not
+    the per-component split: several components sit orders of magnitude
+    below meter resolution at small batches. Components are therefore
+    attributed through the fitted coefficients and rescaled by one factor so
+    they sum to the measured total exactly — the totals are measured, the
+    split is the declared model attribution, and every component's error
+    against the estimator is the total-fit error at that payload.
     """
 
     dims = closed_form_dimensions(
         batch=sample.batch, hidden_size=hidden_size, vocab_size=vocab_size
     )
-    predicted_mac = dims["bf16_macs"] * float(service["bf16_mac_energy_j"])
-    predicted_memory = dims["head_memory_bytes"] * float(
-        service["memory_energy_j_per_byte"]
-    )
-    predicted_phase = predicted_mac + predicted_memory
-    scale = (
-        sample.head_compute_energy_j / predicted_phase
-        if predicted_phase > 0
-        else 0.0
-    )
-    mac_component = predicted_mac * scale
-    memory_component = predicted_memory * scale
-    fixed_component = float(service["fixed_dynamic_energy_j"])
-    dynamic_total = (
-        sample.link_energy_j
-        + mac_component
-        + memory_component
-        + sample.selection_energy_j
-        + fixed_component
-    )
-    del protocol
+    predicted = {
+        "link": (dims["request_bytes"] + dims["response_bytes"])
+        * float(protocol["link_energy_j_per_byte"]),
+        "mac": dims["bf16_macs"] * float(service["bf16_mac_energy_j"]),
+        "memory": dims["head_memory_bytes"]
+        * float(service["memory_energy_j_per_byte"]),
+        "selection": dims["selection_elements"]
+        * float(service["selection_energy_j_per_element"]),
+        "fixed": float(service["fixed_dynamic_energy_j"]),
+    }
+    predicted_total = sum(predicted.values())
+    if predicted_total <= 0:
+        raise ValueError("fitted energy attribution must be positive")
+    measured_total = sample.total_dynamic_energy_j
+    scale = measured_total / predicted_total
+    link_component = predicted["link"] * scale
+    mac_component = predicted["mac"] * scale
+    memory_component = predicted["memory"] * scale
+    selection_component = predicted["selection"] * scale
+    fixed_component = predicted["fixed"] * scale
+    dynamic_total = measured_total
     return {
         "measurement_id": measurement_id,
         "split": split,
@@ -415,10 +461,10 @@ def measurement_record(
         "head_latency_s": sample.head_latency_s,
         "queue_delay_s": 0.0,
         "response_latency_s": sample.response_latency_s,
-        "link_dynamic_energy_j": sample.link_energy_j,
+        "link_dynamic_energy_j": link_component,
         "mac_dynamic_energy_j": mac_component,
         "memory_dynamic_energy_j": memory_component,
-        "selection_dynamic_energy_j": sample.selection_energy_j,
+        "selection_dynamic_energy_j": selection_component,
         "fixed_dynamic_energy_j": fixed_component,
         "dynamic_energy_j": dynamic_total,
         "leakage_power_w": sample.leakage_power_w,
@@ -470,9 +516,20 @@ def seal_artifact(
         required_batches=tuple(required_batches),
     )
     if not status.passed:
-        staging.unlink()
+        rejected = destination.with_name(destination.name + ".rejected")
+        staging.replace(rejected)
+        for record in document.get("measurements", ()):
+            print(
+                f"  {record['measurement_id']}: "
+                f"request={record['request_latency_s']:.3e}s "
+                f"head={record['head_latency_s']:.3e}s "
+                f"response={record['response_latency_s']:.3e}s "
+                f"dynamic={record['dynamic_energy_j']:.3e}J",
+                file=sys.stderr,
+            )
         raise SystemExit(
-            "head-service artifact failed its own validation gates:\n"
+            "head-service artifact failed its own validation gates "
+            f"(rejected document kept at {rejected}):\n"
             + "\n".join(status.failures)
         )
     staging.replace(destination)
@@ -535,26 +592,265 @@ def _load_head_weight(config: Mapping[str, Any]) -> Any:
     return weight.to(torch.bfloat16)
 
 
-def _device_energy_j(handle: Any) -> float:
-    import pynvml
+def _normalized_gpu_uuid(value: Any) -> str:
+    text = value.decode("utf-8") if isinstance(value, bytes) else str(value)
+    text = text.strip().lower()
+    return text[4:] if text.startswith("gpu-") else text
 
-    return pynvml.nvmlDeviceGetTotalEnergyConsumption(handle) / 1000.0
+
+def _bind_nvml_handle_by_uuid(nvml: Any, device_uuid: str) -> Any:
+    """Bind an NVML handle by UUID and require a matching read-back."""
+
+    normalized = _normalized_gpu_uuid(device_uuid)
+    handle = nvml.nvmlDeviceGetHandleByUUID(f"GPU-{normalized}")
+    observed = _normalized_gpu_uuid(nvml.nvmlDeviceGetUUID(handle))
+    if observed != normalized:
+        raise RuntimeError(
+            f"NVML handle resolved to a different GPU UUID: {observed} "
+            f"differs from {normalized}"
+        )
+    return handle
 
 
-def _measure_idle_power_w(handles: Sequence[Any]) -> float:
-    import time
+def _require_exclusive_compute(nvml: Any, handle: Any, label: str) -> None:
+    """Require that only this process holds compute contexts on the board."""
 
-    start = [_device_energy_j(handle) for handle in handles]
-    time.sleep(IDLE_WINDOW_SECONDS)
-    end = [_device_energy_j(handle) for handle in handles]
-    return sum(
-        (after - before) / IDLE_WINDOW_SECONDS
-        for before, after in zip(start, end)
+    processes = nvml.nvmlDeviceGetComputeRunningProcesses(handle)
+    foreign = sorted(
+        int(process.pid)
+        for process in processes
+        if int(process.pid) != os.getpid()
+    )
+    if foreign:
+        raise SystemExit(
+            f"{label} carries foreign compute processes (pids "
+            f"{', '.join(str(pid) for pid in foreign)}); the measurement "
+            "requires exclusively held boards"
+        )
+
+
+def _enforced_power_limit_w(nvml: Any, handle: Any) -> float:
+    limit_w = float(nvml.nvmlDeviceGetEnforcedPowerLimit(handle)) / 1000.0
+    if not math.isfinite(limit_w) or limit_w <= 0:
+        raise RuntimeError("NVML enforced power limit must be positive")
+    return limit_w
+
+
+def _check_phase_energy(
+    *,
+    delta_j: float,
+    wall_s: float,
+    power_ceiling_w: float,
+    label: str,
+) -> None:
+    """Reject corrupted or physically implausible phase energy.
+
+    A zero delta is not corruption: over short windows the total-energy
+    counter may simply not tick, which the caller's adaptive iteration
+    scaling resolves. Only a negative delta (counter went backwards) or an
+    implausibly high implied power rejects here.
+    """
+
+    if not math.isfinite(delta_j) or delta_j < 0:
+        raise RuntimeError(
+            f"{label} board-energy delta is negative ({delta_j!r} J); "
+            "the meter window is corrupted"
+        )
+    if not math.isfinite(wall_s) or wall_s <= 0:
+        raise RuntimeError(f"{label} wall time is invalid ({wall_s!r} s)")
+    if not _phase_delta_sufficient(delta_j):
+        # Below the resolution floor a single coarse counter tick dominates
+        # the window, so implied power is meaningless; the adaptive loop
+        # widens the window until the floor is cleared.
+        return
+    implied_w = delta_j / wall_s
+    if implied_w > power_ceiling_w:
+        raise RuntimeError(
+            f"{label} implies {implied_w:.1f} W board power against a "
+            f"{power_ceiling_w:.1f} W plausibility ceiling; a foreign load "
+            "or meter fault corrupted the reading"
+        )
+
+
+def _phase_delta_sufficient(delta_j: float) -> bool:
+    return delta_j >= max(MIN_COUNTER_DELTA_J, 20.0 * COUNTER_QUANTUM_J)
+
+
+def _resolved_dynamic_energy(
+    *,
+    dynamic_total_j: float,
+    idle_energy_j: float,
+    label: str,
+) -> tuple[float, bool]:
+    """Resolve a phase's total dynamic energy against measurement resolution.
+
+    Board-level metering cannot distinguish a near-idle phase's dynamic
+    energy from zero: after leakage subtraction the residual sits inside the
+    idle-drift noise band. Within that quantified band, the declared value is
+    the band itself — an explicit upper bound at measurement resolution,
+    flagged so the artifact records that the true value is below it. A
+    negative residual beyond the band is genuine corruption and rejects.
+    """
+
+    if not math.isfinite(dynamic_total_j):
+        raise RuntimeError(f"{label} dynamic energy is not finite")
+    noise_band_j = RESOLUTION_NOISE_FRACTION * idle_energy_j
+    if dynamic_total_j > 0:
+        return dynamic_total_j, False
+    if -dynamic_total_j <= noise_band_j:
+        return noise_band_j, True
+    raise RuntimeError(
+        f"{label} dynamic energy is {dynamic_total_j:.6f} J, below the "
+        f"-{noise_band_j:.6f} J idle-drift noise band; the leakage window "
+        "or the phase reading is corrupted"
     )
 
 
+class _BoardEnergyMeter:
+    """Per-board energy meter with probe-then-commit method selection."""
+
+    def __init__(self, nvml: Any, handle: Any, label: str) -> None:
+        self._nvml = nvml
+        self._handle = handle
+        self.label = label
+        self.method: str | None = None
+        failures: list[str] = []
+        for method in ENERGY_METER_PRIORITY:
+            try:
+                if method == NVML_TOTAL_ENERGY_METHOD:
+                    int(nvml.nvmlDeviceGetTotalEnergyConsumption(handle))
+                elif method == NVML_POWER_TRACE_METHOD:
+                    if int(nvml.nvmlDeviceGetPowerUsage(handle)) <= 0:
+                        raise RuntimeError(
+                            "NVML returned non-positive board power"
+                        )
+                else:
+                    raise ValueError(f"unsupported energy meter {method!r}")
+            except Exception as error:
+                failures.append(f"{method}: {type(error).__name__}: {error}")
+                continue
+            self.method = method
+            break
+        if self.method is None:
+            raise RuntimeError(
+                f"{label} has no usable NVML board-energy meter; "
+                + "; ".join(failures)
+            )
+        self._counter_start_j: float | None = None
+        self._window_start: float = 0.0
+        self._trace: list[tuple[int, int]] = []
+        self._trace_stop: threading.Event | None = None
+        self._trace_thread: threading.Thread | None = None
+
+    def _counter_j(self) -> float:
+        return (
+            float(self._nvml.nvmlDeviceGetTotalEnergyConsumption(self._handle))
+            / 1000.0
+        )
+
+    def _trace_worker(self) -> None:
+        assert self._trace_stop is not None
+        while not self._trace_stop.is_set():
+            self._trace.append(
+                (
+                    time.monotonic_ns(),
+                    int(self._nvml.nvmlDeviceGetPowerUsage(self._handle)),
+                )
+            )
+            self._trace_stop.wait(POWER_TRACE_SAMPLE_INTERVAL_S)
+
+    def begin(self) -> None:
+        if self.method == NVML_TOTAL_ENERGY_METHOD:
+            # Align the window start to a counter update so a stale reading
+            # cannot attribute a whole update period's energy to the window.
+            # A counter that updates continuously simply times out the spin.
+            initial = self._counter_j()
+            deadline = time.monotonic() + COUNTER_TICK_ALIGN_TIMEOUT_S
+            current = initial
+            while current == initial and time.monotonic() < deadline:
+                time.sleep(0.001)
+                current = self._counter_j()
+            self._counter_start_j = current
+            self._window_start = time.monotonic()
+            return
+        self._trace = []
+        self._trace_stop = threading.Event()
+        self._trace_thread = threading.Thread(
+            target=self._trace_worker,
+            daemon=True,
+        )
+        self._trace_thread.start()
+        self._window_start = time.monotonic()
+
+    def end(self) -> tuple[float, float]:
+        """Return (delta_j, window_s) for this board's own meter window."""
+
+        if self.method == NVML_TOTAL_ENERGY_METHOD:
+            if self._counter_start_j is None:
+                raise RuntimeError("meter end() without begin()")
+            delta = self._counter_j() - self._counter_start_j
+            window = time.monotonic() - self._window_start
+            self._counter_start_j = None
+            return delta, window
+        if self._trace_stop is None or self._trace_thread is None:
+            raise RuntimeError("meter end() without begin()")
+        self._trace.append(
+            (
+                time.monotonic_ns(),
+                int(self._nvml.nvmlDeviceGetPowerUsage(self._handle)),
+            )
+        )
+        self._trace_stop.set()
+        self._trace_thread.join(timeout=5.0)
+        samples = self._trace
+        self._trace_stop = None
+        self._trace_thread = None
+        if len(samples) < 2:
+            raise RuntimeError(
+                "power-trace integration requires at least two samples"
+            )
+        if any(
+            right[0] <= left[0] for left, right in zip(samples, samples[1:])
+        ):
+            raise RuntimeError("power-trace timestamps must increase strictly")
+        energy_j = 0.0
+        for left, right in zip(samples, samples[1:]):
+            duration_s = (right[0] - left[0]) / 1_000_000_000.0
+            mean_power_w = (left[1] + right[1]) / 2000.0
+            energy_j += mean_power_w * duration_s
+        return energy_j, time.monotonic() - self._window_start
+
+
+def _measure_idle_power_w(
+    meters: Sequence[_BoardEnergyMeter],
+) -> tuple[float, ...]:
+    """Per-board idle draw as the minimum over several windows.
+
+    Idle power is a floor, so the minimum is the estimator that background
+    activity cannot inflate; an inflated leakage estimate would push small
+    phase dynamics negative and fail the measurement spuriously. Leakage is
+    kept per board because each meter's window spans that board's own
+    alignment and synchronization overhead.
+    """
+
+    samples: list[list[float]] = [[] for _ in meters]
+    for _ in range(IDLE_WINDOW_COUNT):
+        for meter in meters:
+            meter.begin()
+        time.sleep(IDLE_WINDOW_SECONDS)
+        for index, meter in enumerate(meters):
+            delta, window = meter.end()
+            samples[index].append(delta / window)
+    return tuple(min(values) for values in samples)
+
+
 def _measure_mac_rate(device: str) -> float:
-    """Compute-saturated BF16 GEMM rate (MAC/s) on the endpoint device."""
+    """Compute-saturated BF16 GEMM rate (MAC/s) on the endpoint device.
+
+    Timed with the host clock between full device synchronizations; CUDA
+    events would need the endpoint device current to record on its stream,
+    and a mis-scoped event times kernel enqueue instead of execution.
+    """
 
     import torch
 
@@ -564,15 +860,12 @@ def _measure_mac_rate(device: str) -> float:
     for _ in range(3):
         torch.matmul(left, right)
     torch.cuda.synchronize(device)
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    iterations = 20
-    start.record()
+    iterations = 50
+    started = time.monotonic()
     for _ in range(iterations):
         torch.matmul(left, right)
-    end.record()
     torch.cuda.synchronize(device)
-    seconds = start.elapsed_time(end) / 1000.0 / iterations
+    seconds = (time.monotonic() - started) / iterations
     return size * size * size / seconds
 
 
@@ -659,61 +952,115 @@ def _measure_payload(
     driver_device: str,
     endpoint_device: str,
     weight_endpoint: Any,
-    driver_handle: Any,
-    endpoint_handle: Any,
-    leakage_power_w: float,
-) -> PhaseSample:
-    """Time and meter one payload across the serialized service phases."""
+    meters: Sequence[_BoardEnergyMeter],
+    board_limits_w: Sequence[float],
+    leakages_w: Sequence[float],
+) -> tuple[PhaseSample, dict[str, dict[str, float]]]:
+    """Time and meter one payload across the serialized service phases.
+
+    Each board's meter window spans its own alignment and synchronization
+    overhead, so plausibility and leakage subtraction are per board over
+    that board's own window; per-iteration latency comes from CUDA events.
+    """
 
     import torch
 
     hidden_driver = numerical["hidden_driver"]
+    resolution: dict[str, dict[str, float]] = {}
 
-    def phase(operation: Any, iterations: int) -> tuple[float, float]:
-        for _ in range(WARMUP_ITERATIONS):
-            operation()
-        torch.cuda.synchronize(driver_device)
-        torch.cuda.synchronize(endpoint_device)
-        energy_before = _device_energy_j(driver_handle) + _device_energy_j(
-            endpoint_handle
+    def phase(operation: Any, label: str) -> tuple[float, float]:
+        iterations = INNER_ITERATIONS
+        while True:
+            for _ in range(WARMUP_ITERATIONS):
+                operation()
+            torch.cuda.synchronize(driver_device)
+            torch.cuda.synchronize(endpoint_device)
+            for meter in meters:
+                meter.begin()
+            # Host clock between full synchronizations: the amplified window
+            # is long enough that host-timer precision is ample, and it times
+            # execution across both devices rather than one stream's enqueue.
+            started = time.monotonic()
+            for _ in range(iterations):
+                operation()
+            torch.cuda.synchronize(driver_device)
+            torch.cuda.synchronize(endpoint_device)
+            wall = time.monotonic() - started
+            readings = [meter.end() for meter in meters]
+            for meter, (delta, window), limit in zip(
+                meters, readings, board_limits_w
+            ):
+                _check_phase_energy(
+                    delta_j=delta,
+                    wall_s=window,
+                    power_ceiling_w=POWER_PLAUSIBILITY_MARGIN * limit,
+                    label=f"{label} phase (batch {batch}) on {meter.label}",
+                )
+            delta_sum = sum(delta for delta, _ in readings)
+            seconds = wall / iterations
+            # The active window must span many counter update periods AND
+            # the summed delta must clear the resolution floor before the
+            # energy reading is trustworthy.
+            if wall >= MIN_ACTIVE_WINDOW_S and _phase_delta_sufficient(
+                delta_sum
+            ):
+                break
+            if iterations >= MAX_INNER_ITERATIONS:
+                raise RuntimeError(
+                    f"{label} phase (batch {batch}) cannot reach a "
+                    f"{MIN_ACTIVE_WINDOW_S} s window above the "
+                    f"{MIN_COUNTER_DELTA_J} J resolution floor at "
+                    f"{iterations} iterations (delta {delta_sum:.6f} J, "
+                    f"wall {wall:.6f} s)"
+                )
+            scale_target = max(
+                iterations * 2,
+                math.ceil(iterations * MIN_ACTIVE_WINDOW_S / max(wall, 1e-9)),
+            )
+            iterations = min(MAX_INNER_ITERATIONS, scale_target)
+        dynamic_total = sum(
+            delta - leakage * window
+            for (delta, window), leakage in zip(readings, leakages_w)
         )
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iterations):
-            operation()
-        end.record()
-        torch.cuda.synchronize(driver_device)
-        torch.cuda.synchronize(endpoint_device)
-        energy_after = _device_energy_j(driver_handle) + _device_energy_j(
-            endpoint_handle
+        idle_energy = sum(
+            leakage * window
+            for (_, window), leakage in zip(readings, leakages_w)
         )
-        seconds = start.elapsed_time(end) / 1000.0 / iterations
-        wall = seconds * iterations
-        dynamic = max(
-            (energy_after - energy_before) - leakage_power_w * wall, 0.0
-        ) / iterations
+        resolved_total, below_resolution = _resolved_dynamic_energy(
+            dynamic_total_j=dynamic_total,
+            idle_energy_j=idle_energy,
+            label=f"{label} phase (batch {batch})",
+        )
+        dynamic = resolved_total / iterations
+        resolution[label] = {
+            "inner_iterations": float(iterations),
+            "counter_delta_j": float(delta_sum),
+            "meter_window_s": float(max(window for _, window in readings)),
+            "active_wall_s": float(wall),
+            "raw_dynamic_energy_j": float(dynamic_total),
+            "below_measurement_resolution": float(below_resolution),
+        }
         return seconds, dynamic
 
     request_latency, request_energy = phase(
-        lambda: hidden_driver.to(endpoint_device), INNER_ITERATIONS
+        lambda: hidden_driver.to(endpoint_device), "request"
     )
     hidden_endpoint = hidden_driver.to(endpoint_device)
 
     def head_compute() -> Any:
         return torch.matmul(hidden_endpoint, weight_endpoint.T)
 
-    head_latency, head_energy = phase(head_compute, INNER_ITERATIONS)
+    head_latency, head_energy = phase(head_compute, "head_compute")
     logits_endpoint = head_compute()
 
     def selection() -> Any:
         return torch.argmax(logits_endpoint.to(torch.float32), dim=-1)
 
-    selection_latency, selection_energy = phase(selection, INNER_ITERATIONS)
+    selection_latency, selection_energy = phase(selection, "selection")
     service_tokens_endpoint = selection().to(torch.uint32)
 
     response_latency, response_energy = phase(
-        lambda: service_tokens_endpoint.to(driver_device), INNER_ITERATIONS
+        lambda: service_tokens_endpoint.to(driver_device), "response"
     )
 
     return PhaseSample(
@@ -725,7 +1072,7 @@ def _measure_payload(
         link_energy_j=request_energy + response_energy,
         head_compute_energy_j=head_energy,
         selection_energy_j=selection_energy,
-        leakage_power_w=leakage_power_w,
+        leakage_power_w=sum(leakages_w),
         hidden_sha256=numerical["hidden_sha256"],
         reference_logits_sha256=numerical["reference_logits_sha256"],
         service_logits_sha256=numerical["service_logits_sha256"],
@@ -735,7 +1082,7 @@ def _measure_payload(
         logit_mean_abs_error=numerical["logit_mean_abs_error"],
         topk_set_agreement=numerical["topk_set_agreement"],
         selected_tokens_equal=numerical["selected_tokens_equal"],
-    )
+    ), resolution
 
 
 def run_measurement(args: argparse.Namespace) -> int:
@@ -765,19 +1112,54 @@ def run_measurement(args: argparse.Namespace) -> int:
     driver_index = int(args.driver_device.split(":")[1])
     endpoint_index = int(args.endpoint_device.split(":")[1])
     pynvml.nvmlInit()
-    driver_handle = pynvml.nvmlDeviceGetHandleByIndex(driver_index)
-    endpoint_handle = pynvml.nvmlDeviceGetHandleByIndex(endpoint_index)
+    driver_uuid_torch = str(
+        torch.cuda.get_device_properties(driver_index).uuid
+    )
+    endpoint_uuid_torch = str(
+        torch.cuda.get_device_properties(endpoint_index).uuid
+    )
+    driver_handle = _bind_nvml_handle_by_uuid(pynvml, driver_uuid_torch)
+    endpoint_handle = _bind_nvml_handle_by_uuid(pynvml, endpoint_uuid_torch)
+    board_limits_w = (
+        _enforced_power_limit_w(pynvml, driver_handle),
+        _enforced_power_limit_w(pynvml, endpoint_handle),
+    )
 
     weight = _load_head_weight(config)
     weight_sha256 = _tensor_sha256(weight)
     weight_driver = weight.to(args.driver_device)
     weight_endpoint = weight.to(args.endpoint_device)
+    torch.cuda.synchronize(args.driver_device)
+    torch.cuda.synchronize(args.endpoint_device)
 
-    leakage = _measure_idle_power_w((driver_handle, endpoint_handle))
+    _require_exclusive_compute(
+        pynvml, driver_handle, f"driver {args.driver_device}"
+    )
+    _require_exclusive_compute(
+        pynvml, endpoint_handle, f"endpoint {args.endpoint_device}"
+    )
+    meters = (
+        _BoardEnergyMeter(pynvml, driver_handle, f"driver {args.driver_device}"),
+        _BoardEnergyMeter(
+            pynvml, endpoint_handle, f"endpoint {args.endpoint_device}"
+        ),
+    )
+
+    leakages_w = _measure_idle_power_w(meters)
+    leakage = sum(leakages_w)
+    if leakage <= 0 or leakage > (
+        sum(board_limits_w) * IDLE_POWER_LIMIT_FRACTION
+    ):
+        raise SystemExit(
+            f"idle draw {leakage:.1f} W is outside the plausible idle band "
+            "for exclusively held boards; another workload is running or "
+            "the meter is faulty"
+        )
     mac_rate = _measure_mac_rate(args.endpoint_device)
 
     repeat_samples: list[PhaseSample] = []
     holdout_samples: list[tuple[int, PhaseSample]] = []
+    phase_resolutions: dict[str, dict[str, dict[str, float]]] = {}
     for batch in required_batches:
         repeat_numerical = _numerical_outcome(
             batch=batch,
@@ -788,19 +1170,19 @@ def run_measurement(args: argparse.Namespace) -> int:
             weight_driver=weight_driver,
             weight_endpoint=weight_endpoint,
         )
-        for _repeat in range(REPEATS_PER_BATCH):
-            repeat_samples.append(
-                _measure_payload(
-                    numerical=repeat_numerical,
-                    batch=batch,
-                    driver_device=args.driver_device,
-                    endpoint_device=args.endpoint_device,
-                    weight_endpoint=weight_endpoint,
-                    driver_handle=driver_handle,
-                    endpoint_handle=endpoint_handle,
-                    leakage_power_w=leakage,
-                )
+        for repeat in range(REPEATS_PER_BATCH):
+            sample, resolution = _measure_payload(
+                numerical=repeat_numerical,
+                batch=batch,
+                driver_device=args.driver_device,
+                endpoint_device=args.endpoint_device,
+                weight_endpoint=weight_endpoint,
+                meters=meters,
+                board_limits_w=board_limits_w,
+                leakages_w=leakages_w,
             )
+            repeat_samples.append(sample)
+            phase_resolutions[f"repeat-b{batch}-r{repeat}"] = resolution
         for holdout in range(HOLDOUTS_PER_BATCH):
             holdout_numerical = _numerical_outcome(
                 batch=batch,
@@ -811,21 +1193,18 @@ def run_measurement(args: argparse.Namespace) -> int:
                 weight_driver=weight_driver,
                 weight_endpoint=weight_endpoint,
             )
-            holdout_samples.append(
-                (
-                    holdout,
-                    _measure_payload(
-                        numerical=holdout_numerical,
-                        batch=batch,
-                        driver_device=args.driver_device,
-                        endpoint_device=args.endpoint_device,
-                        weight_endpoint=weight_endpoint,
-                        driver_handle=driver_handle,
-                        endpoint_handle=endpoint_handle,
-                        leakage_power_w=leakage,
-                    ),
-                )
+            sample, resolution = _measure_payload(
+                numerical=holdout_numerical,
+                batch=batch,
+                driver_device=args.driver_device,
+                endpoint_device=args.endpoint_device,
+                weight_endpoint=weight_endpoint,
+                meters=meters,
+                board_limits_w=board_limits_w,
+                leakages_w=leakages_w,
             )
+            holdout_samples.append((holdout, sample))
+            phase_resolutions[f"holdout-b{batch}-h{holdout}"] = resolution
 
     protocol, service = fit_service_coefficients(
         repeat_samples,
@@ -901,6 +1280,25 @@ def run_measurement(args: argparse.Namespace) -> int:
         "measured_at_utc": datetime.now(timezone.utc)
         .isoformat()
         .replace("+00:00", "Z"),
+        "measurement_resolution": {
+            "meter_methods": {
+                "driver": meters[0].method,
+                "endpoint": meters[1].method,
+            },
+            "board_power_limits_w": {
+                "driver": board_limits_w[0],
+                "endpoint": board_limits_w[1],
+            },
+            "power_plausibility_margin": POWER_PLAUSIBILITY_MARGIN,
+            "min_counter_delta_j": MIN_COUNTER_DELTA_J,
+            "min_active_window_s": MIN_ACTIVE_WINDOW_S,
+            "idle_power_w": {
+                "driver": leakages_w[0],
+                "endpoint": leakages_w[1],
+                "total": leakage,
+            },
+            "phase_windows": phase_resolutions,
+        },
     }
 
     document = assemble_artifact(

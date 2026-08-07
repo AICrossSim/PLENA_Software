@@ -120,6 +120,7 @@ _PROVENANCE_FIELDS = {
     "head_service_id",
     "process_corner",
     "measured_at_utc",
+    "measurement_resolution",
 }
 
 
