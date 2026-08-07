@@ -30,6 +30,7 @@ from decode_dse.software.runtime_environment import (
     capture_runtime_environment,
 )
 from decode_dse.software.sweep_plan import (
+    HARDWARE_VALIDATION_SAMPLE_CONTRACT,
     load_immutable_json,
     write_immutable_json,
 )
@@ -53,6 +54,11 @@ GPU_BASELINE_TIMING_SCOPE = (
 GPU_BASELINE_ENERGY_SCOPE = (
     "synchronized_board_energy_for_measured_decode_only_excluding_warmup"
 )
+# Every decode step visits a cache length the process has not executed before,
+# so the first pass through the shape sequence pays per-shape kernel selection.
+# One discarded warmup repetition replays the identical sequence; the measured
+# repetitions must then agree within this fraction of their median.
+GPU_BASELINE_REPETITION_SPREAD_LIMIT = 0.10
 NVML_TOTAL_ENERGY_METHOD = "nvml_total_energy_counter"
 NVML_POWER_TRACE_METHOD = "nvml_power_trace_trapezoidal"
 ENERGY_UNAVAILABLE_METHOD = "unavailable"
@@ -530,13 +536,20 @@ def build_gpu_baseline_contract(
         raise ValueError("baseline tokenizer revision differs from config")
     if workspace_binding.prompt_manifest_hash != bundle.prompt_manifest().canonical_hash:
         raise ValueError("baseline sample bundle differs from its workspace binding")
-    if len(bundle.hardware_validation) != 64:
+    expected_prompts = HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count
+    expected_prefill = HARDWARE_VALIDATION_SAMPLE_CONTRACT.prefill_tokens
+    if len(bundle.hardware_validation) != expected_prompts:
         raise ValueError(
-            "GPU baseline requires the complete 64-prompt hardware-validation set"
+            f"GPU baseline requires the complete {expected_prompts}-prompt "
+            "hardware-validation set"
         )
-    if any(len(sample.prompt_token_ids) != 512 for sample in bundle.hardware_validation):
+    if any(
+        len(sample.prompt_token_ids) != expected_prefill
+        for sample in bundle.hardware_validation
+    ):
         raise ValueError(
-            "GPU baseline requires 512-token hardware-validation prompts"
+            f"GPU baseline requires {expected_prefill}-token "
+            "hardware-validation prompts"
         )
     phase = dict(config.get("phase_contract", {}))
     if (
@@ -1077,7 +1090,9 @@ class GPUBaselineResult:
             raise ValueError("GPU baseline requires a physical device UUID")
         for snapshot in self.hardware_state_snapshots:
             fields = snapshot.fields
-            if fields["uuid"] != self.device_uuid:
+            if _nvidia_smi_device_id(fields["uuid"]) != _nvidia_smi_device_id(
+                self.device_uuid
+            ):
                 raise ValueError(
                     "GPU hardware-state UUID differs from runtime receipt"
                 )
@@ -1089,6 +1104,25 @@ class GPUBaselineResult:
             indices = tuple(item.repetition for item in self.repetitions)
             if indices != tuple(range(len(self.repetitions))):
                 raise ValueError("GPU repetition indices must be contiguous")
+            repetition_means = tuple(
+                statistics.mean(item.decode_step_ms)
+                for item in self.repetitions
+                if item.decode_step_ms
+            )
+            if len(repetition_means) != len(self.repetitions):
+                raise ValueError("GPU repetition is missing decode-step timings")
+            reference = statistics.median(repetition_means)
+            if reference <= 0.0:
+                raise ValueError("GPU repetition mean decode step must be positive")
+            spread = max(
+                abs(value - reference) / reference for value in repetition_means
+            )
+            if spread > GPU_BASELINE_REPETITION_SPREAD_LIMIT:
+                raise ValueError(
+                    "GPU repetition decode timings are not steady state: "
+                    f"spread {spread:.4f} exceeds "
+                    f"{GPU_BASELINE_REPETITION_SPREAD_LIMIT:.4f}"
+                )
             if any(
                 len(item.document_ids) != self.batch_size
                 for item in self.repetitions
@@ -1527,6 +1561,16 @@ def _capture_baseline_runtime(
     )
 
 
+def _nvidia_smi_device_id(device_uuid: str) -> str:
+    """Return the UUID in the ``GPU-`` form nvidia-smi selects devices by.
+
+    Torch reports the bare UUID, which is the form persisted in every
+    artifact; nvidia-smi matches no device without the prefix.
+    """
+    identifier = device_uuid.strip()
+    return identifier if identifier.startswith("GPU-") else f"GPU-{identifier}"
+
+
 def _capture_hardware_state(
     *,
     device_uuid: str,
@@ -1534,7 +1578,7 @@ def _capture_hardware_state(
 ) -> GPUHardwareStateSnapshot:
     command = (
         "nvidia-smi",
-        f"--id={device_uuid}",
+        f"--id={_nvidia_smi_device_id(device_uuid)}",
         f"--query-gpu={','.join(NVIDIA_SMI_QUERY_FIELDS)}",
         "--format=csv,noheader,nounits",
     )
@@ -1616,11 +1660,16 @@ class _NVMLBoardEnergyMeter:
             module.nvmlInit()
             self._initialized = True
             self._module = module
-            handle = module.nvmlDeviceGetHandleByUUID(self.device_uuid)
+            handle = module.nvmlDeviceGetHandleByUUID(
+                _nvidia_smi_device_id(self.device_uuid)
+            )
             observed_uuid = module.nvmlDeviceGetUUID(handle)
             if isinstance(observed_uuid, bytes):
                 observed_uuid = observed_uuid.decode("utf-8")
-            if str(observed_uuid).lower() != self.device_uuid.lower():
+            if (
+                _nvidia_smi_device_id(str(observed_uuid)).lower()
+                != _nvidia_smi_device_id(self.device_uuid).lower()
+            ):
                 raise RuntimeError("NVML handle resolved to a different GPU UUID")
             self._handle = handle
         except Exception as error:
@@ -2140,6 +2189,16 @@ def run_gpu_baseline(
         }
         if parameter_dtypes != {torch.bfloat16}:
             raise TypeError("GPU baseline model parameters must all be BF16")
+        _run_repetition(
+            model,
+            torch,
+            _select_repeat_samples(bundle, repetition=0, batch_size=batch_size),
+            energy_meter,
+            device=device,
+            warmup_steps=contract.warmup_steps,
+            measured_steps=contract.measured_steps,
+            repetition=0,
+        )
         for repetition in range(contract.repetitions):
             hardware_state_snapshots.append(
                 _capture_hardware_state(
