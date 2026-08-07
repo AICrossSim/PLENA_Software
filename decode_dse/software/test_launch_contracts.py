@@ -89,6 +89,8 @@ from decode_dse.software.benchmark_runner import (
 )
 from decode_dse.software.sweep_plan import (
     GPUBaselinePlan,
+    HARDWARE_VALIDATION_SAMPLE_CONTRACT,
+    NUMERICAL_SCREEN_SAMPLE_CONTRACT,
     PromptManifest,
     PromptRecord,
     build_quantizer_provenance,
@@ -298,23 +300,23 @@ def test_aggregate_launch_preflight_and_exact_memory_arithmetic(
     assert summary["launch_preflight"]["passed"] is True
     assert summary["quantizer_provenance_hash"]
     qwen_trace_plan = summary["compiler_trace_preflight"]
-    assert qwen_trace_plan["structurally_legal_hardware_candidates"] == 1_413_216
-    assert qwen_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 79_488
+    assert qwen_trace_plan["structurally_legal_hardware_candidates"] == 471_072
+    assert qwen_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 26_496
     assert qwen_trace_plan["compiler_base_hardware_signatures"] == 16_216
     assert qwen_trace_plan["exact_batch_record_signatures"] == 912
     assert qwen_trace_plan["unique_compiler_lowering_instantiations"] == 5_472
     assert qwen_trace_plan["unique_lazy_trace_instantiations"] == 912
-    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 811_185_984
+    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 270_395_328
     assert qwen_trace_plan["raw_context_point_resolutions"] == (
-        2_491_963_342_848
+        830_654_447_616
     )
-    assert qwen_trace_plan["physical_signature_pairs"] == 476_928
-    assert qwen_trace_plan["projected_context_timing_resolutions"] == 476_928
-    assert qwen_trace_plan["physical_context_step_outcomes"] == 1_465_122_816
-    assert qwen_trace_plan["projected_full_evaluator_calls"] == 476_928
-    assert qwen_trace_plan["projected_joined_identities"] == 476_928
+    assert qwen_trace_plan["physical_signature_pairs"] == 158_976
+    assert qwen_trace_plan["projected_context_timing_resolutions"] == 158_976
+    assert qwen_trace_plan["physical_context_step_outcomes"] == 488_374_272
+    assert qwen_trace_plan["projected_full_evaluator_calls"] == 158_976
+    assert qwen_trace_plan["projected_joined_identities"] == 158_976
     assert qwen_trace_plan["projected_trace_bytes"] == 9_622_781_952
-    assert qwen_trace_plan["projected_digest_updates"] == 953_856
+    assert qwen_trace_plan["projected_digest_updates"] == 317_952
     assert "projected_wall_clock_seconds" not in qwen_trace_plan
     assert qwen_trace_plan["compiler_trace_preflight_feasible"] is True
 
@@ -675,33 +677,33 @@ def test_model_general_resource_and_dry_run_contracts(
     assert first["provenance"] == second["provenance"]
     assert len(first["manifest"]["entries"]) == 3585
     assert first["cost_declaration"]["manifest_profiles"] == 3585
-    assert first["gpu_baseline_measurements"] == 4
-    assert len(first["gpu_baseline_work_units"]) == 4
-    assert first["cost_declaration"]["gpu_baseline_measurements"] == 4
-    assert first["cost_declaration"]["gpu_baseline_prefill_runs"] == 12
-    assert first["cost_declaration"]["gpu_baseline_decode_steps"] == 1728
+    assert first["gpu_baseline_measurements"] == 6
+    assert len(first["gpu_baseline_work_units"]) == 6
+    assert first["cost_declaration"]["gpu_baseline_measurements"] == 6
+    assert first["cost_declaration"]["gpu_baseline_prefill_runs"] == 18
+    assert first["cost_declaration"]["gpu_baseline_decode_steps"] == 2592
     assert first["run_plan"]["gpu_baseline"] == llama["gpu_baseline"]
     assert first["cost_declaration"]["total_work_units"] == (
-        first["cost_declaration"]["total_profile_evaluations"] + 4
+        first["cost_declaration"]["total_profile_evaluations"] + 6
     )
     llama_trace_plan = first["compiler_trace_preflight"]
-    assert llama_trace_plan["structurally_legal_hardware_candidates"] == 1_848_096
-    assert llama_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 272_160
+    assert llama_trace_plan["structurally_legal_hardware_candidates"] == 616_032
+    assert llama_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 90_720
     assert llama_trace_plan["compiler_base_hardware_signatures"] == 21_192
     assert llama_trace_plan["exact_batch_record_signatures"] == 3_144
     assert llama_trace_plan["unique_compiler_lowering_instantiations"] == 18_864
     assert llama_trace_plan["unique_lazy_trace_instantiations"] == 3_144
-    assert llama_trace_plan["raw_profile_candidate_pairs"] == 1_060_807_104
+    assert llama_trace_plan["raw_profile_candidate_pairs"] == 353_602_368
     assert llama_trace_plan["raw_context_point_resolutions"] == (
-        3_258_799_423_488
+        1_086_266_474_496
     )
-    assert llama_trace_plan["physical_signature_pairs"] == 1_632_960
-    assert llama_trace_plan["projected_context_timing_resolutions"] == 1_632_960
-    assert llama_trace_plan["physical_context_step_outcomes"] == 5_016_453_120
-    assert llama_trace_plan["projected_full_evaluator_calls"] == 1_632_960
-    assert llama_trace_plan["projected_joined_identities"] == 1_632_960
+    assert llama_trace_plan["physical_signature_pairs"] == 544_320
+    assert llama_trace_plan["projected_context_timing_resolutions"] == 544_320
+    assert llama_trace_plan["physical_context_step_outcomes"] == 1_672_151_040
+    assert llama_trace_plan["projected_full_evaluator_calls"] == 544_320
+    assert llama_trace_plan["projected_joined_identities"] == 544_320
     assert llama_trace_plan["projected_trace_bytes"] == 13_392_936_960
-    assert llama_trace_plan["projected_digest_updates"] == 3_265_920
+    assert llama_trace_plan["projected_digest_updates"] == 1_088_640
     assert "projected_wall_clock_seconds" not in llama_trace_plan
     assert (
         first["cost_declaration"]["projection_status"]
@@ -731,7 +733,7 @@ def test_model_general_resource_and_dry_run_contracts(
                 "--device-label",
                 "b200",
                 "--gpus",
-                "0,1",
+                "0,1,2,3",
                 "--dry-run",
             )
         )
@@ -763,6 +765,8 @@ def test_model_general_resource_and_dry_run_contracts(
         "gpu-baseline-batch-2",
         "gpu-baseline-batch-4",
         "gpu-baseline-batch-8",
+        "gpu-baseline-batch-16",
+        "gpu-baseline-batch-32",
     ]
     baseline_contract_command = next(
         command
@@ -837,6 +841,84 @@ def test_model_general_resource_and_dry_run_contracts(
     assert not (tmp_path / "blocked-execution").exists()
 
 
+def _simulator_performance_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the real artifact producer importable the way _disagg() would."""
+
+    from decode_dse import simulator_bridge
+
+    root = simulator_bridge._sim_root()
+    monkeypatch.syspath_prepend(str(root))
+    monkeypatch.syspath_prepend(str(root / "analytic_models" / "performance"))
+
+
+def _exact_trace_point(batch: int) -> dict[str, object]:
+    """One minimal exact point accepted by the real artifact producer."""
+
+    return {
+        "schema_version": "plena-compiler-trace-point-v1",
+        "artifact_scope": "full_model_decode_step_independent_request_batch",
+        "model": {
+            "model_json_sha256": "0" * 64,
+            "dimensions": {
+                "hidden": 16,
+                "inter": 32,
+                "layers": 1,
+                "heads": 2,
+                "kv_heads": 2,
+                "head_dim": 8,
+                "vocab": 32,
+            },
+            "layer_scope": "all_decoder_layers",
+            "output_head_location": "prefill_chip",
+        },
+        "precision": {
+            "specification": {"attn_elem": 4, "ffn_elem": 4, "kv_elem": 4},
+            "weight_format": "mxint",
+            "kv_format": "mxint",
+            "block_size": 8,
+            "mac_bits": 4,
+        },
+        "hardware": {
+            "array_geometry": {"mlen": 16, "blen": 2, "vlen": 16, "hlen": 8},
+            "hbm_timing_geometry": {
+                "generation": "HBM2",
+                "channels": 8,
+                "pin_rate_gbps": 2.0,
+            },
+            "configuration": {},
+            "memory_configuration": {},
+            "overrides": {"TP": 1, "KVP": 1},
+            "topology": {
+                "tp": 1,
+                "kvp": 1,
+                "chip_count": 1,
+                "explicit_topology": True,
+                "legacy_ideal_parallelism": False,
+                "link_ports": 0,
+                "sram_policy": "streaming",
+                "link_generation": "p2p_100GBs",
+                "architecture_knobs_explicit": True,
+                "kv_head_reuse": True,
+                "drain_overlapped": False,
+            },
+        },
+        "serving": {
+            "batch": batch,
+            "input_tokens": 17,
+            "generation_tokens": 1,
+            "sample_stride": 1,
+            "kv_layout": "dense_selector",
+            "runtime_hbm_reserve_bytes": 0,
+        },
+        "compiler": {
+            "settings_sha256": "1" * 64,
+            "latency_library_sha256": "2" * 64,
+            "timing_mode": "rtl_serialized",
+            "frequency_hz": 1.0e9,
+        },
+    }
+
+
 def test_compiler_trace_artifact_command_builds_the_configured_output(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -844,6 +926,7 @@ def test_compiler_trace_artifact_command_builds_the_configured_output(
 ) -> None:
     from decode_dse.software import sweep
 
+    _simulator_performance_paths(monkeypatch)
     config = _config()
     workspace = tmp_path / "workspace"
     output = workspace / "external" / "compiler_trace_artifacts.json"
@@ -852,7 +935,7 @@ def test_compiler_trace_artifact_command_builds_the_configured_output(
         json.dumps(config, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    points = (SimpleNamespace(name="first"), SimpleNamespace(name="second"))
+    points = (_exact_trace_point(batch=2), _exact_trace_point(batch=4))
     monkeypatch.setattr(sweep, "_build_manifest", lambda *args: _small_manifest())
     monkeypatch.setattr(
         sweep,
@@ -866,26 +949,6 @@ def test_compiler_trace_artifact_command_builds_the_configured_output(
         sweep,
         "_compiler_trace_generation_points",
         lambda *args: points,
-    )
-    observed: dict[str, object] = {}
-
-    def build(point_contexts, destination, *, dry_run):
-        resolved = tuple(point_contexts)
-        observed["points"] = tuple(point for point, _ in resolved)
-        observed["contexts"] = tuple(
-            (contexts.start, contexts.stop, contexts.step)
-            for _, contexts in resolved
-        )
-        observed["destination"] = destination
-        observed["dry_run"] = dry_run
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text('{"artifact_set_id":"fixture"}\n', encoding="utf-8")
-        return {"artifact_set_id": "fixture", "native_compile_calls": 2}
-
-    monkeypatch.setitem(
-        sys.modules,
-        "compiler_trace_timing",
-        SimpleNamespace(build_full_model_decode_artifact_set=build),
     )
     assert (
         sweep.compiler_trace_artifacts_main(
@@ -901,16 +964,79 @@ def test_compiler_trace_artifact_command_builds_the_configured_output(
         == 0
     )
     receipt = json.loads(capsys.readouterr().out)
-    assert observed == {
-        "points": points,
-        "contexts": ((512, 3584, 1), (512, 3584, 1)),
-        "destination": output,
-        "dry_run": False,
-    }
     assert receipt["point_count"] == 2
+    assert receipt["context_start"] == 512
+    assert receipt["context_stop"] == 3584
+    assert receipt["context_step"] == 1
     assert receipt["build"]["native_compile_calls"] == 2
+    assert receipt["build"]["unique_lowering_keys"] == 2
+    assert receipt["build"]["family_count"] == 1
+    assert receipt["build"]["record_count"] == 0
+    assert receipt["build"]["records_materialized"] == "lazy_at_consume"
     assert receipt["output"] == str(output)
     assert output.is_file()
+
+    from compiler_trace_timing import (
+        FullModelDecodeArtifactSet,
+        native_decode_compiler_source_sha256,
+    )
+
+    loaded = FullModelDecodeArtifactSet.load(output)
+    assert loaded.artifact_set_id == receipt["build"]["artifact_set_id"]
+    assert loaded.compiler_source_sha256 == native_decode_compiler_source_sha256()
+    assert loaded.records == ()
+    assert len(loaded.families) == 1
+
+
+def test_compiler_trace_artifact_command_dry_run_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from decode_dse.software import sweep
+
+    _simulator_performance_paths(monkeypatch)
+    config = _config()
+    workspace = tmp_path / "workspace"
+    output = workspace / "external" / "compiler_trace_artifacts.json"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(config, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sweep, "_build_manifest", lambda *args: _small_manifest())
+    monkeypatch.setattr(
+        sweep,
+        "_compiler_trace_feasibility",
+        lambda *args: {
+            "compiler_trace_preflight_feasible": True,
+            "compiler_trace_preflight_blockers": [],
+        },
+    )
+    monkeypatch.setattr(
+        sweep,
+        "_compiler_trace_generation_points",
+        lambda *args: (_exact_trace_point(batch=2),),
+    )
+    assert (
+        sweep.compiler_trace_artifacts_main(
+            (
+                "--config",
+                str(config_path),
+                "--output-dir",
+                str(workspace),
+                "--output",
+                str(output),
+                "--dry-run",
+            )
+        )
+        == 0
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    assert receipt["dry_run"] is True
+    assert receipt["output"] is None
+    assert receipt["build"]["native_compile_calls"] == 1
+    assert not output.exists()
 
 
 def test_measured_gpu_baseline_binding_and_strict_comparison_tiers(
@@ -960,7 +1086,7 @@ def test_measured_gpu_baseline_binding_and_strict_comparison_tiers(
                 prompt_hash=hashlib.sha256(f"prompt-{index}".encode()).hexdigest(),
                 token_count=512,
             )
-            for index in range(64)
+            for index in range(HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count)
         ),
         attention_implementation="sdpa",
         warmup_steps=1,
@@ -1453,6 +1579,7 @@ def test_refinement_hardware_points_preserve_energy_identity_and_tier() -> None:
                 "capacity": {"feasible": True},
                 "whole_model": {
                     "rankable": True,
+                    "publication_timing_tier": "stage_calibrated_analytic",
                     "tpot_ms": 10.0,
                     "tps": 100.0,
                     "system_calibration_id": "system-calibration",
@@ -1514,14 +1641,14 @@ def test_stubbed_stage_pipeline_is_idempotent_end_to_end(
                 document_id=f"numerical-{index:03d}",
                 prompt_hash=hashlib.sha256(f"n{index}".encode()).hexdigest(),
             )
-            for index in range(16)
+            for index in range(NUMERICAL_SCREEN_SAMPLE_CONTRACT.prompt_count)
         ),
         hardware_validation=tuple(
             PromptRecord(
                 document_id=f"hardware-{index:03d}",
                 prompt_hash=hashlib.sha256(f"h{index}".encode()).hexdigest(),
             )
-            for index in range(64)
+            for index in range(HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count)
         ),
     )
     prompt_path = tmp_path / "prompts.json"
@@ -1875,6 +2002,10 @@ def test_publication_chat_template_is_sealed_only_from_pinned_local_inputs() -> 
             encoding="utf-8"
         )
     )
+    # Exercise the tokenizer-execution path: drop any sealed asset pin, exactly
+    # as seal_chat_template_asset does before extraction.
+    llama_config["publication"].pop("chat_template_asset", None)
+    llama_config["publication"].pop("chat_template_sha256", None)
     calls = []
 
     class LocalTokenizer:
@@ -2364,9 +2495,10 @@ def test_full_publication_pipeline_receipts_partition_and_resume(
     for command in commands:
         if command.name.startswith("exact-hardware-study"):
             parsed = evaluation._parser().parse_args(command.argv[3:])
-            assert parsed.execution_mode == "compiler_trace"
-            assert parsed.compiler_trace_artifacts
-            assert parsed.request_memory_calibration
+            assert parsed.execution_mode == "legacy_aggregate_bandwidth"
+            assert parsed.publication_timing_tier == "stage_calibrated_analytic"
+            assert parsed.compiler_trace_artifacts is None
+            assert parsed.request_memory_calibration is None
     figure_stems = (
         "00_numerical_completion",
         "01_accuracy_by_weight",
@@ -3285,3 +3417,139 @@ def test_chat_template_sealing_pins_the_config(
         updated["publication"]["chat_template_sha256"] == template_hash
     )
     assert updated["model_architecture"] == config["model_architecture"]
+
+
+class _WidthRecordingModel:
+    """Fake decoder: records forward batch, appends one cache entry per call."""
+
+    def __init__(self, vocabulary: int = 8) -> None:
+        self.vocabulary = vocabulary
+        self.seen_batches: list[int] = []
+
+    def eval(self) -> "_WidthRecordingModel":
+        return self
+
+    def __call__(self, *, input_ids, attention_mask, position_ids,
+                 cache_position, past_key_values, use_cache):
+        import torch
+
+        batch = int(input_ids.shape[0])
+        self.seen_batches.append(batch)
+        assert attention_mask.shape[0] == batch
+        assert position_ids.shape[0] == batch
+        layers = past_key_values
+        for index in range(len(layers.layers)):
+            key = torch.zeros(batch, 1, 1, 2)
+            layers.update(key, key.clone(), index)
+        logits = torch.zeros(batch, 1, self.vocabulary)
+        logits[:, 0, 0] = torch.arange(batch, dtype=logits.dtype)
+        return SimpleNamespace(logits=logits, past_key_values=layers)
+
+
+def _legacy_lanes(batch: int, length: int = 3):
+    import torch
+
+    key = torch.arange(
+        batch * 1 * length * 2, dtype=torch.float32
+    ).reshape(batch, 1, length, 2)
+    return ((key, key.clone()),)
+
+
+def test_execution_batch_width_requires_plain_append_path():
+    from decode_dse.software.cached_decode import TorchHFCachedDecodeBackend
+
+    with pytest.raises(ValueError):
+        TorchHFCachedDecodeBackend(
+            device="cpu",
+            append_transform=lambda cache, start, end, artifact: cache,
+            execution_batch_width=4,
+        )
+    with pytest.raises(ValueError):
+        TorchHFCachedDecodeBackend(device="cpu", execution_batch_width=0)
+
+
+def test_adopt_cache_pads_to_execution_width_and_reports_logical_batch():
+    import torch
+
+    from decode_dse.software.cached_decode import (
+        TorchHFCachedDecodeBackend,
+        _cache_from_layers,
+    )
+
+    backend = TorchHFCachedDecodeBackend(
+        device="cpu", native_append_format=True, execution_batch_width=4
+    )
+    cache = backend.adopt_cache(_cache_from_layers(_legacy_lanes(1)))
+    first_key = cache.layers[0].keys
+    assert first_key.shape[0] == 4
+    assert torch.equal(first_key[1], first_key[0])
+    assert backend.cache_batch_size(cache) == 1
+    assert backend.cache_length(cache) == 3
+
+    plain = TorchHFCachedDecodeBackend(device="cpu", native_append_format=True)
+    untouched = plain.adopt_cache(_cache_from_layers(_legacy_lanes(1)))
+    assert plain.cache_batch_size(untouched) == 1
+    assert untouched.layers[0].keys.shape[0] == 1
+
+
+def test_decode_step_pads_forward_and_slices_lane_zero():
+    from decode_dse.software.cached_decode import (
+        TorchHFCachedDecodeBackend,
+        _cache_from_layers,
+    )
+
+    backend = TorchHFCachedDecodeBackend(
+        device="cpu", native_append_format=True, execution_batch_width=4
+    )
+    model = _WidthRecordingModel()
+    cache = backend.adopt_cache(_cache_from_layers(_legacy_lanes(1)))
+    result = backend.decode_step(
+        model,
+        input_token_id=5,
+        cache=cache,
+        attention_mask=(1, 1, 1, 1),
+        position_id=3,
+        cache_position=3,
+    )
+    assert model.seen_batches == [4]
+    assert tuple(result.logits.shape[:2]) == (1, 1)
+    assert float(result.logits[0, 0, 0]) == 0.0
+    assert backend.cache_batch_size(result.cache) == 1
+    assert backend.cache_length(result.cache) == 4
+
+
+def test_decode_step_batch_pads_forward_and_slices_real_lanes():
+    from decode_dse.software.cached_decode import (
+        TorchHFCachedDecodeBackend,
+        _cache_from_layers,
+    )
+
+    backend = TorchHFCachedDecodeBackend(
+        device="cpu", native_append_format=True, execution_batch_width=4
+    )
+    model = _WidthRecordingModel()
+    cache = backend.adopt_cache(
+        _cache_from_layers(_legacy_lanes(2)), logical_batch=2
+    )
+    result = backend.decode_step_batch(
+        model,
+        input_token_ids=(5, 6),
+        cache=cache,
+        attention_masks=((1, 1, 1, 1), (1, 1, 1, 1)),
+        position_ids=(3, 3),
+        cache_position=3,
+    )
+    assert model.seen_batches == [4]
+    assert tuple(result.logits.shape[:2]) == (2, 1)
+    assert [float(row[0, 0]) for row in result.logits] == [0.0, 1.0]
+    assert backend.cache_batch_size(result.cache) == 2
+
+    with pytest.raises(ValueError):
+        backend.decode_step_batch(
+            model,
+            input_token_ids=(1, 2, 3, 4, 5),
+            cache=cache,
+            attention_masks=(((1,) * 5),) * 5,
+            position_ids=(3,) * 5,
+            cache_position=3,
+        )

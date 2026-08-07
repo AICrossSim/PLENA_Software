@@ -337,6 +337,21 @@ def evaluate_cached_documents(
     )
 
 
+def _cache_from_layers(legacy: tuple[tuple[Any, Any], ...]) -> Any:
+    """Build a transformers Cache from per-layer (key, value) pairs.
+
+    ``DynamicCache.from_legacy_cache`` no longer exists on current
+    transformers; layer-wise ``update`` is the stable construction API.
+    """
+
+    from transformers import DynamicCache
+
+    cache = DynamicCache()
+    for layer_idx, (key, value) in enumerate(legacy):
+        cache.update(key, value, layer_idx)
+    return cache
+
+
 def _legacy_cache_layers(cache: Any) -> tuple[tuple[Any, Any], ...]:
     if hasattr(cache, "to_legacy_cache"):
         cache = cache.to_legacy_cache()
@@ -466,12 +481,68 @@ class TorchHFCachedDecodeBackend:
         append_transform: AppendTransform | None = None,
         append_validator: AppendValidator | None = None,
         native_append_format: bool = False,
+        execution_batch_width: int | None = None,
     ) -> None:
+        # GPU GEMM kernel selection depends on the total batch count, so the
+        # same lane rounds differently at different batch sizes. Padding every
+        # forward to one fixed width keeps kernel dispatch identical across
+        # microbatch sizes; lane isolation keeps pad lanes from affecting real
+        # lanes. Only the plain-cache path supports it: append transforms and
+        # cache factories assume the cache holds exactly the real lanes.
+        if execution_batch_width is not None:
+            if int(execution_batch_width) < 1:
+                raise ValueError("execution_batch_width must be positive")
+            if (
+                cache_factory is not None
+                or append_transform is not None
+                or append_validator is not None
+            ):
+                raise ValueError(
+                    "execution_batch_width requires the plain cache-append path"
+                )
         self.device = device
         self.cache_factory = cache_factory
         self.append_transform = append_transform
         self.append_validator = append_validator
         self.native_append_format = native_append_format
+        self.execution_batch_width = (
+            None if execution_batch_width is None else int(execution_batch_width)
+        )
+
+    def _padded_legacy(
+        self,
+        legacy: tuple[tuple[Any, Any], ...],
+        logical_batch: int,
+    ) -> tuple[tuple[Any, Any], ...]:
+        import torch
+
+        width = self.execution_batch_width
+        if width is None or width == logical_batch:
+            return legacy
+        if logical_batch > width:
+            raise ValueError(
+                f"cache batch {logical_batch} exceeds execution width {width}"
+            )
+        pad = width - logical_batch
+        return tuple(
+            (
+                torch.cat((key, *(key[:1],) * pad), dim=0),
+                torch.cat((value, *(value[:1],) * pad), dim=0),
+            )
+            for key, value in legacy
+        )
+
+    def _tag_logical_batch(self, cache: Any, logical_batch: int) -> Any:
+        if self.execution_batch_width is not None:
+            cache._decode_logical_batch = int(logical_batch)
+        return cache
+
+    def adopt_cache(self, cache: Any, *, logical_batch: int = 1) -> Any:
+        """Pad a live model cache to the execution width for decode stepping."""
+        if self.execution_batch_width is None:
+            return cache
+        legacy = self._padded_legacy(_legacy_cache_layers(cache), logical_batch)
+        return self._tag_logical_batch(_cache_from_layers(legacy), logical_batch)
 
     def materialize_cache(self, artifact: DecodeCacheArtifact) -> Any:
         legacy = tuple(
@@ -483,12 +554,8 @@ class TorchHFCachedDecodeBackend:
         )
         if self.cache_factory is not None:
             return self.cache_factory(legacy)
-        try:
-            from transformers import DynamicCache
-
-            return DynamicCache.from_legacy_cache(legacy)
-        except (ImportError, AttributeError):
-            return legacy
+        legacy = self._padded_legacy(legacy, 1)
+        return self._tag_logical_batch(_cache_from_layers(legacy), 1)
 
     def materialize_cache_batch(
         self,
@@ -538,12 +605,9 @@ class TorchHFCachedDecodeBackend:
         )
         if self.cache_factory is not None:
             return self.cache_factory(legacy)
-        try:
-            from transformers import DynamicCache
-
-            return DynamicCache.from_legacy_cache(legacy)
-        except (ImportError, AttributeError):
-            return legacy
+        logical_batch = len(artifacts)
+        legacy = self._padded_legacy(legacy, logical_batch)
+        return self._tag_logical_batch(_cache_from_layers(legacy), logical_batch)
 
     def _first_key(self, cache: Any) -> Any:
         return _legacy_cache_layers(cache)[0][0]
@@ -555,6 +619,9 @@ class TorchHFCachedDecodeBackend:
         return int(self._first_key(cache).shape[-2])
 
     def cache_batch_size(self, cache: Any) -> int:
+        logical = getattr(cache, "_decode_logical_batch", None)
+        if logical is not None:
+            return int(logical)
         return int(self._first_key(cache).shape[0])
 
     def decode_step(
@@ -569,16 +636,17 @@ class TorchHFCachedDecodeBackend:
     ) -> DecodeStep:
         import torch
 
+        width = self.execution_batch_width or 1
         input_ids = torch.tensor(
-            [[input_token_id]], dtype=torch.long, device=self.device
+            [[input_token_id]] * width, dtype=torch.long, device=self.device
         )
         if input_ids.shape[1] != 1:
             raise AssertionError("decode input must have q_len=1")
         mask = torch.tensor(
-            [attention_mask], dtype=torch.long, device=self.device
+            [attention_mask] * width, dtype=torch.long, device=self.device
         )
         positions = torch.tensor(
-            [[position_id]], dtype=torch.long, device=self.device
+            [[position_id]] * width, dtype=torch.long, device=self.device
         )
         cache_positions = torch.tensor(
             [cache_position], dtype=torch.long, device=self.device
@@ -593,9 +661,10 @@ class TorchHFCachedDecodeBackend:
                 past_key_values=cache,
                 use_cache=True,
             )
-        if output.logits.ndim != 3 or output.logits.shape[:2] != (1, 1):
+        if output.logits.ndim != 3 or output.logits.shape[:2] != (width, 1):
             raise AssertionError("decode logits must have shape [1, 1, vocabulary]")
-        return DecodeStep(logits=output.logits, cache=output.past_key_values)
+        cache = self._tag_logical_batch(output.past_key_values, 1)
+        return DecodeStep(logits=output.logits[:1], cache=cache)
 
     def decode_step_batch(
         self,
@@ -621,6 +690,17 @@ class TorchHFCachedDecodeBackend:
             raise ValueError("batched decode inputs have inconsistent batch sizes")
         if len({len(row) for row in masks}) != 1:
             raise ValueError("batched attention masks must have equal lengths")
+        width = batch
+        if self.execution_batch_width is not None:
+            width = self.execution_batch_width
+            if batch > width:
+                raise ValueError(
+                    f"decode batch {batch} exceeds execution width {width}"
+                )
+            pad = width - batch
+            tokens = tokens + (tokens[0],) * pad
+            masks = masks + (masks[0],) * pad
+            positions_values = positions_values + (positions_values[0],) * pad
         input_ids = torch.tensor(
             tokens,
             dtype=torch.long,
@@ -649,11 +729,12 @@ class TorchHFCachedDecodeBackend:
                 past_key_values=cache,
                 use_cache=True,
             )
-        if output.logits.ndim != 3 or output.logits.shape[:2] != (batch, 1):
+        if output.logits.ndim != 3 or output.logits.shape[:2] != (width, 1):
             raise AssertionError(
                 "decode logits must have shape [batch, 1, vocabulary]"
             )
-        return DecodeStep(logits=output.logits, cache=output.past_key_values)
+        cache = self._tag_logical_batch(output.past_key_values, batch)
+        return DecodeStep(logits=output.logits[:batch], cache=cache)
 
     def commit_append(
         self,

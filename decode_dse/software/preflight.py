@@ -217,8 +217,14 @@ def _run_device_anchor_worker(
 
 
 class _RecordingBackend(TorchHFCachedDecodeBackend):
-    def __init__(self, *, device: Any) -> None:
-        super().__init__(device=device, native_append_format=True)
+    def __init__(
+        self, *, device: Any, execution_batch_width: int | None = None
+    ) -> None:
+        super().__init__(
+            device=device,
+            native_append_format=True,
+            execution_batch_width=execution_batch_width,
+        )
         self.logits: list[Any] = []
 
     def decode_step(self, model: Any, **kwargs: Any):
@@ -249,6 +255,7 @@ def _evaluate_bf16(
     continuation: tuple[int, ...],
     document_id: str,
     provenance: ArtifactProvenance,
+    execution_batch_width: int | None = None,
 ) -> tuple[Any, tuple[Any, ...]]:
     admitted = admit_prefill_cache(
         prefill,
@@ -258,7 +265,9 @@ def _evaluate_bf16(
         provenance=provenance,
         metadata={"document_id": document_id},
     )
-    backend = _RecordingBackend(device=device)
+    backend = _RecordingBackend(
+        device=device, execution_batch_width=execution_batch_width
+    )
     result = evaluate_teacher_forced_cached(
         model,
         ContinuationExample(
@@ -278,6 +287,7 @@ def _evaluate_direct_hf(
     device: Any,
     prompt_token_ids: tuple[int, ...],
     continuation: tuple[int, ...],
+    execution_batch_width: int | None = None,
 ) -> tuple[float, tuple[Any, ...], tuple[int, ...]]:
     import torch
 
@@ -308,8 +318,10 @@ def _evaluate_direct_hf(
     first_token = int(output.logits[0, -1].argmax(dim=-1).item())
     if first_token != continuation[0]:
         raise AssertionError("direct BF16 prefill selected a different first token")
-    backend = _RecordingBackend(device=device)
-    cache = output.past_key_values
+    backend = _RecordingBackend(
+        device=device, execution_batch_width=execution_batch_width
+    )
+    cache = backend.adopt_cache(output.past_key_values)
     losses: list[float] = []
     predicted = [first_token]
     for step_index, target_token in enumerate(continuation[1:]):
@@ -353,6 +365,10 @@ def _run_bf16_worker(
     )
     executor = DecodeEvaluator(context)
     model = executor._load_model().to(executor.device).eval()
+    execution_batch_width = max(
+        context.run_plan.numerical_screen_microbatch_size,
+        context.run_plan.hardware_validation_microbatch_size,
+    )
     provenance = ArtifactProvenance(
         producer="packedkv-bf16-preflight-check",
         code_revision=context.master_manifest.canonical_hash,
@@ -394,6 +410,7 @@ def _run_bf16_worker(
                 device=executor.device,
                 prompt_token_ids=sample.prompt_token_ids,
                 continuation=continuation,
+                execution_batch_width=execution_batch_width,
             )
             fresh_result, fresh_logits = _evaluate_bf16(
                 model=model,
@@ -402,6 +419,7 @@ def _run_bf16_worker(
                 continuation=continuation,
                 document_id=sample.document_id,
                 provenance=provenance,
+                execution_batch_width=execution_batch_width,
             )
             saved_result, saved_logits = _evaluate_bf16(
                 model=model,
@@ -410,6 +428,7 @@ def _run_bf16_worker(
                 continuation=continuation,
                 document_id=sample.document_id,
                 provenance=provenance,
+                execution_batch_width=execution_batch_width,
             )
             if len(direct_logits) != len(saved_logits):
                 raise AssertionError("BF16 decode produced different step counts")
@@ -482,13 +501,19 @@ def _run_bf16_worker(
             }
         ):
             selected = tuple(batched_examples[:microbatch_size])
-            backend = _RecordingBackend(device=executor.device)
+            backend = _RecordingBackend(
+                device=executor.device,
+                execution_batch_width=execution_batch_width,
+            )
             batched = evaluate_teacher_forced_cached_batched(
                 model,
                 selected,
                 backend,
             )
-            reversed_backend = _RecordingBackend(device=executor.device)
+            reversed_backend = _RecordingBackend(
+                device=executor.device,
+                execution_batch_width=execution_batch_width,
+            )
             reversed_results = evaluate_teacher_forced_cached_batched(
                 model,
                 tuple(reversed(selected)),
@@ -551,6 +576,7 @@ def _run_bf16_worker(
                         if entry.profile.kind == PROFILE_KIND_BF16_REFERENCE
                     ),
                     "microbatch_size": microbatch_size,
+                    "execution_batch_width": execution_batch_width,
                     "max_abs_logit_error": max_logit_error,
                     "max_abs_token_nll_error": max_nll_error,
                     "max_abs_permutation_nll_error": permutation_error,
