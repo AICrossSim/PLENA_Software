@@ -74,7 +74,11 @@ from decode_dse.software.cache_artifacts import (
 from decode_dse.legality import (
     load_built_stack_validity,
 )
-from decode_dse.software.sweep_plan import load_immutable_json, resolve_bound_path
+from decode_dse.software.sweep_plan import (
+    load_immutable_json,
+    resolve_bound_path,
+    write_immutable_json,
+)
 
 PACKED_CACHE_LAYOUT = "packed-gqa-mlen1024-block8-native-encoding"
 _PACKED_CACHE_LAYOUT_RE = re.compile(
