@@ -39,6 +39,8 @@ from decode_dse.software.refinement_schedule import (
     RefinementScheduleEntry,
     RefinementShardPlan,
     build_refinement_shard_plans,
+    load_refinement_schedule,
+    load_refinement_shard_plan,
     validate_refinement_shard_plan,
     write_refinement_shard_plan,
 )

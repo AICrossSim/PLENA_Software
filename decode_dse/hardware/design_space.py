@@ -91,6 +91,14 @@ DECODE_EXECUTION_MODES = frozenset(
         LEGACY_AGGREGATE_BANDWIDTH_MODE,
     }
 )
+COMPILER_TRACE_TIMING_TIER = "compiler_trace_request_calibrated"
+STAGE_CALIBRATED_ANALYTIC_TIMING_TIER = "stage_calibrated_analytic"
+PUBLICATION_TIMING_TIERS = frozenset(
+    {
+        COMPILER_TRACE_TIMING_TIER,
+        STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
+    }
+)
 
 CHIP_COUNTS = (1, 2, 4, 8, 16)
 SRAM_POLICIES = (
@@ -1331,6 +1339,7 @@ class HardwareMetrics:
     whole_model_energy: CalibratedEnergy | None = None
     system_calibration_id: str | None = None
     whole_model_rankable: bool = False
+    publication_timing_tier: str | None = None
     avg_ideal_compute_seconds: float | None = None
     avg_realized_compute_seconds: float | None = None
     avg_memory_seconds: float | None = None
@@ -1728,6 +1737,16 @@ class HardwareMetrics:
                 )
         if not isinstance(self.whole_model_rankable, bool):
             raise TypeError("whole_model_rankable must be boolean")
+        if self.publication_timing_tier is not None and (
+            self.publication_timing_tier not in PUBLICATION_TIMING_TIERS
+        ):
+            raise ValueError(
+                "publication_timing_tier must be a declared timing tier"
+            )
+        if self.whole_model_rankable and self.publication_timing_tier is None:
+            raise ValueError(
+                "rankable whole-model metrics require a publication timing tier"
+            )
         canonical_head_status = json.loads(
             _canonical_bytes(dict(self.output_head_status))
         )
@@ -2186,6 +2205,7 @@ class HardwareMetrics:
             },
             "whole_model": {
                 "rankable": self.whole_model_rankable,
+                "publication_timing_tier": self.publication_timing_tier,
                 "tpot_ms": self.whole_model_tpot_ms,
                 "tps": self.whole_model_tps,
                 "calibrated_energy": (

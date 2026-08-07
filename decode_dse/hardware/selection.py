@@ -115,11 +115,23 @@ class ParetoPoint:
     head_service_calibration_id: str | None = None
     whole_model_rankable: bool = False
     energy_tier: str | None = None
+    publication_timing_tier: str | None = None
 
     def __post_init__(self) -> None:
         _finite_optional("mean_nll", self.mean_nll)
         for name in ("tpot_ms", "tps", "energy_per_token_j", "area_mm2"):
             _finite_optional(name, getattr(self, name), positive=True)
+        if self.publication_timing_tier is not None:
+            from decode_dse.hardware.design_space import (
+                PUBLICATION_TIMING_TIERS,
+            )
+
+            if self.publication_timing_tier not in PUBLICATION_TIMING_TIERS:
+                raise ValueError("publication_timing_tier is unsupported")
+        if self.whole_model_rankable and self.publication_timing_tier is None:
+            raise ValueError(
+                "rankable points require a publication timing tier"
+            )
         has_power_cost = (
             self.energy_per_token_j is not None or self.area_mm2 is not None
         )

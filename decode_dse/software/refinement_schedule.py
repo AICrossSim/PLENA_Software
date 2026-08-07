@@ -1212,10 +1212,16 @@ def _hardware_point(
         if isinstance(energy, Mapping)
         else None
     )
+    timing_tier = whole.get("publication_timing_tier") if isinstance(whole, Mapping) else None
     if (
         row.get("deployment_valid") is not True
         or not isinstance(whole, Mapping)
         or whole.get("rankable") is not True
+        or timing_tier
+        not in {
+            "compiler_trace_request_calibrated",
+            "stage_calibrated_analytic",
+        }
         or not isinstance(energy, Mapping)
         or energy_tier not in {"analytic_anchored", "dc_calibrated"}
         or not isinstance(energy_identity, str)
@@ -1242,6 +1248,7 @@ def _hardware_point(
         head_service_calibration_id=str(head_estimate["calibration_id"]),
         whole_model_rankable=True,
         energy_tier=energy_tier,
+        publication_timing_tier=str(timing_tier),
     )
 
 

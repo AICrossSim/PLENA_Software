@@ -14,6 +14,7 @@ import json
 import math
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -82,20 +83,42 @@ def test_hardware_launch_requires_mode_appropriate_timing_artifacts() -> None:
         evaluation._validate_execution_launch(
             execution_mode=COMPILER_TRACE_EXECUTION_MODE,
             compiler_trace_artifacts=None,
+            publication_timing_tier="compiler_trace_request_calibrated",
         )
     with pytest.raises(ValueError, match="cannot consume compiler-trace"):
         evaluation._validate_execution_launch(
             execution_mode=LEGACY_AGGREGATE_BANDWIDTH_MODE,
             compiler_trace_artifacts="artifacts.json",
+            publication_timing_tier="stage_calibrated_analytic",
+        )
+    with pytest.raises(ValueError, match="tier differs from the execution mode"):
+        evaluation._validate_execution_launch(
+            execution_mode=COMPILER_TRACE_EXECUTION_MODE,
+            compiler_trace_artifacts="artifacts.json",
+            publication_timing_tier="stage_calibrated_analytic",
+        )
+    with pytest.raises(ValueError, match="tier differs from the execution mode"):
+        evaluation._validate_execution_launch(
+            execution_mode=LEGACY_AGGREGATE_BANDWIDTH_MODE,
+            compiler_trace_artifacts=None,
+            publication_timing_tier="compiler_trace_request_calibrated",
+        )
+    with pytest.raises(ValueError, match="unsupported publication timing tier"):
+        evaluation._validate_execution_launch(
+            execution_mode=LEGACY_AGGREGATE_BANDWIDTH_MODE,
+            compiler_trace_artifacts=None,
+            publication_timing_tier="uncalibrated",
         )
 
     evaluation._validate_execution_launch(
         execution_mode=COMPILER_TRACE_EXECUTION_MODE,
         compiler_trace_artifacts="artifacts.json",
+        publication_timing_tier="compiler_trace_request_calibrated",
     )
     evaluation._validate_execution_launch(
         execution_mode=LEGACY_AGGREGATE_BANDWIDTH_MODE,
         compiler_trace_artifacts=None,
+        publication_timing_tier="stage_calibrated_analytic",
     )
 
 
@@ -798,8 +821,8 @@ def test_exact_search_knob_choice_respects_area_and_capacity_tradeoffs() -> None
 def test_full_model_spaces_have_exact_bounded_structural_counts() -> None:
     repository = Path(__file__).resolve().parents[2]
     expected = {
-        "qwen3_32b": 1_413_216,
-        "llama3_1_8b": 1_848_096,
+        "qwen3_32b": 471_072,
+        "llama3_1_8b": 616_032,
     }
     for name, count in expected.items():
         config = json.loads(
@@ -1364,6 +1387,7 @@ def _compact_hardware_row(
         "metrics": {
             "whole_model": {
                 "rankable": True,
+                "publication_timing_tier": "stage_calibrated_analytic",
                 "tpot_ms": tpot_ms,
                 "tps": 1000.0 / tpot_ms,
                 "system_calibration_id": "system-calibration",
@@ -2123,6 +2147,16 @@ def _assembled_synthetic_head_artifact(tmp_path: Path) -> tuple[Path, dict]:
         "head_service_id": "endpoint",
         "process_corner": "measured_silicon",
         "measured_at_utc": "2026-08-03T12:00:00Z",
+        "measurement_resolution": {
+            "meter_methods": {
+                "driver": "nvml_total_energy_counter",
+                "endpoint": "nvml_total_energy_counter",
+            },
+            "power_plausibility_ceiling_w": 2400.0,
+            "min_counter_delta_j": 0.1,
+            "idle_power_w": 270.0,
+            "phase_windows": {},
+        },
     }
     document = assemble_artifact(
         model=model,
@@ -2178,3 +2212,160 @@ def test_head_service_loader_rejects_a_corrupted_measurement(
         required_batches=(1, 4, 8),
     )
     assert not status.passed
+
+
+class _FakeNVMLProcess:
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+
+class _FakeNVML:
+    """Deterministic NVML stand-in for the head-service meter tests."""
+
+    def __init__(
+        self,
+        *,
+        uuid: str = "GPU-aaaa",
+        counter_deltas_mj: list[int] | None = None,
+        counter_available: bool = True,
+        power_mw: int = 400_000,
+        power_available: bool = True,
+        compute_pids: list[int] | None = None,
+        enforced_limit_mw: int = 1_000_000,
+    ) -> None:
+        self.uuid = uuid
+        self.counter_available = counter_available
+        self.power_mw = power_mw
+        self.power_available = power_available
+        self.compute_pids = list(compute_pids or [])
+        self.enforced_limit_mw = enforced_limit_mw
+        self._counter_mj = 1_000_000
+        self._pending_deltas = list(counter_deltas_mj or [])
+
+    def nvmlDeviceGetHandleByUUID(self, uuid: str):
+        if uuid.lower() != self.uuid.lower():
+            raise RuntimeError("uuid not found")
+        return "handle"
+
+    def nvmlDeviceGetUUID(self, handle):
+        return self.uuid
+
+    def nvmlDeviceGetTotalEnergyConsumption(self, handle) -> int:
+        if not self.counter_available:
+            raise RuntimeError("counter unsupported")
+        if self._pending_deltas:
+            self._counter_mj += self._pending_deltas.pop(0)
+        return self._counter_mj
+
+    def nvmlDeviceGetPowerUsage(self, handle) -> int:
+        if not self.power_available:
+            raise RuntimeError("power unsupported")
+        return self.power_mw
+
+    def nvmlDeviceGetComputeRunningProcesses(self, handle):
+        return [_FakeNVMLProcess(pid) for pid in self.compute_pids]
+
+    def nvmlDeviceGetEnforcedPowerLimit(self, handle) -> int:
+        return self.enforced_limit_mw
+
+
+def test_head_meter_uuid_binding_rejects_mismatched_handle() -> None:
+    from decode_dse.hardware import measure_bf16_head_service as measure
+
+    nvml = _FakeNVML(uuid="GPU-aaaa")
+    handle = measure._bind_nvml_handle_by_uuid(nvml, "aaaa")
+    assert handle == "handle"
+    nvml.nvmlDeviceGetUUID = lambda handle: "GPU-bbbb"
+    with pytest.raises(RuntimeError, match="different GPU UUID"):
+        measure._bind_nvml_handle_by_uuid(nvml, "aaaa")
+
+
+def test_head_meter_exclusivity_gate_rejects_foreign_processes() -> None:
+    import os
+
+    from decode_dse.hardware import measure_bf16_head_service as measure
+
+    own = _FakeNVML(compute_pids=[os.getpid()])
+    measure._require_exclusive_compute(own, "handle", "driver cuda:0")
+    foreign = _FakeNVML(compute_pids=[os.getpid(), 4242])
+    with pytest.raises(SystemExit, match="foreign compute processes"):
+        measure._require_exclusive_compute(foreign, "handle", "driver cuda:0")
+
+
+def test_head_phase_energy_rejects_corrupted_and_implausible() -> None:
+    from decode_dse.hardware import measure_bf16_head_service as measure
+
+    measure._check_phase_energy(
+        delta_j=1.0, wall_s=0.01, power_ceiling_w=2400.0, label="head"
+    )
+    # zero is a quantization outcome the adaptive loop escalates, not an error
+    measure._check_phase_energy(
+        delta_j=0.0, wall_s=0.01, power_ceiling_w=2400.0, label="head"
+    )
+    with pytest.raises(RuntimeError, match="negative"):
+        measure._check_phase_energy(
+            delta_j=-0.001, wall_s=0.01, power_ceiling_w=2400.0, label="head"
+        )
+    with pytest.raises(RuntimeError, match="plausibility ceiling"):
+        measure._check_phase_energy(
+            delta_j=9.243, wall_s=0.003265, power_ceiling_w=2400.0, label="head"
+        )
+
+
+def test_head_phase_resolution_floor_drives_adaptive_iterations() -> None:
+    from decode_dse.hardware import measure_bf16_head_service as measure
+
+    assert not measure._phase_delta_sufficient(0.0009)
+    assert not measure._phase_delta_sufficient(0.05)
+    assert measure._phase_delta_sufficient(0.1)
+    assert measure._phase_delta_sufficient(1.0)
+
+
+def test_head_meter_probes_counter_then_falls_back_to_power_trace() -> None:
+    from decode_dse.hardware import measure_bf16_head_service as measure
+
+    # deltas consumed by: constructor probe, begin() alignment reads, end()
+    counter = _FakeNVML(counter_deltas_mj=[0, 0, 100, 500])
+    meter = measure._BoardEnergyMeter(counter, "handle", "driver")
+    assert meter.method == measure.NVML_TOTAL_ENERGY_METHOD
+    meter.begin()
+    delta, window = meter.end()
+    assert delta == pytest.approx(0.5)
+    assert window > 0
+
+    fallback = _FakeNVML(counter_available=False, power_mw=200_000)
+    meter = measure._BoardEnergyMeter(fallback, "handle", "driver")
+    assert meter.method == measure.NVML_POWER_TRACE_METHOD
+    meter.begin()
+    time.sleep(0.05)
+    energy, window = meter.end()
+    assert energy > 0
+    assert energy == pytest.approx(200.0 * 0.05, rel=0.5)
+    assert window == pytest.approx(0.05, rel=0.5)
+
+    dead = _FakeNVML(counter_available=False, power_available=False)
+    with pytest.raises(RuntimeError, match="no usable NVML board-energy meter"):
+        measure._BoardEnergyMeter(dead, "handle", "driver")
+
+
+def test_head_dynamic_energy_resolution_policy() -> None:
+    from decode_dse.hardware import measure_bf16_head_service as measure
+
+    # positive measurements pass through untouched
+    value, below = measure._resolved_dynamic_energy(
+        dynamic_total_j=1.5, idle_energy_j=280.0, label="head"
+    )
+    assert value == 1.5 and below is False
+
+    # a residual inside the idle-drift band becomes the declared bound
+    value, below = measure._resolved_dynamic_energy(
+        dynamic_total_j=-6.2, idle_energy_j=280.0, label="response"
+    )
+    assert value == pytest.approx(0.05 * 280.0)
+    assert below is True
+
+    # beyond the band is corruption
+    with pytest.raises(RuntimeError, match="noise band"):
+        measure._resolved_dynamic_energy(
+            dynamic_total_j=-20.0, idle_energy_j=280.0, label="response"
+        )

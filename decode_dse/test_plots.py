@@ -314,6 +314,7 @@ def test_selected_publication_rows_bind_every_consumed_artifact(
             "timing_evidence_id": "timing-" + "6" * 64,
             "whole_model": {
                 "rankable": True,
+                "publication_timing_tier": "compiler_trace_request_calibrated",
                 "tpot_ms": 4.0,
                 "tps": 500.0,
                 "calibrated_energy": {"total_j": 0.08},

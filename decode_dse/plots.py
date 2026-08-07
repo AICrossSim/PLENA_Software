@@ -325,12 +325,22 @@ def _load_selected_publication_rows(
         else None
     )
     hardware = hardware_row.get("hardware")
+    timing_tier_by_mode = {
+        "compiler_trace": "compiler_trace_request_calibrated",
+        "legacy_aggregate_bandwidth": "stage_calibrated_analytic",
+    }
+    selected_timing_tier = (
+        whole_model.get("publication_timing_tier")
+        if isinstance(whole_model, Mapping)
+        else None
+    )
     if (
         hardware_row.get("deployment_valid") is not True
         or hardware_row.get("profile_id") != alternative.profile_id
         or hardware_row.get("candidate_id") != alternative.candidate_id
         or not isinstance(metrics, Mapping)
-        or metrics.get("execution_mode") != "compiler_trace"
+        or timing_tier_by_mode.get(str(metrics.get("execution_mode")))
+        != selected_timing_tier
         or metrics.get("timing_calibrated") is not True
         or not metrics.get("timing_evidence_id")
         or not isinstance(whole_model, Mapping)
@@ -391,7 +401,7 @@ def _load_selected_publication_rows(
             "batch_size": int(hardware["BATCH"]),
             "tpot_ms": plena_tpot_ms,
             "tokens_per_second": plena_tps,
-            "throughput_evidence_tier": "compiler_trace_request_calibrated",
+            "throughput_evidence_tier": str(selected_timing_tier),
             "energy_per_token_j": plena_energy_j,
             "tokens_per_joule": 1.0 / plena_energy_j,
             "energy_evidence_tier": alternative.energy_tier,

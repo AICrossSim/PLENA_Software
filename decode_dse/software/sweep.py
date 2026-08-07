@@ -23,7 +23,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from decode_dse.legality import load_built_stack_validity
 from decode_dse.manifest import (
@@ -51,6 +51,8 @@ from decode_dse.software.runtime_environment import (
 from decode_dse.software.sweep_plan import (
     ExecutorContext,
     GPUBaselinePlan,
+    HARDWARE_VALIDATION_SAMPLE_CONTRACT,
+    NUMERICAL_SCREEN_SAMPLE_CONTRACT,
     PromptManifest,
     StageSampleContract,
     SweepRunPlan,
@@ -1380,7 +1382,7 @@ def compiler_trace_artifacts_main(
             int(workload["input_seq"]) + int(workload["output_seq"]),
             int(resources["stride"]),
         )
-        from compiler_trace_timing import build_full_model_decode_artifact_set
+        from full_model_artifact_build import build_full_model_decode_artifact_set
 
         result = build_full_model_decode_artifact_set(
             ((point, contexts) for point in points),
@@ -2703,9 +2705,32 @@ _PIPELINE_RESOURCE_FIELDS = frozenset(
         "bootstrap_replicates",
         "publication_enabled",
         "publication_executor",
+        "publication_timing_tier",
         "figure_formats",
     }
 )
+
+
+def _hardware_timing_arguments(
+    resources: Mapping[str, Any],
+    required_path: Callable[[str], Path],
+) -> list[str]:
+    """Build the tier-matched timing arguments for the hardware evaluator."""
+
+    timing_tier = str(resources["publication_timing_tier"])
+    if timing_tier == "compiler_trace_request_calibrated":
+        arguments = [
+            "--execution-mode",
+            "compiler_trace",
+            "--compiler-trace-artifacts",
+            str(required_path("compiler_trace_artifacts")),
+            "--request-memory-calibration",
+            str(required_path("request_memory_calibration")),
+        ]
+    else:
+        arguments = ["--execution-mode", "legacy_aggregate_bandwidth"]
+    arguments.extend(("--publication-timing-tier", timing_tier))
+    return arguments
 
 
 def _publication_pipeline_config(
@@ -2772,6 +2797,13 @@ def _publication_pipeline_config(
     if not isinstance(executor, str) or not executor:
         raise ValueError(
             "publication_pipeline.resources.publication_executor must be non-empty"
+        )
+    from decode_dse.hardware.design_space import PUBLICATION_TIMING_TIERS
+
+    if resources.get("publication_timing_tier") not in PUBLICATION_TIMING_TIERS:
+        raise ValueError(
+            "publication_pipeline.resources.publication_timing_tier must be "
+            "one of " + ", ".join(sorted(PUBLICATION_TIMING_TIERS))
         )
     formats = resources.get("figure_formats")
     if (
@@ -2983,6 +3015,7 @@ def validate_publication_evidence(
         path = paths[name]
         if path is not None:
             identities[name] = _path_identity(require(name))
+    timing_tier = str(resources["publication_timing_tier"])
     body = {
         "schema_version": "decode-publication-evidence-gate",
         "model_name": value["model_name"],
@@ -2990,6 +3023,12 @@ def validate_publication_evidence(
         "timing_evidence_id": timing.evidence_id,
         "timing_mode": timing.mode,
         "timing_evidence_tier": timing.evidence_tier,
+        "publication_timing_tier": timing_tier,
+        "compiler_trace_artifacts_role": (
+            "exhaustive_study_pricing"
+            if timing_tier == "compiler_trace_request_calibrated"
+            else "spot_check_only"
+        ),
         "head_service": head.to_dict(),
         "artifacts": identities,
     }
@@ -3603,12 +3642,7 @@ def build_pipeline(
             str(config),
             "--timing-evidence",
             str(required_path("timing_evidence")),
-            "--execution-mode",
-            "compiler_trace",
-            "--compiler-trace-artifacts",
-            str(required_path("compiler_trace_artifacts")),
-            "--request-memory-calibration",
-            str(required_path("request_memory_calibration")),
+            *_hardware_timing_arguments(resources, required_path),
             "--stride",
             str(resources["stride"]),
             "--runtime-hbm-reserve-bytes",
@@ -3796,12 +3830,7 @@ def build_pipeline(
             str(config),
             "--timing-evidence",
             str(required_path("timing_evidence")),
-            "--execution-mode",
-            "compiler_trace",
-            "--compiler-trace-artifacts",
-            str(required_path("compiler_trace_artifacts")),
-            "--request-memory-calibration",
-            str(required_path("request_memory_calibration")),
+            *_hardware_timing_arguments(resources, required_path),
             "--stride",
             str(resources["stride"]),
             "--runtime-hbm-reserve-bytes",
@@ -4058,6 +4087,10 @@ def _validate_bound_launch_artifacts(
     if not (prefill_root / "index.json").is_file():
         raise FileNotFoundError(prefill_root / "index.json")
 
+    expected_documents = (
+        NUMERICAL_SCREEN_SAMPLE_CONTRACT.prompt_count
+        + HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count
+    )
     receipt = load_immutable_json(output_dir / "admission_preparation.json")
     if (
         receipt.get("schema_version") != "decode-admission-preparation"
@@ -4065,8 +4098,9 @@ def _validate_bound_launch_artifacts(
         or receipt.get("run_plan_hash") != plan.canonical_hash
         or receipt.get("prompt_manifest_hash") != prompts.canonical_hash
         or receipt.get("quantized_format_count") != len(DECODE_FORMATS)
-        or receipt.get("document_count") != 80
-        or receipt.get("artifact_count") != 80 * (len(DECODE_FORMATS) + 1)
+        or receipt.get("document_count") != expected_documents
+        or receipt.get("artifact_count")
+        != expected_documents * (len(DECODE_FORMATS) + 1)
         or receipt.get("runtime_environment_fingerprint")
         != current_runtime.logical_fingerprint
     ):
@@ -4078,8 +4112,9 @@ def _validate_bound_launch_artifacts(
     if (
         index.get("content_hash") != receipt.get("admission_index_hash")
         or index.get("sample_bundle_hash") != bundle.canonical_hash
-        or index.get("document_count") != 80
-        or index.get("artifact_count") != 80 * (len(DECODE_FORMATS) + 1)
+        or index.get("document_count") != expected_documents
+        or index.get("artifact_count")
+        != expected_documents * (len(DECODE_FORMATS) + 1)
     ):
         raise ValueError("admission index differs from its workspace receipt")
 

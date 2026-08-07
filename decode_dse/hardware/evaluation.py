@@ -30,6 +30,7 @@ from decode_dse.hardware.design_space import (
     CapacityBreakdown,
     COMPILER_TRACE_EXECUTION_MODE,
     COMPILER_TRACE_TIMING_SET_SCHEMA,
+    COMPILER_TRACE_TIMING_TIER,
     ExactHardwareSpace,
     ExactHardwareStudy,
     FULL_MODEL_DECODE_SCOPE,
@@ -38,9 +39,11 @@ from decode_dse.hardware.design_space import (
     HardwareMetrics,
     LEGACY_AGGREGATE_BANDWIDTH_MODE,
     PHYSICAL_TRAFFIC_KEYS,
+    PUBLICATION_TIMING_TIERS,
     PhysicalTraffic,
     ResourceBudget,
     ResourceBudgetStatus,
+    STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
     physical_cost_signature,
 )
 from decode_dse.hardware.lm_head_service import (
@@ -1875,6 +1878,11 @@ class DecodeSimulatorBackend:
         _validate_execution_launch(
             execution_mode=execution_mode,
             compiler_trace_artifacts=compiler_trace_artifacts,
+            publication_timing_tier=(
+                COMPILER_TRACE_TIMING_TIER
+                if execution_mode == COMPILER_TRACE_EXECUTION_MODE
+                else STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+            ),
         )
         if (
             execution_mode == COMPILER_TRACE_EXECUTION_MODE
@@ -3017,11 +3025,17 @@ class ProductionHardwareEvaluator:
         admission_correctness_status: AdmissionCorrectnessStatus | None = None,
         handoff_artifact: PrefillHandoffArtifact | None = None,
         resource_budget: ResourceBudget = ResourceBudget(),
+        publication_timing_tier: str = COMPILER_TRACE_TIMING_TIER,
     ) -> None:
         self.backend = backend
         self.workload = workload
         self.power_engine = power_engine
         self.dc_anchor_index = dc_anchor_index
+        if publication_timing_tier not in PUBLICATION_TIMING_TIERS:
+            raise ValueError(
+                "publication_timing_tier must be a declared timing tier"
+            )
+        self.publication_timing_tier = publication_timing_tier
         if handoff_artifact is not None and not isinstance(
             handoff_artifact,
             PrefillHandoffArtifact,
@@ -3481,12 +3495,27 @@ class ProductionHardwareEvaluator:
                 )
             except Exception as exc:
                 head_estimate_error = f"{type(exc).__name__}: {exc}"
+        resolved_timing_tier: str | None = None
+        if (
+            self.publication_timing_tier == COMPILER_TRACE_TIMING_TIER
+            and observation.execution_mode == COMPILER_TRACE_EXECUTION_MODE
+        ):
+            resolved_timing_tier = COMPILER_TRACE_TIMING_TIER
+        elif (
+            self.publication_timing_tier
+            == STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+            and observation.execution_mode == LEGACY_AGGREGATE_BANDWIDTH_MODE
+            and observation.timing_calibrated
+            and observation.timing_evidence_id is not None
+            and observation.bandwidth_calibration_id is not None
+        ):
+            resolved_timing_tier = STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
         whole_rankable = (
             head_estimate is not None
             and observation.output_head_location == EXTERNAL_BF16_HEAD
             and observation.runtime_feasible
             and observation.timing_calibrated
-            and observation.execution_mode == COMPILER_TRACE_EXECUTION_MODE
+            and resolved_timing_tier is not None
             and self.admission_correctness_valid
         )
         whole_tpot_ms = (
@@ -3507,13 +3536,14 @@ class ProductionHardwareEvaluator:
             error_code = "timing_uncalibrated"
             error_message = observation.timing_reason
         elif (
-            observation.execution_mode
-            == LEGACY_AGGREGATE_BANDWIDTH_MODE
+            observation.execution_mode == LEGACY_AGGREGATE_BANDWIDTH_MODE
+            and resolved_timing_tier is None
         ):
             error_code = "legacy_timing_sensitivity_unrankable"
             error_message = (
-                "aggregate-bandwidth timing is retained only as an "
-                "explicit, unrankable sensitivity"
+                "aggregate-bandwidth timing is rankable only at the "
+                "explicitly requested stage_calibrated_analytic tier with "
+                "calibrated bandwidth and timing evidence"
             )
         elif not observation.packedkv_selector_supported:
             error_code = "packedkv_selector_unsupported"
@@ -3849,6 +3879,9 @@ class ProductionHardwareEvaluator:
             whole_model_energy=whole_energy,
             system_calibration_id=system_calibration_id,
             whole_model_rankable=whole_rankable,
+            publication_timing_tier=(
+                resolved_timing_tier if whole_rankable else None
+            ),
             avg_peak_compute_seconds=(
                 observation.avg_peak_compute_seconds
             ),
@@ -4013,8 +4046,18 @@ def _parser() -> argparse.ArgumentParser:
         ),
         required=True,
         help=(
-            "compiler_trace is the publication path; "
-            "legacy_aggregate_bandwidth is an unrankable sensitivity"
+            "compiler_trace prices from full-model traces; "
+            "legacy_aggregate_bandwidth prices from the stage-calibrated "
+            "analytic model"
+        ),
+    )
+    parser.add_argument(
+        "--publication-timing-tier",
+        choices=sorted(PUBLICATION_TIMING_TIERS),
+        required=True,
+        help=(
+            "declared timing tier of every rankable row; must match the "
+            "execution mode and is stamped on the study output"
         ),
     )
     parser.add_argument(
@@ -4064,12 +4107,25 @@ def _validate_execution_launch(
     *,
     execution_mode: str,
     compiler_trace_artifacts: str | os.PathLike[str] | None,
+    publication_timing_tier: str,
 ) -> None:
     if execution_mode not in {
         COMPILER_TRACE_EXECUTION_MODE,
         LEGACY_AGGREGATE_BANDWIDTH_MODE,
     }:
         raise ValueError("unsupported decode execution mode")
+    if publication_timing_tier not in PUBLICATION_TIMING_TIERS:
+        raise ValueError("unsupported publication timing tier")
+    expected_tier = (
+        COMPILER_TRACE_TIMING_TIER
+        if execution_mode == COMPILER_TRACE_EXECUTION_MODE
+        else STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+    )
+    if publication_timing_tier != expected_tier:
+        raise ValueError(
+            "publication timing tier differs from the execution mode: "
+            f"{execution_mode} prices at {expected_tier}"
+        )
     if execution_mode == COMPILER_TRACE_EXECUTION_MODE:
         if compiler_trace_artifacts is None or not os.fspath(
             compiler_trace_artifacts
@@ -4111,7 +4167,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     _validate_execution_launch(
         execution_mode=args.execution_mode,
         compiler_trace_artifacts=args.compiler_trace_artifacts,
+        publication_timing_tier=args.publication_timing_tier,
     )
+    if (
+        args.publication_timing_tier == STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+        and args.local_bf16_head_sensitivity
+    ):
+        raise ValueError(
+            "the analytic publication tier requires the remote head service"
+        )
     if (
         args.execution_mode == LEGACY_AGGREGATE_BANDWIDTH_MODE
         and args.request_memory_calibration is not None
@@ -4229,6 +4293,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the remote BF16 output-head service is not rankable: "
             + ",".join(failures)
         )
+    if (
+        args.publication_timing_tier == STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+        and not backend.calibrated_bandwidth
+    ):
+        raise ValueError(
+            "the stage_calibrated_analytic tier requires "
+            "config.bw_model == 'calibrated'"
+        )
     if backend.calibrated_bandwidth:
         backend.sim.validate_calibrated_hardware_space(
             space.hbm_generation,
@@ -4268,6 +4340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         admission_correctness_status=admission_status,
         handoff_artifact=handoff_artifact,
         resource_budget=space.resource_budget,
+        publication_timing_tier=args.publication_timing_tier,
     )
     result = run_exact_hardware_study(
         manifest=manifest,
