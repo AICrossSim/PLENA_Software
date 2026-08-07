@@ -43,7 +43,7 @@
     "split": "validation",
     "text_column": "text",
     "document_separator": "\n\n",
-    "cache_dir": "/data/datasets"
+    "cache_dir": "/home/sr1325/plena/datasets"
   },
   "executor": {
     "sample_bundle": "workspace://inputs/qwen3_32b_samples.json",
@@ -191,7 +191,7 @@
       "split": "train",
       "text_column": "text",
       "document_separator": "\n\n",
-      "cache_dir": "/data/datasets"
+      "cache_dir": "/home/sr1325/plena/datasets"
     }
   },
   "publication": {
@@ -203,8 +203,10 @@
         "dataset_config": "wikitext-2-raw-v1",
         "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
         "split": "test",
-        "cache_dir": "/data/datasets",
-        "content_columns": ["text"],
+        "cache_dir": "/home/sr1325/plena/datasets",
+        "content_columns": [
+          "text"
+        ],
         "id_column": null,
         "source_item_count": 4358
       },
@@ -213,8 +215,13 @@
         "dataset_config": "default",
         "dataset_revision": "39ed06ce3906b51290c6e95b7c697e928c8a7b00",
         "split": "train",
-        "cache_dir": "/data/datasets",
-        "content_columns": ["key", "prompt", "instruction_id_list", "kwargs"],
+        "cache_dir": "/home/sr1325/plena/datasets",
+        "content_columns": [
+          "key",
+          "prompt",
+          "instruction_id_list",
+          "kwargs"
+        ],
         "id_column": "key",
         "source_item_count": 541
       },
@@ -223,8 +230,11 @@
         "dataset_config": "main",
         "dataset_revision": "e53f048856ff4f594e959d75785d2c2d37b678ee",
         "split": "test",
-        "cache_dir": "/data/datasets",
-        "content_columns": ["question", "answer"],
+        "cache_dir": "/home/sr1325/plena/datasets",
+        "content_columns": [
+          "question",
+          "answer"
+        ],
         "id_column": null,
         "source_item_count": 1319
       }
@@ -287,9 +297,7 @@
       256
     ],
     "HBM_CHANNELS": [
-      8,
-      16,
-      32
+      8
     ],
     "HBM_GENERATION": "HBM2",
     "CHIP_COUNT": [
@@ -364,7 +372,9 @@
       1,
       2,
       4,
-      8
+      8,
+      16,
+      32
     ],
     "precision": "BF16",
     "q_len": 1,
@@ -413,6 +423,7 @@
       "bootstrap_replicates": 2000,
       "publication_enabled": true,
       "publication_executor": "decode_dse.software.benchmark_evaluator:create_executor",
+      "publication_timing_tier": "stage_calibrated_analytic",
       "figure_formats": [
         "png",
         "pdf",
