@@ -1,0 +1,466 @@
+{
+  "_comment": "Deterministic decode-only precision sweep for Llama-3.1-8B-Instruct.",
+  "model_name": "meta-llama/Llama-3.1-8B-Instruct",
+  "model_revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+  "tokenizer_revision": "0e9e39f249a16976918f6564b8830bc894c89659",
+  "sim_model": "llama-3.1-8b",
+  "model_architecture": {
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "vocab_size": 128256,
+    "tie_word_embeddings": false,
+    "attention_bias": false,
+    "use_qk_norm": false
+  },
+  "model_placement": {
+    "policy": "single_device",
+    "device_count": 1,
+    "automatic_device_map": false
+  },
+  "runtime_requirements": {
+    "compute_capability": "sm_100",
+    "minimum_package_versions": {
+      "torch": "2.7.0",
+      "transformers": "4.51.0",
+      "datasets": "3.0.0",
+      "numpy": "1.26.0",
+      "nvidia-ml-py": "13.0.0"
+    }
+  },
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "hf_cache_dir": "/data/models",
+  "local_files_only": true,
+  "trust_remote_code": false,
+  "evaluation_data": {
+    "dataset_name": "Salesforce/wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+    "split": "validation",
+    "text_column": "text",
+    "document_separator": "\n\n",
+    "cache_dir": "/data/datasets"
+  },
+  "executor": {
+    "sample_bundle": "workspace://inputs/llama3_1_8b_samples.json",
+    "prefill_artifact_root": "workspace://artifacts/prefill_bf16",
+    "admission_artifact_root": "workspace://artifacts/decode_admission",
+    "stack_validity_manifest": "workspace://stack_validity.json",
+    "layout_id": "packed-gqa-mlen1024-block8-native-encoding",
+    "mase_src": "../mase/src",
+    "decode_microbatch_size": {
+      "numerical_screen": 16,
+      "hardware_validation": 8
+    },
+    "max_cpu_cache_gib": 24,
+    "artifact_policy": "content_addressed_recompute_per_format",
+    "artifact_space_safety_factor": 1.05,
+    "artifact_space_reserve_gib": 8,
+    "serialize_weight_bank_builds": true
+  },
+  "phase_contract": {
+    "prefill_precision": "BF16",
+    "prefill_kv_precision": "BF16",
+    "decode_query_length": 1,
+    "first_token_owner": "prefill",
+    "decode_kv_admission": "quantize_once"
+  },
+  "output_head_contract": {
+    "headline_location": "external_bf16_service",
+    "headline_precision": "BF16",
+    "local_bf16": "sensitivity_unrankable",
+    "local_low_precision": "accuracy_only"
+  },
+  "reference_workload": {
+    "batch": 4,
+    "input_seq": 512,
+    "output_seq": 3072,
+    "hbm_gen": "HBM2",
+    "hbm_channels": 32
+  },
+  "search": {
+    "weight_w": [
+      "MXINT2",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "kv": [
+      "MXINT2",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "act_w": [
+      "MXINT2",
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "block": [
+      8
+    ],
+    "mixed_weight": false,
+    "front_fp_setting": [
+      [
+        3,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        6,
+        5
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        4,
+        7
+      ],
+      [
+        8,
+        5
+      ]
+    ],
+    "vector_fp": [
+      "FP_E3M2",
+      "FP_E2M3",
+      "FP_E6M5",
+      "FP_E5M6",
+      "FP_E4M7",
+      "FP_E8M5"
+    ],
+    "include_vector_bf16_controls": true,
+    "include_bf16_reference": true,
+    "expected_quantized_profiles": 3072,
+    "expected_vector_bf16_controls": 512,
+    "expected_total_profiles": 3585,
+    "fp_setting_attention": true,
+    "quant_attn_matmuls": true
+  },
+  "software_search": "deterministic_exhaustive",
+  "search_budget": 3585,
+  "sampler": "deterministic_grid",
+  "use_rotation": false,
+  "fp_ppl_tol": 0.01,
+  "gptq": {
+    "nsamples": 64,
+    "seqlen": 1024,
+    "cali_batch_size": 8
+  },
+  "refinement": {
+    "schema_version": "decode-refinement-config/v1",
+    "sample_bundle": "workspace://refinement/inputs/samples.json",
+    "prefill_artifact_root": "workspace://refinement/artifacts/prefill_bf16",
+    "admission_artifact_root": "workspace://refinement/artifacts/decode_admission",
+    "calibration_artifact": "workspace://refinement/inputs/gptq_calibration.pt",
+    "calibration_receipt": "workspace://refinement/inputs/gptq_calibration.json",
+    "checkpoint_root": "workspace://refinement/checkpoints",
+    "calibration_samples": 128,
+    "calibration_sequence_length": 2048,
+    "calibration_batch_size": 8,
+    "calibration_seed": 20260725,
+    "sample_selection_seed": 20260725,
+    "gpu_min_free_mb": 36000,
+    "max_cpu_cache_gib": 24,
+    "calibration_data": {
+      "dataset_name": "Salesforce/wikitext",
+      "dataset_config": "wikitext-2-raw-v1",
+      "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+      "split": "train",
+      "text_column": "text",
+      "document_separator": "\n\n",
+      "cache_dir": "/data/datasets"
+    }
+  },
+  "publication": {
+    "chat_template_sha256": "e10ca381b1ccc5cf9db52e371f3b6651576caee0a630b452e2816b2d404d4b65",
+    "chat_template_asset": "decode_dse/configs/publication_chat_template_llama3_1_8b.json",
+    "benchmark_datasets": {
+      "wikitext2": {
+        "dataset_name": "Salesforce/wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+        "split": "test",
+        "cache_dir": "/data/datasets",
+        "content_columns": [
+          "text"
+        ],
+        "id_column": null,
+        "source_item_count": 4358
+      },
+      "ifeval": {
+        "dataset_name": "google/IFEval",
+        "dataset_config": "default",
+        "dataset_revision": "39ed06ce3906b51290c6e95b7c697e928c8a7b00",
+        "split": "train",
+        "cache_dir": "/data/datasets",
+        "content_columns": [
+          "key",
+          "prompt",
+          "instruction_id_list",
+          "kwargs"
+        ],
+        "id_column": "key",
+        "source_item_count": 541
+      },
+      "gsm8k": {
+        "dataset_name": "openai/gsm8k",
+        "dataset_config": "main",
+        "dataset_revision": "e53f048856ff4f594e959d75785d2c2d37b678ee",
+        "split": "test",
+        "cache_dir": "/data/datasets",
+        "content_columns": [
+          "question",
+          "answer"
+        ],
+        "id_column": null,
+        "source_item_count": 1319
+      }
+    },
+    "thinking_mode": "disabled",
+    "enable_thinking": false,
+    "greedy": true,
+    "temperature": 0.0,
+    "token_budgets": {
+      "wikitext2": 32768,
+      "ifeval": 2048,
+      "gsm8k": 2048,
+      "ruler": 512
+    },
+    "output_head_location": "external_bf16_service",
+    "output_head_precision": "BF16"
+  },
+  "eval_ppl_nsamples": 32,
+  "eval_ppl_seqlen": 2048,
+  "tasks": [
+    "gsm8k",
+    "ifeval"
+  ],
+  "task_batch_size": 8,
+  "front_size": 6,
+  "hardware_space": {
+    "MLEN": [
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096
+    ],
+    "BLEN": [
+      2,
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "HLEN": [
+      16,
+      32,
+      64,
+      128
+    ],
+    "BATCH": [
+      1,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "HBM_CHANNELS": [
+      8
+    ],
+    "HBM_GENERATION": "HBM2",
+    "CHIP_COUNT": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "TP": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "KVP": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "LINK_PORTS": [
+      1,
+      2,
+      4
+    ],
+    "SRAM_POLICY": [
+      "streaming",
+      "projection_resident",
+      "kv_resident_25",
+      "kv_resident_50",
+      "kv_resident_75",
+      "kv_resident_100"
+    ],
+    "KV_HEAD_REUSE": [
+      false,
+      true
+    ],
+    "DRAIN_OVERLAPPED": [
+      false,
+      true
+    ],
+    "FP_SRAM_DEPTH": 512,
+    "RESOURCE_BUDGET": {
+      "reference_system": "A100x4",
+      "aggregate_area_limit_mm2": 3634.4,
+      "aggregate_hbm_capacity_limit_bytes": 320000000000,
+      "aggregate_hbm_bandwidth_limit_bytes_per_s": 8156000000000.0
+    }
+  },
+  "hbm_sensitivity": {
+    "schema_version": "decode-hbm-sensitivity/v2",
+    "source_profile_count": 4,
+    "generations": [
+      "HBM2",
+      "HBM2E",
+      "HBM3",
+      "HBM3E",
+      "HBM4"
+    ],
+    "preserve_geometry_batch_channels": true,
+    "cross_generation_ranking": false
+  },
+  "gpu_baseline": {
+    "attention_implementation": "sdpa",
+    "warmup_steps": 16,
+    "measured_steps": 128,
+    "repetitions": 3,
+    "batch_sizes": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "precision": "BF16",
+    "q_len": 1,
+    "first_gpu_only": true,
+    "energy_meter_priority": [
+      "nvml_total_energy_counter",
+      "nvml_power_trace_trapezoidal"
+    ],
+    "power_trace_sample_interval_ms": 10
+  },
+  "publication_pipeline": {
+    "schema_version": "decode-publication-pipeline",
+    "artifacts": {
+      "admission_receipt": "workspace://admission_preparation.json",
+      "timing_evidence": "workspace://external/decode_timing_evidence.json",
+      "compiler_trace_artifacts": "workspace://external/compiler_trace_artifacts.json",
+      "request_memory_calibration": "simulator://analytic_models/disagg_serve/calibration_dma_requests.csv",
+      "head_service_calibration": "workspace://external/bf16_output_head_service.json",
+      "handoff_artifact": null,
+      "power_calibration": null,
+      "area_config": null,
+      "exact_dc_anchors": null,
+      "hardware_study": "workspace://hardware/exact_hardware_study.jsonl",
+      "refined_hardware_study": "workspace://hardware/refined_hardware_study.jsonl",
+      "refinement_validity": null,
+      "refinement_schedule": "workspace://refinement/schedule.json",
+      "refinement_promotion": "workspace://refinement/source_selection.json",
+      "refinement_results": "workspace://refinement/results",
+      "publication_configurations": "workspace://publication/inputs/configurations.json",
+      "publication_benchmarks": "workspace://publication/inputs/benchmarks.json",
+      "publication_chat_template": "workspace://publication/inputs/chat_template.json",
+      "publication_contract": "workspace://publication/contract.json",
+      "publication_results": "workspace://publication/results",
+      "final_selection": "workspace://publication/final_selection.json",
+      "packedkv_evidence": null,
+      "decode_analysis": null,
+      "figures": "workspace://publication/figures"
+    },
+    "resources": {
+      "stride": 1,
+      "runtime_hbm_reserve_bytes": 8589934592,
+      "rtl_source_tree_sha256": null,
+      "refinement_enabled": true,
+      "refinement_execution": "four_logical_shards",
+      "refinement_decode_microbatch_size": 8,
+      "bootstrap_replicates": 2000,
+      "publication_enabled": true,
+      "publication_executor": "decode_dse.software.benchmark_evaluator:create_executor",
+      "publication_timing_tier": "stage_calibrated_analytic",
+      "figure_formats": [
+        "png",
+        "pdf",
+        "svg"
+      ]
+    }
+  },
+  "n_chips": 1,
+  "baseline_hbm_channels": 32,
+  "seed": 0,
+  "scratch_dir": "workspace://scratch",
+  "gpu_min_free_mb": 24000,
+  "max_parallel_points": 4,
+  "compiler_trace_preflight": {
+    "schema_version": "decode-compiler-trace-preflight/v1",
+    "max_unique_family_artifacts": 64,
+    "max_unique_lowering_instantiations": 100000,
+    "max_lazy_trace_instantiations": 25000,
+    "max_projected_trace_bytes": 68719476736,
+    "max_context_timing_resolutions": 10000000,
+    "max_joined_identities": 10000000,
+    "max_joined_bytes": 68719476736,
+    "max_digest_updates": 20000000,
+    "projected_joined_row_bytes": 4096,
+    "digest_updates_per_joined_identity": 2
+  },
+  "doomed_ppl_abs": 100.0,
+  "doomed_ppl_ratio": 3.0,
+  "reference_chip": {
+    "MLEN": 1024,
+    "BLEN": 8,
+    "VLEN": 1024,
+    "HLEN": 128
+  },
+  "bw_model": "calibrated",
+  "runtime": {
+    "persistent": true,
+    "max_attempts": 3
+  }
+}
