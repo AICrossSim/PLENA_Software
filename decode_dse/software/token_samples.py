@@ -392,7 +392,7 @@ def build_bundle_from_documents(
     dataset_revision: str,
     seed: int,
 ) -> TokenSampleBundle:
-    """Select 80 disjoint windows while maximizing source-document coverage."""
+    """Select the stage-contract window count maximizing source coverage."""
 
     if seed < 0:
         raise ValueError("selection seed must be non-negative")
@@ -441,7 +441,7 @@ def build_bundle_from_documents(
     )
     if available_windows < count:
         raise ValueError(
-            "held-out documents cannot form 80 non-overlapping decode windows"
+            f"held-out documents cannot form {count} non-overlapping decode windows"
         )
 
     selected: list[tuple[TokenizedSourceDocument, int]] = []
@@ -519,17 +519,26 @@ def build_bundle_from_documents(
             item[1],
         )
     )
+    screen_count = NUMERICAL_SCREEN_SAMPLE_CONTRACT.prompt_count
+    validation_count = HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count
+    if count % screen_count != 0:
+        raise AssertionError("stage prompt counts must stratify evenly")
+    stride = count // screen_count
+    residue = stride // 2
     numerical_screen = [
         sample
         for index, (_, _, sample) in enumerate(built)
-        if index % 5 == 2
+        if index % stride == residue
     ]
     hardware_validation = [
         sample
         for index, (_, _, sample) in enumerate(built)
-        if index % 5 != 2
+        if index % stride != residue
     ]
-    if (len(numerical_screen), len(hardware_validation)) != (16, 64):
+    if (len(numerical_screen), len(hardware_validation)) != (
+        screen_count,
+        validation_count,
+    ):
         raise AssertionError("stratified stage assignment has invalid counts")
     random.Random(seed ^ 0x53315F31).shuffle(numerical_screen)
     random.Random(seed ^ 0x53325F32).shuffle(hardware_validation)

@@ -712,7 +712,7 @@ def validate_sweep_config(config: Mapping[str, Any]) -> None:
         "warmup_steps": 16,
         "measured_steps": 128,
         "repetitions": 3,
-        "batch_sizes": [1, 2, 4, 8],
+        "batch_sizes": [1, 2, 4, 8, 16, 32],
         "precision": "BF16",
         "q_len": 1,
         "first_gpu_only": True,

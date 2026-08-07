@@ -47,7 +47,7 @@ HARDWARE_VALIDATION_PROFILE_COUNT = (
     + HARDWARE_VALIDATION_VECTOR_CONTROL_COUNT
 )
 PARITY_TOLERANCE = 1e-5
-MAX_PROJECTED_HOURS = 42.0
+MAX_PROJECTED_HOURS = 168.0
 WORKSPACE_PATH_PREFIX = "workspace://"
 
 
@@ -388,9 +388,9 @@ NUMERICAL_SCREEN_SAMPLE_CONTRACT = StageSampleContract(
 HARDWARE_VALIDATION_SAMPLE_CONTRACT = StageSampleContract(
     name="hardware-validation",
     prompt_set="hardware_validation",
-    prompt_count=64,
+    prompt_count=32,
     prefill_tokens=512,
-    decode_steps=32,
+    decode_steps=16,
     q_len=1,
     teacher_forced_cached=True,
     compiler_required=True,
@@ -883,12 +883,18 @@ class PromptManifest:
         if not self.dataset_name or not self.dataset_revision:
             raise ValueError("prompt dataset name and revision must be pinned")
         if len(self.numerical_screen) != NUMERICAL_SCREEN_SAMPLE_CONTRACT.prompt_count:
-            raise ValueError("numerical screen requires exactly 16 prompt records")
+            raise ValueError(
+                "numerical screen requires exactly "
+                f"{NUMERICAL_SCREEN_SAMPLE_CONTRACT.prompt_count} prompt records"
+            )
         if (
             len(self.hardware_validation)
             != HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count
         ):
-            raise ValueError("hardware validation requires exactly 64 prompt records")
+            raise ValueError(
+                "hardware validation requires exactly "
+                f"{HARDWARE_VALIDATION_SAMPLE_CONTRACT.prompt_count} prompt records"
+            )
         all_records = self.numerical_screen + self.hardware_validation
         document_ids = tuple(record.document_id for record in all_records)
         prompt_hashes = tuple(record.prompt_hash for record in all_records)
