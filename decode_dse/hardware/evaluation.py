@@ -2504,6 +2504,7 @@ class DecodeSimulatorBackend:
                 kv_head_reuse=candidate.kv_head_reuse,
                 drain_overlapped=candidate.drain_overlapped,
                 kv_heads=attention_partition.local_kv_heads,
+                hbm_interface_units=candidate.hbm_channels,
             )
             if len(self._resource_area_cache) >= 4096:
                 self._resource_area_cache.clear()
@@ -2680,6 +2681,7 @@ class DecodeSimulatorBackend:
                 else False
             ),
             kv_heads=attention_partition.local_kv_heads,
+            hbm_interface_units=candidate.hbm_channels,
         )
         chip_area_status = area_status.get("chip")
         if not isinstance(chip_area_status, Mapping):
