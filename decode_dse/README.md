@@ -22,7 +22,7 @@ rather than silently made.
 ## Contents
 
 - [Execution contract](#execution-contract) — how prefill, admission and decode divide
-- [Canonical search](#canonical-search) — the 3,585-profile grid and what admits to hardware pricing
+- [Declared search space](#declared-search-space) — the per-study precision grid and what admits to hardware pricing
 - [Workflow](#workflow) — the four protocols, launch checks, and module map
 - [Validity scope](#validity-scope) — what evidence does and does not carry over
 - [Publication outcomes](#publication-outcomes) — how results may be framed
