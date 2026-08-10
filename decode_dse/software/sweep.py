@@ -3758,7 +3758,7 @@ def build_pipeline(
                 str(paths["refinement_validity"]),
             )
         )
-    accuracy_budgets = config.get("accuracy_budgets")
+    accuracy_budgets = config_value.get("accuracy_budgets")
     if accuracy_budgets is not None:
         if not isinstance(accuracy_budgets, Mapping):
             raise ValueError("accuracy_budgets must be a mapping when present")
