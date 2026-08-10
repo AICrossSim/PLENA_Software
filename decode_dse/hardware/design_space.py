@@ -93,6 +93,15 @@ DECODE_EXECUTION_MODES = frozenset(
 )
 COMPILER_TRACE_TIMING_TIER = "compiler_trace_request_calibrated"
 STAGE_CALIBRATED_ANALYTIC_TIMING_TIER = "stage_calibrated_analytic"
+# Measured-validity requirements follow the declared timing evidence tier:
+# both declared tiers rest on compiler-emitted programs executed under the
+# calibrated emulator contract, so those two layers must be measured valid.
+# RTL and DC validity stay recorded and disclosed, never required, because
+# neither tier claims RTL-simulated or DC-calibrated evidence.
+TIMING_TIER_REQUIRED_VALIDITY: Mapping[str, tuple[str, ...]] = {
+    STAGE_CALIBRATED_ANALYTIC_TIMING_TIER: ("compiler_valid", "emulator_valid"),
+    COMPILER_TRACE_TIMING_TIER: ("compiler_valid", "emulator_valid"),
+}
 PUBLICATION_TIMING_TIERS = frozenset(
     {
         COMPILER_TRACE_TIMING_TIER,
@@ -2371,6 +2380,11 @@ def _mean_nll(row: Mapping[str, Any]) -> float | None:
     if not isinstance(metrics, Mapping):
         return None
     value = metrics.get("mean_nll")
+    refined = metrics.get("mean_token_nll")
+    if value is None:
+        value = refined
+    elif refined is not None and refined != value:
+        return None
     if (
         isinstance(value, bool)
         or not isinstance(value, (int, float))
@@ -3923,8 +3937,13 @@ class ExactHardwareStudy:
             accuracy_threshold = reference_mean_nll + math.log(
                 float(relative_perplexity_limit)
             )
-            self._entries = tuple(
-                entry
+            # The accuracy budget labels profiles instead of excluding them:
+            # refinement sources, the deployment fallback, and the published
+            # accuracy-throughput front all need pricing for profiles beyond
+            # the budget, while the budget line itself is recorded in the
+            # accuracy_constraint header block and per profile aggregate.
+            self._accuracy_admitted = frozenset(
+                entry.profile_id
                 for entry in available_entries
                 if (
                     (mean_nll := _mean_nll(self._rows[entry.profile_id]))
@@ -3933,7 +3952,8 @@ class ExactHardwareStudy:
                 )
             )
         else:
-            self._entries = available_entries
+            self._accuracy_admitted = None
+        self._entries = available_entries
 
         rows_bound_to_schedule = {
             entry.profile_id: self._rows[entry.profile_id]
@@ -4180,9 +4200,15 @@ class ExactHardwareStudy:
             "schema": "plena-lossless-joint-search-schedule",
             "profile_counts": {
                 "hardware_relevant_available": len(available_entries),
-                "accuracy_passing": len(self._entries),
+                "accuracy_passing": (
+                    len(self._accuracy_admitted)
+                    if self._accuracy_admitted is not None
+                    else len(self._entries)
+                ),
                 "accuracy_rejected": (
-                    len(available_entries) - len(self._entries)
+                    len(available_entries) - len(self._accuracy_admitted)
+                    if self._accuracy_admitted is not None
+                    else 0
                 ),
                 "physical_cost_signatures": len(physical_groups),
                 "preflight_equivalence_groups": len(preflight_groups),
@@ -4243,8 +4269,9 @@ class ExactHardwareStudy:
             },
             "losslessness_proof": {
                 "accuracy": (
-                    "Only profiles violating the declared hard accuracy "
-                    "constraint are removed."
+                    "No profile is removed by the accuracy constraint; profiles "
+                    "beyond the budget are priced and labelled so downstream "
+                    "selection and publication apply the recorded budget line."
                 ),
                 "signature_cache": (
                     "Each evaluator-declared equivalence class has identical "
@@ -4339,6 +4366,105 @@ class ExactHardwareStudy:
                 }
             )
         return tuple(records)
+
+    @property
+    def factor_block_count(self) -> int:
+        return len(self._factor_schedule)
+
+    def price_block(
+        self,
+        block_ordinal: int,
+    ) -> list[tuple[int, int, HardwareEvaluation]]:
+        """Price one schedule block with exactly the serial loop's semantics."""
+
+        groups, candidate_mask = self._factor_schedule[block_ordinal]
+        results: list[tuple[int, int, HardwareEvaluation]] = []
+        for candidate_ordinal, candidate in enumerate(
+            self.space.iter_candidates(self.hidden_size)
+        ):
+            if not candidate_mask[candidate_ordinal]:
+                continue
+            for group_index, group in enumerate(groups):
+                representative = group.entries[0]
+                representative_numerical = self._rows[representative.profile_id]
+                try:
+                    outcome = self.evaluator(
+                        representative,
+                        candidate,
+                        representative_numerical,
+                    )
+                    if not isinstance(outcome, HardwareEvaluation):
+                        raise TypeError(
+                            "hardware evaluator must return HardwareEvaluation"
+                        )
+                except Exception as exc:
+                    outcome = HardwareEvaluation.failed(
+                        "evaluator_exception",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                results.append((candidate_ordinal, group_index, outcome))
+        return results
+
+    def iter_factor_evaluations_from_blocks(
+        self,
+        block_results: Iterable[
+            Sequence[tuple[int, int, HardwareEvaluation]]
+        ],
+    ) -> Iterator[_HardwareFactorEvaluation]:
+        """Rebuild the exact serial factor stream from per-block outcomes."""
+
+        factor_ordinal = 0
+        block_iter = iter(block_results)
+        for groups, candidate_mask in self._factor_schedule:
+            try:
+                results = next(block_iter)
+            except StopIteration:
+                raise RuntimeError(
+                    "parallel pricing produced fewer blocks than scheduled"
+                ) from None
+            passing = [
+                ordinal
+                for ordinal in range(len(candidate_mask))
+                if candidate_mask[ordinal]
+            ]
+            if len(results) != len(passing) * len(groups):
+                raise RuntimeError(
+                    "parallel pricing block size differs from its schedule"
+                )
+            needed = set(passing)
+            candidates: dict[int, HardwareCandidate] = {}
+            for candidate_ordinal, candidate in enumerate(
+                self.space.iter_candidates(self.hidden_size)
+            ):
+                if candidate_ordinal in needed:
+                    candidates[candidate_ordinal] = candidate
+            position = 0
+            for candidate_ordinal in passing:
+                candidate = candidates[candidate_ordinal]
+                for group_index, group in enumerate(groups):
+                    observed_ordinal, observed_group, outcome = results[position]
+                    if (
+                        observed_ordinal != candidate_ordinal
+                        or observed_group != group_index
+                        or not isinstance(outcome, HardwareEvaluation)
+                    ):
+                        raise RuntimeError(
+                            "parallel pricing stream is misaligned"
+                        )
+                    yield _HardwareFactorEvaluation(
+                        ordinal=factor_ordinal,
+                        candidate_ordinal=candidate_ordinal,
+                        group=group,
+                        candidate=candidate,
+                        outcome=outcome,
+                    )
+                    factor_ordinal += 1
+                    position += 1
+        remainder = next(block_iter, None)
+        if remainder is not None:
+            raise RuntimeError(
+                "parallel pricing produced more blocks than scheduled"
+            )
 
     def iter_factor_evaluations(self) -> Iterator[_HardwareFactorEvaluation]:
         """Price each evaluator-equivalent factor exactly once."""
@@ -4467,15 +4593,31 @@ class ExactHardwareStudy:
             error_message=outcome.error_message,
         )
 
-    def write(self, path: str | os.PathLike[str]) -> HardwareStudyArtifact:
+    def write(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        factor_stream: Iterable[_HardwareFactorEvaluation] | None = None,
+    ) -> HardwareStudyArtifact:
         """Atomically seal factor evaluations and retained profile bindings."""
 
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         reducer = _FactorizedHardwareReducer(self)
-        for factor in self.iter_factor_evaluations():
+        for factor in (
+            factor_stream
+            if factor_stream is not None
+            else self.iter_factor_evaluations()
+        ):
             reducer.consume(factor)
         compact_summary, stored_factors, stored_bindings = reducer.finish()
+        accuracy_admitted = getattr(self, "_accuracy_admitted", None)
+        for aggregate in compact_summary.get("profile_aggregates", ()):
+            aggregate["accuracy_within_limit"] = (
+                aggregate["profile_id"] in accuracy_admitted
+                if accuracy_admitted is not None
+                else None
+            )
         memberships = self.factor_membership_records()
         membership_digest = hashlib.sha256()
         for membership in memberships:

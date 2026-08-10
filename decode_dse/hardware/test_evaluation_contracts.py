@@ -1049,19 +1049,21 @@ def test_lossless_schedule_filters_only_hard_gates_and_joins_cached_rows(
     }
     assert schedule["cross_product_counts"] == {
         "raw_hardware_relevant": 9,
-        "after_accuracy_constraint": 6,
+        "after_accuracy_constraint": 9,
         "physical_signature_pairs": 3,
         "preflight_passing_equivalence_pairs": 2,
         "simulator_priced_pairs": 2,
-        "joined_result_rows": 4,
+        "joined_result_rows": 6,
     }
     assert schedule["preflight_rejections_by_code"] == {
         "runtime_capacity_exceeded": 1,
     }
-    assert len(results) == study.expected_result_count == 4
+    # The over-budget profile is priced and labelled, never removed.
+    assert len(results) == study.expected_result_count == 6
     assert {result.profile_id for result in results} == {
         quantized[0].profile_id,
         quantized[1].profile_id,
+        quantized[2].profile_id,
     }
     assert {result.candidate.batch for result in results} == {1, 4}
     assert len(evaluator.calls) == 2
@@ -1140,11 +1142,11 @@ def test_lossless_schedule_filters_only_hard_gates_and_joins_cached_rows(
     artifact = study.write(tmp_path / "factorized_hardware.jsonl")
     factorized_header, _ = load_hardware_artifact(artifact.path)
     assert factorized_header["factor_evaluation_count"] == 2
-    assert factorized_header["conceptual_result_count"] == 4
+    assert factorized_header["conceptual_result_count"] == 6
     assert [
         membership["member_count"]
         for membership in factorized_header["factor_memberships"]
-    ] == [2]
+    ] == [3]
 
 
 def _compact_publication_profiles() -> tuple[DecodePrecisionProfile, ...]:
@@ -2369,3 +2371,101 @@ def test_head_dynamic_energy_resolution_policy() -> None:
         measure._resolved_dynamic_energy(
             dynamic_total_j=-20.0, idle_energy_j=280.0, label="response"
         )
+
+
+def test_parallel_block_pricing_reproduces_the_serial_artifact(
+    tmp_path: Path,
+) -> None:
+    manifest = _synthetic_manifest()
+    reference = next(
+        entry
+        for entry in manifest.entries
+        if entry.profile.kind == PROFILE_KIND_BF16_REFERENCE
+    )
+    quantized = tuple(
+        entry
+        for entry in manifest.entries
+        if (
+            entry.profile.kind == PROFILE_KIND_QUANTIZED
+            and entry.legality.hardware_candidate
+        )
+    )[:3]
+    rows = (
+        _numerical_row(reference, 1.0),
+        _numerical_row(quantized[0], 1.001),
+        _numerical_row(quantized[1], 1.005),
+        _numerical_row(quantized[2], 1.02),
+    )
+
+    class Evaluator:
+        def physical_cost_group_key(self, entry, numerical):
+            return {"profile": entry.profile_id}
+
+        def preflight_group_key(self, entry, numerical):
+            return {"profile": entry.profile_id}
+
+        def evaluation_group_key(self, entry, numerical):
+            return {"profile": entry.profile_id}
+
+        def preflight(self, entry, candidate, numerical):
+            if candidate.batch > 4:
+                return HardwareEvaluation.failed(
+                    "runtime_capacity_exceeded",
+                    "synthetic physical capacity exceeded",
+                )
+            return None
+
+        def __call__(self, entry, candidate, numerical):
+            return HardwareEvaluation.failed(
+                "synthetic_unrankable",
+                f"{entry.profile_id}:{candidate.batch}",
+            )
+
+    space = ExactHardwareSpace(
+        mlen=(128,),
+        blen=(2,),
+        hlen=(16,),
+        batch=(1, 4, 8),
+        hbm_channels=(8,),
+        chip_count=(1,),
+        sram_policy=("streaming",),
+        kv_head_reuse=(False,),
+        drain_overlapped=(False,),
+        attention_heads=8,
+        kv_heads=2,
+    )
+
+    def build_study():
+        return ExactHardwareStudy(
+            manifest=manifest,
+            numerical_results=rows,
+            space=space,
+            hidden_size=128,
+            evaluator=Evaluator(),
+            evaluator_version="synthetic-evaluator",
+            require_complete=False,
+            relative_perplexity_limit=1.01,
+        )
+
+    serial_study = build_study()
+    serial_artifact = serial_study.write(tmp_path / "serial.jsonl")
+
+    block_study = build_study()
+    assert block_study.factor_block_count == serial_study.factor_block_count
+    block_stream = block_study.iter_factor_evaluations_from_blocks(
+        block_study.price_block(index)
+        for index in range(block_study.factor_block_count)
+    )
+    block_artifact = block_study.write(
+        tmp_path / "blocks.jsonl",
+        factor_stream=block_stream,
+    )
+    assert (
+        (tmp_path / "serial.jsonl").read_bytes()
+        == (tmp_path / "blocks.jsonl").read_bytes()
+    )
+    assert serial_artifact.content_hash == block_artifact.content_hash
+
+    truncated = build_study()
+    with pytest.raises(RuntimeError, match="fewer blocks"):
+        list(truncated.iter_factor_evaluations_from_blocks(iter(())))

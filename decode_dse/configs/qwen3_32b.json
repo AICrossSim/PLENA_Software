@@ -351,7 +351,7 @@
     }
   },
   "hbm_sensitivity": {
-    "schema_version": "decode-hbm-sensitivity/v2",
+    "schema_version": "decode-hbm-sensitivity",
     "source_profile_count": 4,
     "generations": [
       "HBM2",
@@ -399,7 +399,7 @@
       "exact_dc_anchors": null,
       "hardware_study": "workspace://hardware/exact_hardware_study.jsonl",
       "refined_hardware_study": "workspace://hardware/refined_hardware_study.jsonl",
-      "refinement_validity": null,
+      "refinement_validity": "workspace://refinement/validity.json",
       "refinement_schedule": "workspace://refinement/schedule.json",
       "refinement_promotion": "workspace://refinement/source_selection.json",
       "refinement_results": "workspace://refinement/results",
@@ -421,9 +421,10 @@
       "refinement_execution": "four_logical_shards",
       "refinement_decode_microbatch_size": 8,
       "bootstrap_replicates": 2000,
-      "publication_enabled": true,
+      "publication_enabled": false,
       "publication_executor": "decode_dse.software.benchmark_evaluator:create_executor",
       "publication_timing_tier": "stage_calibrated_analytic",
+      "study_parallel_workers": 48,
       "figure_formats": [
         "png",
         "pdf",

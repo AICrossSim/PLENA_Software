@@ -100,6 +100,10 @@ class HardwarePoint:
     sample_limit: int | None = None
     scatter_population_count: int | None = None
     dominated_population_count: int | None = None
+    publication_timing_tier: str | None = None
+    unrankable_population_count: int | None = None
+    sampled_unrankable_count: int | None = None
+    source_artifact: str | None = None
 
     @property
     def tokens_per_j(self) -> float:
@@ -447,6 +451,56 @@ def _load_selected_publication_rows(
     }
 
 
+def plot_no_selection_statement(
+    *,
+    model_name: str,
+    failure_action: str,
+    accuracy_pass_ids: Sequence[str],
+    output_dir: Path,
+    formats: Sequence[str],
+) -> tuple[Path, ...]:
+    """State the sealed no-selection outcome; nothing is compared or claimed."""
+
+    fig, ax = plt.subplots(figsize=(9.2, 4.1), constrained_layout=True)
+    ax.set_axis_off()
+    ax.text(
+        0.5,
+        0.60,
+        "No configuration met the declared relative-perplexity budget.",
+        ha="center",
+        va="center",
+        fontsize=13,
+    )
+    ax.text(
+        0.5,
+        0.42,
+        (
+            "The accuracy-throughput frontier is reported without a "
+            "near-lossless deployment claim."
+            + (
+                f" Accuracy-passing configurations: {len(accuracy_pass_ids)}."
+                if accuracy_pass_ids
+                else ""
+            )
+        ),
+        ha="center",
+        va="center",
+        fontsize=10,
+        color=MUTED,
+    )
+    _set_title(
+        ax,
+        "Selected deployment",
+        f"{model_name} · sealed outcome: {failure_action}",
+    )
+    return _save(
+        fig,
+        stem="12_selected_deployment",
+        output_dir=output_dir,
+        formats=formats,
+    )
+
+
 def plot_selected_deployment_evidence(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -532,6 +586,18 @@ def plot_selected_deployment_evidence(
                 va="bottom",
                 color=MUTED,
                 fontsize=8,
+            )
+        else:
+            energy_ax.text(
+                index,
+                0.02,
+                str(row["energy_evidence_tier"]),
+                transform=energy_ax.get_xaxis_transform(),
+                rotation=90,
+                ha="center",
+                va="bottom",
+                color=SURFACE,
+                fontsize=7.2,
             )
     _set_title(
         energy_ax,
@@ -1409,10 +1475,30 @@ def _load_hardware_points(
     profile_by_id: Mapping[str, DecodePrecisionProfile],
     nll_by_id: Mapping[str, float],
     reference_nll: float,
+    require_points: bool = True,
 ) -> tuple[HardwarePoint, ...]:
     header, rows = load_hardware_artifact(path)
     retention = header.get("retention")
     retention = retention if isinstance(retention, Mapping) else {}
+
+    def _retention_count(factorized_name: str, legacy_name: str) -> int | None:
+        value = retention.get(factorized_name, retention.get(legacy_name))
+        return int(value) if value is not None else None
+
+    scatter_population = _retention_count(
+        "factor_population_count", "scatter_population_count"
+    )
+    dominated_population = _retention_count(
+        "dominated_factor_population_count", "dominated_population_count"
+    )
+    unrankable_population = _retention_count(
+        "unrankable_factor_population_count", "unrankable_population_count"
+    )
+    sampled_unrankable = (
+        int(retention["sampled_unrankable_count"])
+        if retention.get("sampled_unrankable_count") is not None
+        else None
+    )
     points = []
     for row in rows:
         if row.get("deployment_valid") is not True:
@@ -1491,19 +1577,19 @@ def _load_hardware_points(
                     if retention.get("sample_limit") is not None
                     else None
                 ),
-                scatter_population_count=(
-                    int(retention["scatter_population_count"])
-                    if retention.get("scatter_population_count") is not None
+                scatter_population_count=scatter_population,
+                dominated_population_count=dominated_population,
+                publication_timing_tier=(
+                    str(whole["publication_timing_tier"])
+                    if whole.get("publication_timing_tier") not in (None, "")
                     else None
                 ),
-                dominated_population_count=(
-                    int(retention["dominated_population_count"])
-                    if retention.get("dominated_population_count") is not None
-                    else None
-                ),
+                unrankable_population_count=unrankable_population,
+                sampled_unrankable_count=sampled_unrankable,
+                source_artifact=str(path),
             )
         )
-    if not points:
+    if not points and require_points:
         raise ValueError(
             "hardware figure requires at least one deployment-valid energy-ranked row"
         )
@@ -1554,6 +1640,22 @@ def plot_hardware_pareto(
     ]
     if not finite:
         raise ValueError("hardware Pareto has no finite positive cost points")
+    timing_tiers = {
+        point.publication_timing_tier
+        for point in finite
+        if point.publication_timing_tier is not None
+    }
+    if len(timing_tiers) > 1:
+        raise ValueError(
+            "hardware Pareto mixes timing tiers: " + ", ".join(sorted(timing_tiers))
+        )
+    timing_tier = next(iter(timing_tiers), None)
+    unranked_by_artifact = {
+        point.source_artifact: point.unrankable_population_count or 0
+        for point in points
+        if point.source_artifact is not None
+    }
+    unranked_total = sum(unranked_by_artifact.values())
     areas = np.asarray([point.area_mm2 for point in finite], dtype=float)
     if float(np.max(areas)) == float(np.min(areas)):
         marker_sizes = np.full(len(areas), 46.0)
@@ -1668,9 +1770,16 @@ def plot_hardware_pareto(
         latency_ax,
         "Latency–energy co-design frontier",
         (
-            f"{model_name} · area sets marker size · "
+            f"{model_name} · timing tier: {timing_tier or 'undeclared'} · "
+            "area sets marker size · "
             f"exact decision/frontier rows + {sampled_count} deterministic "
             "sampled dominated row(s)"
+            + (
+                f" · {unranked_total} unranked rows excluded "
+                "(timing_uncalibrated)"
+                if unranked_total
+                else ""
+            )
         ),
     )
 
@@ -2590,6 +2699,21 @@ def _hardware_table(
                 if point.dominated_population_count is not None
                 else ""
             ),
+            "publication_timing_tier": (
+                point.publication_timing_tier
+                if point.publication_timing_tier is not None
+                else ""
+            ),
+            "unrankable_population_count": (
+                point.unrankable_population_count
+                if point.unrankable_population_count is not None
+                else ""
+            ),
+            "sampled_unrankable_count": (
+                point.sampled_unrankable_count
+                if point.sampled_unrankable_count is not None
+                else ""
+            ),
         }
         for point in points
     )
@@ -2825,8 +2949,16 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
                 profile_by_id=profile_by_id,
                 nll_by_id=nll_by_id,
                 reference_nll=reference_nll,
+                require_points=False,
             )
         )
+        # A single weight-bank partition may legitimately hold no
+        # deployment-valid row; only an empty union is a defect.
+        if not hardware_points:
+            raise ValueError(
+                "hardware figure requires at least one deployment-valid "
+                "energy-ranked row across all partitions"
+            )
         hardware_identities = tuple(
             (point.profile_id, point.candidate_id) for point in hardware_points
         )
@@ -2959,47 +3091,82 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
             name: Path(str(value)).resolve()
             for name, value in publication_inputs.items()
         }
-        selected_rows, publication_selection = _load_selected_publication_rows(
-            config_path=publication_paths["config"],
-            manifest=manifest,
-            gpu_baseline_report_path=publication_paths[
-                "gpu_baseline_report"
-            ],
-            gpu_baseline_receipt_path=publication_paths[
-                "gpu_baseline_receipt"
-            ],
-            publication_contract_path=publication_paths[
-                "publication_contract"
-            ],
-            publication_report_path=publication_paths["publication_report"],
-            final_selection_path=publication_paths["final_selection"],
-            refined_hardware_artifact_path=publication_paths[
+        final_selection_value = load_immutable_json(
+            publication_paths["final_selection"]
+        )
+        final_selection_outcome = final_selection_value.get("selection")
+        frontier_fallback = "report_pareto_frontier_without_near_lossless_claim"
+        if (
+            final_selection_value.get("schema_version")
+            == FINAL_PUBLICATION_SELECTION_SCHEMA
+            and isinstance(final_selection_outcome, Mapping)
+            and final_selection_outcome.get("selected") is False
+            and final_selection_outcome.get("failure_action") == frontier_fallback
+        ):
+            # The sealed no-selection outcome: render an explicit statement
+            # instead of the selected-deployment comparison, and never a
+            # fabricated near-lossless bar.
+            outputs.extend(
+                plot_no_selection_statement(
+                    model_name=manifest.model_name,
+                    failure_action=frontier_fallback,
+                    accuracy_pass_ids=tuple(
+                        final_selection_value.get(
+                            "accuracy_pass_configuration_ids", ()
+                        )
+                    ),
+                    output_dir=output_dir,
+                    formats=formats,
+                )
+            )
+            source_paths.extend(publication_paths.values())
+            publication_selection = {
+                "selected": False,
+                "failure_action": frontier_fallback,
+            }
+            selected_rows = ()
+        else:
+            selected_rows, publication_selection = _load_selected_publication_rows(
+                config_path=publication_paths["config"],
+                manifest=manifest,
+                gpu_baseline_report_path=publication_paths[
+                    "gpu_baseline_report"
+                ],
+                gpu_baseline_receipt_path=publication_paths[
+                    "gpu_baseline_receipt"
+                ],
+                publication_contract_path=publication_paths[
+                    "publication_contract"
+                ],
+                publication_report_path=publication_paths["publication_report"],
+                final_selection_path=publication_paths["final_selection"],
+                refined_hardware_artifact_path=publication_paths[
+                    "refined_hardware_artifact"
+                ],
+            )
+            outputs.extend(
+                plot_selected_deployment_evidence(
+                    selected_rows,
+                    model_name=manifest.model_name,
+                    output_dir=output_dir,
+                    formats=formats,
+                )
+            )
+            data_tables.append(
+                _write_csv(
+                    output_dir / "12_selected_deployment_data.csv",
+                    selected_rows,
+                    fieldnames=tuple(selected_rows[0]),
+                )
+            )
+            source_paths.extend(publication_paths.values())
+            refined_metadata = publication_paths[
                 "refined_hardware_artifact"
-            ],
-        )
-        outputs.extend(
-            plot_selected_deployment_evidence(
-                selected_rows,
-                model_name=manifest.model_name,
-                output_dir=output_dir,
-                formats=formats,
+            ].with_name(
+                f"{publication_paths['refined_hardware_artifact'].name}.meta.json"
             )
-        )
-        data_tables.append(
-            _write_csv(
-                output_dir / "12_selected_deployment_data.csv",
-                selected_rows,
-                fieldnames=tuple(selected_rows[0]),
-            )
-        )
-        source_paths.extend(publication_paths.values())
-        refined_metadata = publication_paths[
-            "refined_hardware_artifact"
-        ].with_name(
-            f"{publication_paths['refined_hardware_artifact'].name}.meta.json"
-        )
-        if refined_metadata.is_file():
-            source_paths.append(refined_metadata)
+            if refined_metadata.is_file():
+                source_paths.append(refined_metadata)
 
     terminal_counts: dict[str, int] = {}
     for row in terminal_rows:

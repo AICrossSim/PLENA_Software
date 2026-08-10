@@ -2347,6 +2347,7 @@ def test_publication_configuration_builder_separates_accuracy_and_hardware(
         merge_receipt_path=merge_path,
         merged_results_path=results_path,
         hardware_artifacts=(hardware_path,),
+        publication_timing_tier="stage_calibrated_analytic",
     )
     assert [item["role"] for item in built["configurations"]] == [
         "bf16",
@@ -2365,6 +2366,7 @@ def test_publication_configuration_builder_separates_accuracy_and_hardware(
         schedule_path,
         merge_path,
         results_path,
+        publication_timing_tier="stage_calibrated_analytic",
     )
     assert len(refined_manifest.entries) == len(refined_rows) == len(profiles) - 1
     assert refined_manifest.refinement_schedule_hash == schedule.canonical_hash
@@ -2378,6 +2380,7 @@ def test_publication_configuration_builder_separates_accuracy_and_hardware(
             merge_receipt_path=merge_path,
             merged_results_path=results_path,
             hardware_artifacts=(hardware_path,),
+            publication_timing_tier="stage_calibrated_analytic",
         )
 
 

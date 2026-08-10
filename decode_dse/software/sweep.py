@@ -2706,6 +2706,7 @@ _PIPELINE_RESOURCE_FIELDS = frozenset(
         "publication_enabled",
         "publication_executor",
         "publication_timing_tier",
+        "study_parallel_workers",
         "figure_formats",
     }
 )
@@ -2758,12 +2759,20 @@ def _publication_pipeline_config(
             raise ValueError(
                 f"publication_pipeline.artifacts.{name} must be a non-empty path"
             )
-    for name in ("stride", "refinement_decode_microbatch_size"):
+    for name in (
+        "stride",
+        "refinement_decode_microbatch_size",
+        "study_parallel_workers",
+    ):
         value = resources.get(name)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(
                 f"publication_pipeline.resources.{name} must be a positive integer"
             )
+    if resources["study_parallel_workers"] > 256:
+        raise ValueError(
+            "publication_pipeline.resources.study_parallel_workers must be at most 256"
+        )
     reserve = resources.get("runtime_hbm_reserve_bytes")
     if isinstance(reserve, bool) or not isinstance(reserve, int) or reserve < 0:
         raise ValueError(
@@ -2996,12 +3005,14 @@ def validate_publication_evidence(
         "compiler_trace_artifacts",
         "request_memory_calibration",
     }
+    # refinement_validity is produced by joint selection during the run, so
+    # its identity is sealed by that stage's receipt and the promotion's
+    # validity hash; the pre-run evidence ledger covers only external inputs.
     optional_inputs = {
         "handoff_artifact",
         "power_calibration",
         "area_config",
         "exact_dc_anchors",
-        "refinement_validity",
         "packedkv_evidence",
         "decode_analysis",
     }
@@ -3079,12 +3090,22 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
     if report.get("contract_hash") != contract.canonical_hash:
         raise ValueError("publication report differs from its contract")
     selection = report.get("selection")
-    if not isinstance(selection, Mapping) or selection.get("selected") is not True:
+    if not isinstance(selection, Mapping):
+        raise ValueError("publication accuracy gates did not select a deployment")
+    frontier_fallback = "report_pareto_frontier_without_near_lossless_claim"
+    # The benchmark report may legitimately decline the near-lossless claim;
+    # that outcome is sealed as an explicit no-selection artifact rather than
+    # failing the run, and only for the report's own declared fallback action.
+    frontier_only = (
+        selection.get("selected") is False
+        and selection.get("failure_action") == frontier_fallback
+    )
+    if not frontier_only and selection.get("selected") is not True:
         raise ValueError("publication accuracy gates did not select a deployment")
     passing_ids = selection.get("accuracy_configuration_ids")
     if (
         not isinstance(passing_ids, list)
-        or not passing_ids
+        or (not passing_ids and not frontier_only)
         or any(not isinstance(value, str) or not value for value in passing_ids)
         or len(passing_ids) != len(set(passing_ids))
     ):
@@ -3199,6 +3220,22 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
             raise ValueError("publication alternative differs from exact hardware evidence")
         if alternative.configuration_id in passing_ids:
             joined_alternatives.append((configuration, alternative, row, header))
+    if frontier_only:
+        result = {
+            "schema_version": "decode-final-publication-selection",
+            "contract_hash": contract.canonical_hash,
+            "contract_sha256": _sha256_file(args.contract),
+            "benchmark_report_sha256": _sha256_file(args.report),
+            "accuracy_pass_configuration_ids": passing_ids,
+            "hardware_artifacts": component_artifacts,
+            "selection": {
+                "selected": False,
+                "failure_action": frontier_fallback,
+            },
+        }
+        write_immutable_json(args.output, result)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if not joined_alternatives:
         raise ValueError("no hardware alternatives cover passing accuracy configurations")
 
@@ -3344,9 +3381,9 @@ def build_pipeline(
         _partitioned_artifact(
             required_path("hardware_study"),
             index,
-            len(validation_roots),
+            len(numerical_roots),
         )
-        for index in range(len(validation_roots))
+        for index in range(len(numerical_roots))
     )
     refinement_output_root = required_path("refinement_results")
     refinement_merge_receipt = refinement_output_root / "merged" / "merge.json"
@@ -3630,14 +3667,21 @@ def build_pipeline(
         ),
     ]
 
-    for index, (validation_root, hardware_study) in enumerate(
-        zip(validation_roots, hardware_studies)
+    # The study prices hardware candidates and gates them on relative
+    # perplexity, so it needs the BF16 reference and one consistent sample
+    # contract. The hardware-validation set is deliberately built from
+    # hardware candidates and legal vector controls only and never contains
+    # the reference; the numerical-screen shards carry it alongside every
+    # accuracy row, and the study filters to hardware candidates itself.
+    # Hardware-validation results reach selection and the figures directly.
+    for index, (screen_root, hardware_study) in enumerate(
+        zip(numerical_roots, hardware_studies)
     ):
         hardware_arguments = [
             "--manifest",
-            str(validation_root / "manifest.json"),
+            str(screen_root / "manifest.json"),
             "--numerical-jsonl",
-            str(validation_root),
+            str(screen_root),
             "--config",
             str(config),
             "--timing-evidence",
@@ -3651,6 +3695,8 @@ def build_pipeline(
             str(required_path("head_service_calibration")),
             "--admission-receipt",
             str(required_path("admission_receipt")),
+            "--parallel-workers",
+            str(resources["study_parallel_workers"]),
             "--output",
             str(hardware_study),
         ]
@@ -3697,9 +3743,19 @@ def build_pipeline(
         schedule_arguments.extend(("--hardware-validation-results", str(path)))
     for path in hardware_studies:
         schedule_arguments.extend(("--hardware-study", str(path)))
-    if paths["refinement_validity"] is not None:
+    if resources["refinement_enabled"]:
+        if paths["refinement_validity"] is None:
+            raise ValueError(
+                "refinement requires artifacts.refinement_validity so joint "
+                "selection can derive and record measured stack validity"
+            )
         schedule_arguments.extend(
-            ("--validity", str(paths["refinement_validity"]))
+            (
+                "--stack-validity",
+                str(stack_validity),
+                "--validity-output",
+                str(paths["refinement_validity"]),
+            )
         )
     schedule_arguments.extend(
         (
@@ -3719,6 +3775,11 @@ def build_pipeline(
             outputs=(
                 required_path("refinement_schedule"),
                 required_path("refinement_promotion"),
+            )
+            + (
+                (paths["refinement_validity"],)
+                if resources["refinement_enabled"]
+                else ()
             ),
         )
     )
@@ -3890,6 +3951,8 @@ def build_pipeline(
                         str(refinement_merged_results),
                         "--hardware-artifact",
                         str(refined_hardware_study),
+                        "--publication-timing-tier",
+                        str(resources["publication_timing_tier"]),
                         "--output",
                         str(required_path("publication_configurations")),
                     ),

@@ -22,7 +22,7 @@ from decode_dse.hardware.selection import (
     select_refinement_sources,
 )
 from decode_dse.legality import StackValidity
-from decode_dse.manifest import load_manifest
+from decode_dse.manifest import SweepManifest, SweepManifestEntry, load_manifest
 from decode_dse.profiles import (
     DECODE_FORMATS,
     MX_BLOCK_SIZE,
@@ -1077,6 +1077,26 @@ def _file_hash(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _path_hash(path: str | Path) -> str:
+    """Digest a receipt input that may be a file or a stage partition directory."""
+
+    resolved = Path(path)
+    if resolved.is_file():
+        return _file_hash(resolved)
+    if not resolved.is_dir():
+        raise ValueError(f"receipt input does not exist: {resolved}")
+    files = tuple(sorted(value for value in resolved.rglob("*") if value.is_file()))
+    if not files:
+        raise ValueError(f"receipt input directory is empty: {resolved}")
+    digest = hashlib.sha256()
+    for value in files:
+        name = value.relative_to(resolved).as_posix().encode("utf-8")
+        digest.update(len(name).to_bytes(8, "little"))
+        digest.update(name)
+        digest.update(bytes.fromhex(_file_hash(value)))
+    return digest.hexdigest()
+
+
 def _load_sharded_stage_rows(
     paths: Sequence[str | Path],
     *,
@@ -1270,6 +1290,59 @@ def _error_evidence(row: Mapping[str, Any]) -> RefinementAccuracyEvidence:
     )
 
 
+def derive_refinement_validity(
+    schedule: RefinementSchedule,
+    stack_validity_document: Mapping[str, Any],
+) -> RefinementValidityManifest:
+    """Carry measured stack validity onto exactly-matching refinement profiles.
+
+    A refinement profile inherits its source profile's measured validity only
+    when its physical formats are identical to the source's (the equal-K/V
+    baseline). Split-K/V variants were never validated as whole profiles by
+    the stack reports, so their validity is recorded as unmeasured rather
+    than synthesized; they remain accuracy-only downstream.
+    """
+
+    profiles = stack_validity_document.get("profiles")
+    if not isinstance(profiles, Mapping):
+        raise ValueError("stack validity lacks per-profile records")
+    content_hash = stack_validity_document.get("content_hash")
+    if not isinstance(content_hash, str) or len(content_hash) != 64:
+        raise ValueError("stack validity lacks a content hash")
+    records = []
+    for entry in schedule.entries:
+        profile = entry.profile
+        source_id = profile.source_profile.profile_id
+        source_validity = profiles.get(source_id)
+        if source_validity is None:
+            raise ValueError(
+                f"stack validity does not cover refinement source {source_id}"
+            )
+        if (
+            profile.key_format
+            == profile.value_format
+            == profile.source_profile.kv_format
+        ):
+            validity = StackValidity.from_dict(source_validity)
+        else:
+            validity = StackValidity()
+        evidence = tuple(
+            (name, content_hash if getattr(validity, name) is not None else None)
+            for name in _VALIDITY_FIELDS
+        )
+        records.append(
+            RefinementValidityRecord(
+                profile_id=entry.profile_id,
+                validity=validity,
+                evidence=evidence,
+            )
+        )
+    return RefinementValidityManifest(
+        source_schedule_hash=schedule.canonical_hash,
+        records=tuple(records),
+    )
+
+
 def prepare_refinement_schedule(
     *,
     manifest_path: str | Path,
@@ -1281,6 +1354,8 @@ def prepare_refinement_schedule(
     promotion_path: str | Path,
     epsilon: EpsilonPolicy = EpsilonPolicy(),
     validity_path: str | Path | None = None,
+    stack_validity_path: str | Path | None = None,
+    validity_output_path: str | Path | None = None,
 ) -> None:
     """Build four measured refinement sources from complete upstream results."""
 
@@ -1303,13 +1378,54 @@ def prepare_refinement_schedule(
         hardware_validation_rows,
         expected_profile_ids=plan.hardware_validation_profile_ids,
     )
-    numerical_screen_rows, _ = _load_sharded_stage_rows(
+    numerical_screen_rows, numerical_screen_manifests = _load_sharded_stage_rows(
         numerical_screen_paths,
         manifest=manifest,
         plan=plan,
         stage="numerical-screen",
         profile_ids=plan.numerical_screen_profile_ids,
     )
+    screen_rows_by_profile = {
+        profile_id: row
+        for profile_id, row in zip(
+            plan.numerical_screen_profile_ids, numerical_screen_rows
+        )
+    }
+    workspace_references = tuple(
+        entry
+        for entry in manifest.entries
+        if entry.profile.kind == PROFILE_KIND_BF16_REFERENCE
+    )
+    if len(workspace_references) != 1:
+        raise ValueError("the workspace manifest must declare exactly one BF16 reference")
+    reference_entry = workspace_references[0]
+    # The hardware studies are produced per numerical-screen shard; shards that
+    # lack the BF16 reference are priced under an in-memory reference-augmented
+    # manifest, so its hash must be recomputed here to validate provenance.
+    study_manifest_hashes = set(numerical_screen_manifests)
+    for shard_manifest in numerical_screen_manifests.values():
+        if any(
+            entry.profile.kind == PROFILE_KIND_BF16_REFERENCE
+            for entry in shard_manifest.entries
+        ):
+            continue
+        augmented = SweepManifest(
+            model_name=shard_manifest.model_name,
+            model_revision=shard_manifest.model_revision,
+            model_architecture=shard_manifest.model_architecture,
+            tokenizer_revision=shard_manifest.tokenizer_revision,
+            quantizer_provenance=shard_manifest.quantizer_provenance,
+            entries=shard_manifest.entries
+            + (
+                SweepManifestEntry(
+                    ordinal=len(shard_manifest.entries),
+                    profile=reference_entry.profile,
+                    legality=reference_entry.legality,
+                    validity=reference_entry.validity,
+                ),
+            ),
+        )
+        study_manifest_hashes.add(augmented.canonical_hash)
     reference_rows = [
         row
         for entry, row in zip(manifest.entries, numerical_screen_rows)
@@ -1334,9 +1450,9 @@ def prepare_refinement_schedule(
     for hardware_path in hardware_study_paths:
         header, artifact_rows = load_hardware_artifact(hardware_path)
         provenance = header.get("provenance", {})
-        if provenance.get("manifest_hash") not in hardware_validation_manifests:
+        if provenance.get("manifest_hash") not in study_manifest_hashes:
             raise ValueError(
-                "hardware-validation study was produced for another manifest"
+                "hardware study was produced for another manifest"
             )
         if header.get("storage_revision") in {
             HARDWARE_STORAGE_REVISION,
@@ -1366,9 +1482,11 @@ def prepare_refinement_schedule(
             if entry.profile_id == profile_id
         ):
             raise ValueError("hardware-validation profile identity mismatch")
-        if row.get("numerical_result_hash") != _canonical_hash(numerical[profile_id]):
+        if row.get("numerical_result_hash") != _canonical_hash(
+            screen_rows_by_profile[profile_id]
+        ):
             raise ValueError(
-                "hardware-validation hardware/numerical join hash mismatch"
+                "hardware study joined a numerical row this screen did not measure"
             )
         retention_labels = tuple(row.get("retention_labels", ()))
         if (
@@ -1388,7 +1506,7 @@ def prepare_refinement_schedule(
             entry is None
             or aggregate.get("profile") != entry.profile.to_dict()
             or aggregate.get("numerical_result_hash")
-            != _canonical_hash(numerical[profile_id])
+            != _canonical_hash(screen_rows_by_profile[profile_id])
         ):
             raise ValueError(
                 "compact hardware aggregate differs from its numerical profile"
@@ -1458,7 +1576,27 @@ def prepare_refinement_schedule(
         promoted_evidence,
         reference_mean_nll=reference_mean_nll,
     )
-    if validity_path is not None:
+    if stack_validity_path is not None and validity_path is not None:
+        raise ValueError(
+            "pass either a stack-validity manifest to derive validity from or "
+            "a prebuilt refinement validity manifest, not both"
+        )
+    validity_manifest = None
+    if stack_validity_path is not None:
+        if validity_output_path is None:
+            raise ValueError(
+                "deriving refinement validity requires an output path"
+            )
+        document = load_immutable_json(stack_validity_path)
+        if (
+            document.get("manifest_hash") != manifest.canonical_hash
+            or document.get("run_plan_hash") != plan.canonical_hash
+        ):
+            raise ValueError("stack validity is bound to another workspace")
+        validity_manifest = derive_refinement_validity(schedule, document)
+        schedule = attach_refinement_validity(schedule, validity_manifest)
+        write_refinement_validity(validity_output_path, validity_manifest)
+    elif validity_path is not None:
         schedule = attach_refinement_validity(
             schedule,
             load_refinement_validity(validity_path),
@@ -1474,17 +1612,22 @@ def prepare_refinement_schedule(
                 hardware_validation_manifest.canonical_hash
             ),
             "numerical_screen_sha256": [
-                _file_hash(path) for path in numerical_screen_paths
+                _path_hash(path) for path in numerical_screen_paths
             ],
             "hardware_validation_sha256": [
-                _file_hash(path) for path in hardware_validation_paths
+                _path_hash(path) for path in hardware_validation_paths
             ],
             "hardware_study_sha256": [
-                _file_hash(path) for path in hardware_study_paths
+                _path_hash(path) for path in hardware_study_paths
             ],
             "reference_mean_nll": reference_mean_nll,
             "source_selection": source_selection.to_dict(),
             "schedule_hash": schedule.canonical_hash,
+            "validity_hash": (
+                validity_manifest.canonical_hash
+                if validity_manifest is not None
+                else None
+            ),
         },
     )
 
@@ -1507,6 +1650,8 @@ def build_schedule_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--hardware-study", action="append", required=True)
     parser.add_argument("--validity")
+    parser.add_argument("--stack-validity")
+    parser.add_argument("--validity-output")
     parser.add_argument("--schedule", required=True)
     parser.add_argument("--promotion", required=True)
     for name in ("mean-nll", "tpot-ms", "tps", "energy-per-token-j", "area-mm2"):
@@ -1525,6 +1670,8 @@ def build_schedule_main(argv: Iterable[str] | None = None) -> int:
         schedule_path=args.schedule,
         promotion_path=args.promotion,
         validity_path=args.validity,
+        stack_validity_path=args.stack_validity,
+        validity_output_path=args.validity_output,
         epsilon=EpsilonPolicy(
             mean_nll=args.epsilon_mean_nll,
             tpot_ms=args.epsilon_tpot_ms,
@@ -1561,6 +1708,7 @@ __all__ = [
     "build_refinement_schedule",
     "build_refinement_shard_plans",
     "build_selective_rotation_schedule",
+    "derive_refinement_validity",
     "evaluate_doomed_gate",
     "iter_split_kv_variants",
     "load_refinement_schedule",

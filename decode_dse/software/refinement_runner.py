@@ -1816,6 +1816,7 @@ def refinement_worker_command(
         sys.executable,
         "-m",
         "decode_dse.software.refinement_runner",
+        "run",
         "--config",
         str(config),
         "--schedule",

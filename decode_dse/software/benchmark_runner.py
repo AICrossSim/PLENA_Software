@@ -129,17 +129,18 @@ class PublicationConfiguration:
                 raise ValueError(
                     f"{self.role} does not descend from its uniform source"
                 )
+            # Every declared timing tier requires at least compiler and
+            # emulator validity; the tier-specific requirement is enforced by
+            # build_publication_configuration_manifest, which knows the tier.
             if any(
                 value is not True
                 for value in (
-                    self.validity.software_valid,
                     self.validity.compiler_valid,
                     self.validity.emulator_valid,
-                    self.validity.rtl_valid,
                 )
             ):
                 raise ValueError(
-                    f"{self.role} requires measured end-to-end hardware validity"
+                    f"{self.role} requires measured compiler and emulator validity"
                 )
 
     @property
@@ -2061,15 +2062,24 @@ def build_publication_configuration_manifest(
     merge_receipt_path: str | Path,
     hardware_artifacts: Sequence[str | Path],
     merged_results_path: str | Path | None = None,
+    publication_timing_tier: str,
 ) -> dict[str, Any]:
     """Select accuracy configurations once and retain every hardware option."""
 
+    from decode_dse.hardware.design_space import TIMING_TIER_REQUIRED_VALIDITY
+    from decode_dse.legality import evaluate_profile_legality
     from decode_dse.manifest import load_manifest
     from decode_dse.software.refinement_runner import (
         load_refinement_merged_results,
     )
     from decode_dse.software.refinement_schedule import load_refinement_schedule
 
+    required_validity = TIMING_TIER_REQUIRED_VALIDITY.get(publication_timing_tier)
+    if required_validity is None:
+        raise ValueError(
+            "no measured-validity requirement is declared for timing tier "
+            f"{publication_timing_tier!r}"
+        )
     manifest = load_manifest(manifest_path)
     schedule = load_refinement_schedule(schedule_path)
     roles, source_selection = _load_source_selection(
@@ -2119,13 +2129,12 @@ def build_publication_configuration_manifest(
                 continue
             if any(
                 getattr(entry.validity, name) is not True
-                for name in (
-                    "software_valid",
-                    "compiler_valid",
-                    "emulator_valid",
-                    "rtl_valid",
-                )
+                for name in required_validity
             ):
+                continue
+            # Mirror the refined-artifact writer's filter so every selected
+            # role winner is guaranteed to exist in the repriced artifact.
+            if not evaluate_profile_legality(entry.profile).hardware_candidate:
                 continue
             candidates.append(
                 (
@@ -2392,6 +2401,7 @@ def build_configurations_parser() -> argparse.ArgumentParser:
         action="append",
         required=True,
     )
+    parser.add_argument("--publication-timing-tier", required=True)
     parser.add_argument("--output", required=True)
     return parser
 
@@ -2407,6 +2417,7 @@ def build_configurations_main(argv: Iterable[str] | None = None) -> int:
         merge_receipt_path=args.refinement_merge,
         merged_results_path=args.refinement_results,
         hardware_artifacts=tuple(args.hardware_artifact),
+        publication_timing_tier=args.publication_timing_tier,
     )
     output = write_immutable_json(args.output, manifest)
     load_publication_configuration_manifest(output)

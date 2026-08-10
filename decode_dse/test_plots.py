@@ -108,6 +108,7 @@ def test_selected_deployment_plot_keeps_evidence_tiers_separate(
             "tokens_per_second": 240.0,
             "throughput_evidence_tier": "compiler_trace_request_calibrated",
             "energy_per_token_j": 0.08,
+            "energy_evidence_tier": "analytic_anchored",
             **common,
         },
         {
@@ -115,6 +116,7 @@ def test_selected_deployment_plot_keeps_evidence_tiers_separate(
             "tokens_per_second": 180.0,
             "throughput_evidence_tier": "measured",
             "energy_per_token_j": "",
+            "energy_evidence_tier": "unavailable",
             **common,
         },
     )

@@ -23,9 +23,19 @@ ADMISSION_CORRECTNESS_SCOPE = "bf16_to_packedkv_numerical_correctness"
 ADMISSION_VALIDATION_BASIS = (
     "independent_source_conversion_exact_persisted_planes"
 )
+# The recompute policy rebuilds each plane from its source instead of reading
+# a persisted one, so it validates against a basis of its own. Each policy
+# still requires exactly its own basis string.
+RECOMPUTABLE_ADMISSION_VALIDATION_BASIS = (
+    "independent_source_recompute_exact_planes"
+)
 ADMISSION_PERSISTENCE_CONTRACT = (
     "packed_planes_plus_bf16_numerical_view"
 )
+# Admission may instead recompute each format on demand, persisting nothing.
+# The recomputable projection reports a logical total and a runtime peak in
+# place of the persisted-plane fields the contract above accounts for.
+RECOMPUTABLE_ADMISSION_POLICY = "content_addressed_recompute_per_format"
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -115,13 +125,23 @@ class AdmissionCorrectnessStatus:
             and self.runtime_environment_fingerprint is not None
             and self.sample_bundle_hash is not None
             and self.layout_id is not None
-            and self.persistence_contract
-            == ADMISSION_PERSISTENCE_CONTRACT
+            and (
+                # The persisted contract keeps its planes on disk; the
+                # recompute policy rebuilds them and persists nothing, so
+                # each policy pins its own persisted-byte expectation.
+                (
+                    self.persistence_contract == ADMISSION_PERSISTENCE_CONTRACT
+                    and self.persisted_bytes > 0
+                )
+                or (
+                    self.persistence_contract == RECOMPUTABLE_ADMISSION_POLICY
+                    and self.persisted_bytes == 0
+                )
+            )
             and bool(self.formats)
             and self.document_count > 0
             and self.artifact_count > 0
             and self.tensor_count > 0
-            and self.persisted_bytes > 0
             and self.projected_cold_artifact_bytes >= self.persisted_bytes
             and self.projected_numerical_view_bytes > 0
         )
@@ -350,6 +370,75 @@ def _validate_numerical_records(
     return total_tensors
 
 
+def _format_bytes(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    formats: Sequence[str],
+) -> dict[str, int]:
+    """Total rebuild cost per format, including the BF16 reference."""
+
+    totals = {format_id: 0 for format_id in (*formats, "BF16")}
+    for record in records:
+        format_id = str(record.get("format_id", ""))
+        if format_id not in totals:
+            raise ValueError("admission record declares an unknown format")
+        totals[format_id] += int(record["persisted_bytes"])
+    return totals
+
+
+def _validate_recomputable_resource_projection(
+    value: Mapping[str, Any],
+    *,
+    logical_bytes: int,
+    format_bytes: Mapping[str, int],
+) -> dict[str, int | float | str]:
+    """Validate the projection written by the recompute-per-format policy."""
+
+    integer_fields = (
+        "logical_total_bytes",
+        "runtime_peak_format_bytes",
+        "persisted_after_preparation_bytes",
+        "required_cold_capacity_bytes",
+        "observed_cold_available_bytes",
+        "required_host_bytes",
+        "observed_host_available_bytes",
+    )
+    integers: dict[str, int] = {}
+    for name in integer_fields:
+        field = value.get(name)
+        if isinstance(field, bool) or not isinstance(field, int) or field < 0:
+            raise ValueError(f"admission resource {name} is invalid")
+        integers[name] = field
+    if integers["logical_total_bytes"] != logical_bytes:
+        raise ValueError("admission logical total differs from its records")
+    if integers["runtime_peak_format_bytes"] != max(format_bytes.values()):
+        raise ValueError("admission runtime peak differs from its records")
+    if integers["persisted_after_preparation_bytes"] != 0:
+        raise ValueError("recomputable admission must persist nothing")
+    if integers["required_cold_capacity_bytes"] <= 0:
+        raise ValueError("admission required cold capacity is invalid")
+    if (
+        integers["observed_cold_available_bytes"]
+        < integers["required_cold_capacity_bytes"]
+    ):
+        raise ValueError("admission cold capacity was not available")
+    if integers["required_host_bytes"] <= 0:
+        raise ValueError("admission required host bytes is invalid")
+    if integers["observed_host_available_bytes"] < integers["required_host_bytes"]:
+        raise ValueError("admission host capacity was not available")
+    resolved: dict[str, int | float | str] = dict(integers)
+    # Present the recomputable projection through the same field names the
+    # persisted contract reports, so downstream evidence stays one shape:
+    # cold capacity is what preparation required, and the numerical-view
+    # total is the logical cost of rebuilding every plane.
+    resolved["persistence_contract"] = RECOMPUTABLE_ADMISSION_POLICY
+    resolved["projected_cold_artifact_bytes"] = integers[
+        "required_cold_capacity_bytes"
+    ]
+    resolved["projected_numerical_view_bytes"] = integers["logical_total_bytes"]
+    return resolved
+
+
 def _validate_resource_projection(
     value: Any,
     *,
@@ -522,6 +611,11 @@ def load_admission_correctness_evidence(
         payload_bytes = sum(
             int(record["payload_bytes"]) for record in records
         )
+        projection = index.get("resource_projection")
+        recomputable = (
+            isinstance(projection, Mapping)
+            and projection.get("policy") == RECOMPUTABLE_ADMISSION_POLICY
+        )
         if (
             int(receipt.get("artifact_count", -1)) != len(records)
             or int(index.get("artifact_count", -2)) != len(records)
@@ -529,19 +623,49 @@ def load_admission_correctness_evidence(
             or int(index.get("document_count", -2)) != document_count
             or int(receipt.get("quantized_format_count", -1))
             != len(formats)
-            or int(receipt.get("persisted_bytes", -1))
-            != persisted_bytes
-            or int(index.get("persisted_bytes", -2))
-            != persisted_bytes
-            or int(index.get("payload_bytes", -1)) != payload_bytes
             or receipt.get("resource_projection")
             != index.get("resource_projection")
         ):
             raise ValueError("admission aggregate counts differ")
-        resources = _validate_resource_projection(
-            index.get("resource_projection"),
-            persisted_bytes=persisted_bytes,
-        )
+        if recomputable:
+            # Under the content-addressed recompute policy nothing survives
+            # preparation: each per-record size is the cost of rebuilding that
+            # artifact, their sum is the logical total, and the persisted
+            # totals must be exactly zero.
+            if (
+                int(receipt.get("persisted_bytes", -1)) != 0
+                or int(index.get("persisted_bytes", -2)) != 0
+                or int(receipt.get("logical_artifact_bytes", -1))
+                != persisted_bytes
+                or int(index.get("logical_artifact_bytes", -2))
+                != persisted_bytes
+                or receipt.get("persistence_policy")
+                != RECOMPUTABLE_ADMISSION_POLICY
+                or index.get("persistence_policy")
+                != RECOMPUTABLE_ADMISSION_POLICY
+            ):
+                raise ValueError("admission aggregate counts differ")
+            resources = _validate_recomputable_resource_projection(
+                projection,
+                logical_bytes=persisted_bytes,
+                format_bytes=_format_bytes(records, formats=formats),
+            )
+            # Nothing survives preparation under this policy; the summed
+            # per-record size is the logical rebuild cost, reported through
+            # the projection rather than as persisted bytes.
+            reported_persisted_bytes = 0
+        else:
+            if (
+                int(receipt.get("persisted_bytes", -1)) != persisted_bytes
+                or int(index.get("persisted_bytes", -2)) != persisted_bytes
+                or int(index.get("payload_bytes", -1)) != payload_bytes
+            ):
+                raise ValueError("admission aggregate counts differ")
+            resources = _validate_resource_projection(
+                projection,
+                persisted_bytes=persisted_bytes,
+            )
+            reported_persisted_bytes = persisted_bytes
         raw_validation_path = Path(
             str(receipt.get("numerical_validation_path", ""))
         )
@@ -559,7 +683,12 @@ def load_admission_correctness_evidence(
             validation.get("schema_version")
             != ADMISSION_NUMERICAL_VALIDATION_SCHEMA
             or validation.get("passed") is not True
-            or validation.get("basis") != ADMISSION_VALIDATION_BASIS
+            or validation.get("basis")
+            != (
+                RECOMPUTABLE_ADMISSION_VALIDATION_BASIS
+                if recomputable
+                else ADMISSION_VALIDATION_BASIS
+            )
             or validation.get("admission_index_hash") != index_hash
             or validation.get("admission_contract_id") != contract_id
             or validation.get("admission_code_revision")
@@ -609,7 +738,7 @@ def load_admission_correctness_evidence(
                 "persistence_contract": resources[
                     "persistence_contract"
                 ],
-                "persisted_bytes": persisted_bytes,
+                "persisted_bytes": reported_persisted_bytes,
                 "projected_cold_artifact_bytes": resources[
                     "projected_cold_artifact_bytes"
                 ],
@@ -639,7 +768,7 @@ def load_admission_correctness_evidence(
             document_count=document_count,
             artifact_count=len(indexed),
             tensor_count=tensor_count,
-            persisted_bytes=persisted_bytes,
+            persisted_bytes=reported_persisted_bytes,
             projected_cold_artifact_bytes=int(
                 resources["projected_cold_artifact_bytes"]
             ),

@@ -44,6 +44,7 @@ from decode_dse.hardware.design_space import (
     ResourceBudget,
     ResourceBudgetStatus,
     STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
+    TIMING_TIER_REQUIRED_VALIDITY,
     physical_cost_signature,
 )
 from decode_dse.hardware.lm_head_service import (
@@ -93,6 +94,14 @@ PREFILL_HANDOFF_ANALYSIS_SCHEMA = "plena-prefill-handoff-analysis-v1"
 PREFILL_MEASUREMENT_SCOPE = "full_model_bf16_prompt_encoding_to_kv_ready"
 HANDOFF_LINK_GENERATIONS = frozenset({"nvlink3", "nvlink4", "ualink", "pcie5"})
 DECODE_BF16_HEAD = "decode_bf16_unmodeled"
+# The configured runtime HBM reserve is an allowance for working memory, sized
+# for whichever memory the study was first written against. Cap it at this
+# fraction of the chip it is actually reserved from: a reserve chosen for a
+# large memory must not exceed - or dominate - a smaller one, and a reserve
+# larger than the chip would render every geometry infeasible regardless of
+# precision, sharding or chip count. Scaling with capacity keeps the same
+# configuration meaningful across channel counts and across model sizes.
+RUNTIME_HBM_RESERVE_CAPACITY_DIVISOR = 8
 EXTERNAL_BF16_HEAD = "external_bf16_service"
 _AREA_KEYS = (
     "MATRIX_SRAM_DEPTH",
@@ -1514,6 +1523,8 @@ def _refinement_hardware_inputs(
     schedule_path: str | os.PathLike[str],
     merge_receipt_path: str | os.PathLike[str],
     results_path: str | os.PathLike[str] | None,
+    *,
+    publication_timing_tier: str,
 ) -> tuple[RefinementHardwareManifest, tuple[Mapping[str, Any], ...]]:
     from decode_dse.software.refinement_runner import (
         load_refinement_merged_results,
@@ -1522,6 +1533,12 @@ def _refinement_hardware_inputs(
         load_refinement_schedule,
     )
 
+    required_validity = TIMING_TIER_REQUIRED_VALIDITY.get(publication_timing_tier)
+    if required_validity is None:
+        raise ValueError(
+            "no measured-validity requirement is declared for timing tier "
+            f"{publication_timing_tier!r}"
+        )
     schedule = load_refinement_schedule(schedule_path)
     merged = load_refinement_merged_results(
         schedule,
@@ -1537,12 +1554,7 @@ def _refinement_hardware_inputs(
             or not legality.hardware_candidate
             or any(
                 getattr(schedule_entry.validity, name) is not True
-                for name in (
-                    "software_valid",
-                    "compiler_valid",
-                    "emulator_valid",
-                    "rtl_valid",
-                )
+                for name in required_validity
             )
         ):
             continue
@@ -1714,6 +1726,118 @@ def _terminal_files(paths: Sequence[str | os.PathLike[str]]) -> tuple[Path, ...]
     if not ordered:
         raise ValueError("no numerical JSONL files were found")
     return ordered
+
+
+def _augment_with_stage_reference(
+    manifest: SweepManifest,
+    rows: tuple[Mapping[str, Any], ...],
+    *,
+    workspace_manifest: SweepManifest,
+    numerical_paths: Sequence[str | os.PathLike[str]],
+) -> tuple[SweepManifest, tuple[Mapping[str, Any], ...]]:
+    """Anchor the accuracy gate on the reference measured in a sibling shard.
+
+    A stage partition holds the single BF16 reference in exactly one shard,
+    yet every partition needs it to gate on relative perplexity. Each row of
+    a stage is measured over the same prompt set under the same sample
+    contract regardless of partition, so the one reference measurement is a
+    valid anchor for every partition. The reference entry is taken from the
+    workspace manifest and its row from whichever sibling partition recorded
+    it; both are rejected unless they agree with this stage's contract.
+    """
+
+    if any(
+        entry.profile.kind == PROFILE_KIND_BF16_REFERENCE
+        for entry in manifest.entries
+    ):
+        return manifest, rows
+    references = tuple(
+        entry
+        for entry in workspace_manifest.entries
+        if entry.profile.kind == PROFILE_KIND_BF16_REFERENCE
+    )
+    if len(references) != 1:
+        raise ValueError(
+            "the workspace manifest must declare exactly one BF16 reference"
+        )
+    reference = references[0]
+    contracts = {
+        json.dumps(
+            (row.get("result") or {}).get("sample_contract"),
+            sort_keys=True,
+        )
+        for row in rows
+    }
+    if len(contracts) != 1:
+        raise ValueError("stage rows disagree on their sample contract")
+    stage_contract = next(iter(contracts))
+
+    partitions: list[Path] = []
+    for path in numerical_paths:
+        resolved = Path(path).resolve()
+        root = resolved if resolved.is_dir() else resolved.parent
+        for sibling in sorted(root.parent.iterdir()):
+            if sibling.is_dir() and (sibling / "manifest.json").is_file():
+                if sibling not in partitions:
+                    partitions.append(sibling)
+    for partition in partitions:
+        sibling_manifest = load_manifest(partition / "manifest.json")
+        if not any(
+            entry.profile_id == reference.profile_id
+            for entry in sibling_manifest.entries
+        ):
+            continue
+        if (
+            sibling_manifest.model_name != manifest.model_name
+            or sibling_manifest.model_revision != manifest.model_revision
+            or sibling_manifest.tokenizer_revision != manifest.tokenizer_revision
+            or sibling_manifest.quantizer_provenance.canonical_hash
+            != manifest.quantizer_provenance.canonical_hash
+        ):
+            raise ValueError(
+                "the reference partition does not share this stage's identity"
+            )
+        sibling_rows = load_terminal_numerical_rows(
+            (partition,),
+            sibling_manifest,
+            require_complete=False,
+        )
+        for row in sibling_rows:
+            if str(row.get("profile_id", "")) != reference.profile_id:
+                continue
+            contract = json.dumps(
+                (row.get("result") or {}).get("sample_contract"),
+                sort_keys=True,
+            )
+            if contract != stage_contract:
+                raise ValueError(
+                    "the reference row was measured under a different "
+                    "sample contract than this stage"
+                )
+            anchored = dict(row)
+            anchored["manifest_hash"] = manifest.canonical_hash
+            entries = manifest.entries + (
+                SweepManifestEntry(
+                    ordinal=len(manifest.entries),
+                    profile=reference.profile,
+                    legality=reference.legality,
+                    validity=reference.validity,
+                ),
+            )
+            return (
+                SweepManifest(
+                    model_name=manifest.model_name,
+                    model_revision=manifest.model_revision,
+                    model_architecture=manifest.model_architecture,
+                    tokenizer_revision=manifest.tokenizer_revision,
+                    quantizer_provenance=manifest.quantizer_provenance,
+                    entries=entries,
+                ),
+                rows + (anchored,),
+            )
+    raise ValueError(
+        "no sibling stage partition recorded the BF16 reference measurement"
+    )
 
 
 def load_terminal_numerical_rows(
@@ -2308,7 +2432,10 @@ class DecodeSimulatorBackend:
                 context=workload.input_seq + workload.output_seq,
                 batch=candidate.batch,
                 hbm_capacity_bytes=hbm_per_chip,
-                runtime_hbm_reserve_bytes=workload.runtime_hbm_reserve_bytes,
+                runtime_hbm_reserve_bytes=min(
+                    int(workload.runtime_hbm_reserve_bytes),
+                    hbm_per_chip // RUNTIME_HBM_RESERVE_CAPACITY_DIVISOR,
+                ),
                 kv_layout=workload.kv_layout,
                 include_lm_head=(
                     self.output_head_location == DECODE_BF16_HEAD
@@ -3427,6 +3554,14 @@ class ProductionHardwareEvaluator:
                 "successful numerical result is missing",
             )
         mean_nll = numerical_metrics.get("mean_nll")
+        refined_mean_nll = numerical_metrics.get("mean_token_nll")
+        if mean_nll is None:
+            mean_nll = refined_mean_nll
+        elif refined_mean_nll is not None and refined_mean_nll != mean_nll:
+            return HardwareEvaluation.failed(
+                "numerical_metrics_invalid",
+                "numerical result carries two disagreeing mean NLL fields",
+            )
         token_count = numerical_metrics.get("token_count")
         if (
             isinstance(mean_nll, bool)
@@ -4100,6 +4235,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True)
     parser.add_argument("--code-revision", action="append", default=[])
     parser.add_argument("--allow-incomplete", action="store_true")
+    parser.add_argument("--parallel-workers", type=int, default=1)
     return parser
 
 
@@ -4139,8 +4275,9 @@ def _validate_execution_launch(
         )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
+    """Build the fully validated study from parsed launch arguments."""
+
     refinement_mode = any(
         value is not None
         for value in (
@@ -4218,9 +4355,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         base_manifest.tokenizer_revision
     ):
         raise ValueError("config and manifest tokenizer revisions differ")
+    # The admission receipt is prepared once per workspace and binds the
+    # workspace manifest, while --manifest addresses one stage shard whose
+    # canonical hash covers only that shard's entries. Resolve the workspace
+    # manifest that sits beside the receipt and require the shard to belong
+    # to it before validating admission against the workspace identity.
+    workspace_manifest_path = (
+        Path(args.admission_receipt).resolve().parent / "manifest.json"
+    )
+    if not workspace_manifest_path.is_file():
+        raise ValueError(
+            "admission receipt is not accompanied by a workspace manifest"
+        )
+    workspace_manifest = load_manifest(workspace_manifest_path)
+    if (
+        workspace_manifest.model_name != base_manifest.model_name
+        or workspace_manifest.model_revision != base_manifest.model_revision
+        or workspace_manifest.tokenizer_revision
+        != base_manifest.tokenizer_revision
+        or workspace_manifest.quantizer_provenance.canonical_hash
+        != base_manifest.quantizer_provenance.canonical_hash
+    ):
+        raise ValueError("stage manifest does not belong to the workspace manifest")
     admission_status = load_admission_correctness_evidence(
         args.admission_receipt,
-        manifest_hash=base_manifest.canonical_hash,
+        manifest_hash=workspace_manifest.canonical_hash,
     )
     if not admission_status.passed:
         raise ValueError(
@@ -4233,6 +4392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.refinement_schedule,
             args.refinement_merge,
             args.refinement_results,
+            publication_timing_tier=args.publication_timing_tier,
         )
     else:
         manifest = base_manifest
@@ -4240,6 +4400,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.numerical_jsonl,
             base_manifest,
             require_complete=not args.allow_incomplete,
+        )
+        manifest, rows = _augment_with_stage_reference(
+            manifest,
+            rows,
+            workspace_manifest=workspace_manifest,
+            numerical_paths=args.numerical_jsonl,
         )
     reference = config.get("reference_workload")
     if not isinstance(reference, Mapping):
@@ -4342,19 +4508,96 @@ def main(argv: Sequence[str] | None = None) -> int:
         resource_budget=space.resource_budget,
         publication_timing_tier=args.publication_timing_tier,
     )
-    result = run_exact_hardware_study(
+    return ExactHardwareStudy(
         manifest=manifest,
-        numerical_rows=rows,
+        numerical_results=rows,
         space=space,
         hidden_size=int(backend.sim.dims["hidden"]),
         evaluator=evaluator,
-        output=args.output,
+        evaluator_version=evaluator.evaluator_id,
+        evaluator_provenance=evaluator.provenance,
         code_revisions=_code_revisions(args.code_revision),
         require_complete=not args.allow_incomplete,
         relative_perplexity_limit=(
             None if refinement_mode else _relative_perplexity_limit(config)
         ),
     )
+
+
+_PARALLEL_WORKER_STUDY: ExactHardwareStudy | None = None
+
+
+def _parallel_worker_initializer(argv: tuple[str, ...]) -> None:
+    global _PARALLEL_WORKER_STUDY
+    args = _parser().parse_args(list(argv))
+    args.parallel_workers = 1
+    _PARALLEL_WORKER_STUDY = _construct_study(args)
+
+
+def _parallel_price_block(
+    block_ordinal: int,
+) -> list[tuple[int, int, HardwareEvaluation]]:
+    study = _PARALLEL_WORKER_STUDY
+    if study is None:
+        raise RuntimeError("parallel pricing worker was not initialized")
+    return study.price_block(block_ordinal)
+
+
+def _parallel_factor_stream(
+    study: ExactHardwareStudy,
+    argv: Sequence[str],
+    workers: int,
+) -> Iterable[Any]:
+    """Price factor blocks in worker processes, preserving exact order.
+
+    Every worker rebuilds the identical study from the identical launch
+    arguments, so block schedules agree by construction; the parent consumes
+    block results strictly in schedule order, which keeps the factor stream
+    byte-identical to serial execution.
+    """
+
+    import concurrent.futures
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    executor = concurrent.futures.ProcessPoolExecutor(
+        max_workers=max(1, min(int(workers), study.factor_block_count)),
+        mp_context=context,
+        initializer=_parallel_worker_initializer,
+        initargs=(tuple(argv),),
+    )
+    try:
+        yield from study.iter_factor_evaluations_from_blocks(
+            executor.map(
+                _parallel_price_block,
+                range(study.factor_block_count),
+            )
+        )
+    finally:
+        # Never block on in-flight blocks: on the complete path all tasks
+        # are already drained, and on an error path the exception must
+        # propagate immediately rather than wait out running workers.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    argv_list = list(argv) if argv is not None else list(sys.argv[1:])
+    args = _parser().parse_args(argv_list)
+    study = _construct_study(args)
+    factor_stream = (
+        _parallel_factor_stream(study, argv_list, args.parallel_workers)
+        if args.parallel_workers > 1
+        else None
+    )
+    artifact = study.write(args.output, factor_stream=factor_stream)
+    result = {
+        "run_id": artifact.run_id,
+        "path": str(artifact.path),
+        "metadata_path": str(artifact.metadata_path),
+        "result_count": artifact.result_count,
+        "content_sha256": artifact.content_hash,
+        "evaluator_id": study.evaluator.evaluator_id,
+    }
     print(json.dumps(result, sort_keys=True))
     return 0
 

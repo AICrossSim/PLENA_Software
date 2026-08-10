@@ -692,7 +692,7 @@ def promote_epsilon_pareto(
     quantized = tuple(
         point for point in values if point.profile.kind == PROFILE_KIND_QUANTIZED
     )
-    ranked_candidates = quantized or unique
+    ranked_candidates = quantized or values
     ranked = tuple(
         point
         for front in epsilon_pareto_fronts(ranked_candidates, epsilon)
