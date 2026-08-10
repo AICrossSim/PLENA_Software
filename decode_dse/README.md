@@ -3,9 +3,14 @@
 This package evaluates a dedicated PLENA decode chip for disaggregated
 Qwen3-32B and Llama-3.1-8B serving. It keeps numerical accuracy, compiler
 support, emulator support, RTL validation, timing calibration, and power
-calibration as separate claims. The two pinned model configurations use the
-same precision search and publication contracts; Llama-3.1-8B is the first
-execution target, followed by Qwen3-32B.
+calibration as separate claims. The two pinned model configurations share the
+same publication contracts; each declares its own precision search space
+(Llama-3.1-8B enumerates the canonical space, Qwen3-32B a declared subspace
+with disclosed exclusions). Llama-3.1-8B is the first execution target,
+followed by Qwen3-32B. Every physical number comes from the sibling
+`PLENA_Simulator` checkout's analytic models — resolved via
+`PLENA_SIMULATOR_PATH` or the adjacent `../PLENA_Simulator` directory — so
+that checkout is a hard dependency of every pricing stage.
 
 The organising principle is that **no result inherits evidence from another**.
 A precision profile that is accurate says nothing about whether the compiler can
@@ -47,10 +52,10 @@ prefill-greedy handoff token is unscored, and later dataset tokens use cached
 is not standard WikiText-2 perplexity. Cache-free perplexity is not part of
 this path.
 
-## Canonical search
+## Declared search space
 
-The main block size is 8, the native RTL MX block. W, A, and shared K/V each
-use:
+The main block size is 8, the native RTL MX block. The canonical format
+tuple for W, A, and shared K/V is:
 
 ```text
 MXINT2 MXINT4 MXINT8 E1M2 E2M1 E3M4 E4M3 E5M2
@@ -62,35 +67,47 @@ Every W/A/KV point is evaluated with:
 FP_E3M2 FP_E2M3 FP_E6M5 FP_E5M6 FP_E4M7 FP_E8M5
 ```
 
-The deterministic manifest contains:
+Each study declares its precision space in `search`: every axis must be a
+canonical-order subsequence of the canonical tuple, every excluded format
+needs a disclosed rationale under `search.declared_exclusions`, and the
+sealed expected counts must equal the declared space's cross product. Within
+the declared space the enumeration is exhaustive and unpruned. The Llama
+study declares the full canonical space (3,072 quantized profiles, 512
+vector-BF16 controls, one split-execution BF16 reference — 3,585 IDs). The
+Qwen study excludes MXINT2 and E2M1 from the weight and activation axes on
+measured prior evidence from the Llama screen (each exceeded the relaxed
+1.05x accuracy budget with margin) and enumerates 1,728 quantized profiles,
+288 controls, and the reference — 2,017 IDs.
 
-- 3,072 quantized profiles;
-- 512 vector-BF16 controls; and
-- one split-execution BF16 software reference.
-
-The 3,585 IDs are enumerated exactly. Optuna is not used for this numerical
-grid. Blocks 16 and 32 are reserved for a selected-profile numerical
-sensitivity study and are not deployment candidates for the native block-8
-datapath. Split K/V precision is confined to promoted-profile refinement.
+Optuna is not used for this numerical grid. Blocks 16 and 32 are reserved
+for a selected-profile numerical sensitivity study and are not deployment
+candidates for the native block-8 datapath. Split K/V precision is confined
+to promoted-profile refinement.
 
 Accuracy is evaluated once for every precision profile and model, while the
 hardware search evaluates the complete precision-by-hardware cross-product.
 Final selection is joint under the accuracy, area, and HBM constraints; there
 is no staged partial-objective decomposition of the canonical search.
 
-Static datapath legality admits 574 rows to hardware pricing: 492 quantized
-profiles and 82 vector-BF16 controls. The complete structural spaces contain
-1,413,216 Qwen and 1,848,096 Llama candidates, giving 811,185,984 and
-1,060,807,104 raw profile-candidate pairs. Exact compiler geometry admits
-79,488 Qwen and 272,160 Llama candidates. The factorized artifact stores
-476,928 and 1,632,960 physical-cost evaluation rows, respectively, plus the
-ordered memberships required to reconstruct every eligible conceptual join;
-it never materializes the raw cross-product. The scheduler compresses this
-work only by exact physical-cost equivalence, prices each equivalence class
-once, and joins the result back to every accuracy row. Its
-provenance records the raw, hard-accuracy-gated, hard-resource-gated,
-simulator-priced, and joined counts. It performs no performance, bandwidth
-demand, memory-bound, or objective-based pruning.
+Static datapath legality admits the hardware-pricing rows per declared
+space (574 for the canonical Llama space; 336 for the declared Qwen
+subspace). The Qwen hardware grid is pruned to compiler-legal geometry —
+head_dim fixes HLEN at 128, the grouped-query head-broadcast bound requires
+MLEN of at least 1,024 and TP and KVP of at most 8 — so its geometry census
+records zero compiler rejections; compiler-legality pruning removes
+impossible programs, never unpromising ones. HBM channels are searchable at
+8, 16, and 32 interface units, all measured aggregate-calibration groups,
+and the chip-side HBM PHY is charged per interface unit so attached
+bandwidth trades against silicon area. The factorized artifact stores the
+physical-cost evaluation rows plus the ordered memberships required to
+reconstruct every eligible conceptual join; it never materializes the raw
+cross-product. The scheduler compresses this work only by exact
+physical-cost equivalence, prices each equivalence class once, and joins the
+result back to every accuracy row. Its provenance records the raw,
+hard-resource-gated, simulator-priced, and joined counts. Within the
+declared space it performs no performance, bandwidth demand, memory-bound,
+or objective-based pruning; accuracy is priced for every profile and stamped
+as an `accuracy_within_limit` label, never used as a filter.
 
 ## Workflow
 
@@ -245,11 +262,68 @@ that model's plan and preflight evidence pass. It executes in this order:
 1. **Measured GPU baseline.** The immutable run plan lists every
    cached-`q_len=1` BF16 baseline batch; the pipeline measures those batches on
    its first visible GPU before any sweep work.
-2. **Hardware-validation shards**, evaluated with compiler-trace timing.
-3. **Joint source selection** over the verified partitions.
-4. **Refinement**, following the declared protocol.
-5. **Repricing** of the selected refined profiles.
-6. **Publication figures**, rendered only once the above have completed.
+2. **Compiler-trace artifacts and the publication evidence gate**, binding the
+   external evidence inputs before any gated stage may run.
+3. **Preflight**, including the fidelity, correctness, and evidence-building
+   stages that gate the sharded sweeps.
+4. **Numerical screen shards** — the exhaustive accuracy pass over every
+   declared profile; the BF16 reference row for the accuracy budget lives
+   here.
+5. **Hardware-validation shards**, evaluated with compiler-trace timing.
+6. **Exact hardware study partitions** — analytic pricing of every
+   profile-by-candidate signature pair, parallelised across
+   `study_parallel_workers` spawn workers via deterministic factor blocks
+   whose output is byte-identical to the serial order.
+7. **Joint source selection** over the verified partitions; when the config
+   declares `accuracy_budgets`, the promotion record also carries the strict
+   and relaxed accuracy frontiers.
+8. **Refinement**, following the declared protocol.
+9. **Repricing** of the selected refined profiles.
+10. **Publication benchmarks and final selection**, only when
+    `publication_enabled` is true; the pipeline otherwise stops after
+    repricing.
+11. **Publication figures**, rendered only once the above have completed. The
+    figure stage always receives the measured GPU baseline, so the analytic
+    energy context and the dual-accuracy envelopes render even when the
+    publication benchmark stages are disabled.
+
+### Execution modes and timing tiers
+
+Hardware pricing runs in one of two execution modes, and the declared
+publication timing tier is bound one-to-one to the mode:
+
+- `legacy_aggregate_bandwidth` prices decode steps from the stage-calibrated
+  analytic model — `max(compute, memory)` per sampled step, with the memory
+  stage priced on the emulator-measured, DMA-size-aware bandwidth curves.
+  Its rows carry the `stage_calibrated_analytic` tier.
+- `compiler_trace` prices from emitted full-model compiler traces with a
+  latency library and carries the `compiler_trace_request_calibrated` tier.
+
+Both tiers require compiler and emulator validity; RTL and DC validity are
+recorded and disclosed on every row but never required.
+
+### HBM operating points
+
+The calibrated bandwidth model is measured at the emulator's 2 Gb/s pin rate
+with channel groups at 8, 16, and 32 interface units; those are the only
+rankable headline operating points, and `validate_calibrated_hardware_space`
+fails closed on anything else. The calibration rows labelled HBM3 were also
+measured at the emulator rate and are not used for headline pricing. Faster
+HBM generations appear only through the separate `hbm_sensitivity`
+disclosure, which never ranks across generations.
+
+### Energy tiers
+
+Every rankable study row prices energy per generated token on the
+literature-anchored analytic power model and carries the
+`analytic_anchored` tier. Supplying `artifacts.power_calibration` and
+`artifacts.area_config` switches pricing to the DC-calibrated event-power
+engine (`dc_calibrated` tier), which fails closed outside its measured
+interpolation domain. The figure stage writes `energy_context.json`, which
+places the best analytic PLENA point next to the measured GPU board energy
+with both tiers, an explicit `model_estimate_over_measured_gpu` ratio
+semantics, and `not_a_headline_claim`; measured-versus-measured headline
+energy ratios remain the exclusive province of the final deployment table.
 
 ### Restartability
 
@@ -267,8 +341,9 @@ selection. Evidence tiers appear side by side, and:
 - the throughput ratio stays **empty** until a same-tier measured PLENA result
   exists;
 - headline ratios accept measured evidence on both sides only;
-- A100 and H100 peak-roofline values remain a separate labelled table and never
-  acquire a ratio.
+- the measured baseline device is whatever the run plan declares (a single
+  B200 for these studies); A100 and H100 appear only as peak-roofline values
+  in a separate labelled table and never acquire a ratio.
 
 ### Measured baseline energy
 
@@ -306,7 +381,8 @@ from GPU timing.
 ### Refinement and benchmarks
 
 Refinement is partitioned into exactly four logical source shards from one
-immutable master schedule, run in two waves across the two-GPU execution pool.
+immutable master schedule, scheduled across the execution pool the run plan
+declares.
 The merge accepts only complete, checksum-verified terminal coverage, and every
 accuracy-selected refinement profile is repriced against the exact hardware
 space before publication configurations are sealed.
