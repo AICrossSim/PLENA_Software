@@ -820,8 +820,10 @@ def test_exact_search_knob_choice_respects_area_and_capacity_tradeoffs() -> None
 
 def test_full_model_spaces_have_exact_bounded_structural_counts() -> None:
     repository = Path(__file__).resolve().parents[2]
+    # The Qwen grid is pruned to compiler-legal geometry with searchable
+    # HBM channels; the Llama grid keeps its historical shape.
     expected = {
-        "qwen3_32b": 471_072,
+        "qwen3_32b": 55_584,
         "llama3_1_8b": 616_032,
     }
     for name, count in expected.items():
