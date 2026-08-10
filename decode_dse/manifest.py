@@ -24,10 +24,13 @@ from decode_dse.legality import (
     evaluate_profile_legality,
 )
 from decode_dse.profiles import (
+    CANONICAL_SEARCH_SPACE,
     PROFILE_KIND_BF16_REFERENCE,
     PROFILE_KIND_QUANTIZED,
     PROFILE_KIND_VECTOR_BF16_CONTROL,
+    DeclaredSearchSpace,
     DecodePrecisionProfile,
+    declared_search_space,
     enumerate_decode_profiles,
 )
 
@@ -331,10 +334,15 @@ def build_exhaustive_manifest(
     model_architecture: Mapping[str, Any],
     quantizer_provenance: QuantizerProvenance,
     tokenizer_revision: str | None = None,
+    search_space: DeclaredSearchSpace = CANONICAL_SEARCH_SPACE,
 ) -> SweepManifest:
-    """Build the exact quantized, vector-control, and BF16 reference schedule."""
+    """Build the exact quantized, vector-control, and BF16 reference schedule.
 
-    profiles = enumerate_decode_profiles()
+    The schedule is exhaustive and unpruned over the declared search space;
+    the canonical space reproduces the historical 3,585-profile sweep.
+    """
+
+    profiles = enumerate_decode_profiles(search_space)
     entries = tuple(
         SweepManifestEntry(
             ordinal=ordinal,
@@ -352,10 +360,10 @@ def build_exhaustive_manifest(
         entries=entries,
     )
     expected = {
-        "quantized": EXPECTED_QUANTIZED_PROFILES,
-        "vector_bf16_control": EXPECTED_VECTOR_CONTROLS,
+        "quantized": search_space.expected_quantized_profiles,
+        "vector_bf16_control": search_space.expected_vector_bf16_controls,
         "bf16_reference": EXPECTED_BF16_REFERENCES,
-        "total": EXPECTED_TOTAL_PROFILES,
+        "total": search_space.expected_total_profiles,
     }
     if manifest.counts != expected:
         raise AssertionError(
@@ -652,16 +660,16 @@ def _load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
 
 
 def validate_sweep_config(config: Mapping[str, Any]) -> None:
-    """Reject configuration drift from the canonical exhaustive schedule."""
+    """Reject configuration drift from the declared exhaustive schedule.
 
-    from decode_dse.profiles import DECODE_FORMATS, VECTOR_FP_FORMATS
+    The declared search space may be a canonical-order subspace with
+    disclosed exclusions; within that space the schedule stays exhaustive
+    and unpruned, and every expected count must match the space exactly.
+    """
 
     search = config.get("search", {})
+    space = declared_search_space(search)
     expected: tuple[tuple[str, Any, Any], ...] = (
-        ("search.weight_w", tuple(search.get("weight_w", ())), DECODE_FORMATS),
-        ("search.act_w", tuple(search.get("act_w", ())), DECODE_FORMATS),
-        ("search.kv", tuple(search.get("kv", ())), DECODE_FORMATS),
-        ("search.vector_fp", tuple(search.get("vector_fp", ())), VECTOR_FP_FORMATS),
         ("search.block", tuple(search.get("block", ())), (8,)),
         ("search.mixed_weight", search.get("mixed_weight"), False),
         (
@@ -673,20 +681,20 @@ def validate_sweep_config(config: Mapping[str, Any]) -> None:
         (
             "search.expected_quantized_profiles",
             search.get("expected_quantized_profiles"),
-            EXPECTED_QUANTIZED_PROFILES,
+            space.expected_quantized_profiles,
         ),
         (
             "search.expected_vector_bf16_controls",
             search.get("expected_vector_bf16_controls"),
-            EXPECTED_VECTOR_CONTROLS,
+            space.expected_vector_bf16_controls,
         ),
         (
             "search.expected_total_profiles",
             search.get("expected_total_profiles"),
-            EXPECTED_TOTAL_PROFILES,
+            space.expected_total_profiles,
         ),
         ("software_search", config.get("software_search"), "deterministic_exhaustive"),
-        ("search_budget", config.get("search_budget"), EXPECTED_TOTAL_PROFILES),
+        ("search_budget", config.get("search_budget"), space.expected_total_profiles),
         ("sampler", config.get("sampler"), "deterministic_grid"),
         ("use_rotation", config.get("use_rotation"), False),
     )
@@ -701,7 +709,7 @@ def validate_sweep_config(config: Mapping[str, Any]) -> None:
             int(token.removeprefix("FP_E").split("M")[0]),
             int(token.split("M")[1]),
         )
-        for token in VECTOR_FP_FORMATS
+        for token in space.vector_formats
     )
     if fp_pairs != required_pairs:
         mismatches.append(
@@ -780,6 +788,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         dict(config["model_architecture"]),
         build_quantizer_provenance(repository, config),
         str(config["tokenizer_revision"]),
+        search_space=declared_search_space(config.get("search", {})),
     )
     output = write_manifest(args.output, manifest)
     print(

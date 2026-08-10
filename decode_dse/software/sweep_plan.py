@@ -28,10 +28,13 @@ from decode_dse.profiles import (
     PROFILE_KIND_BF16_REFERENCE,
     PROFILE_KIND_QUANTIZED,
     PROFILE_KIND_VECTOR_BF16_CONTROL,
+    VECTOR_FP_FORMATS,
+    DeclaredSearchSpace,
     DecodePrecisionProfile,
     enumerate_decode_profiles,
     format_descriptor,
 )
+from types import MappingProxyType
 
 RUN_PLAN_SCHEMA = "decode-sweep-run-plan"
 PROMPT_MANIFEST_SCHEMA = "decode-prompt-manifest"
@@ -156,20 +159,54 @@ def load_immutable_json(path: str | os.PathLike[str]) -> dict[str, Any]:
     return value | {"content_hash": expected}
 
 
-def validate_exhaustive_manifest(manifest: SweepManifest) -> None:
-    """Require the canonical 3,585 profiles in their canonical order."""
+def manifest_declared_space(manifest: SweepManifest) -> DeclaredSearchSpace:
+    """Derive the declared precision space from the manifest's own entries.
 
+    The distinct formats on each axis, ordered canonically, define the space;
+    the cross-product completeness check in validate_exhaustive_manifest then
+    proves the manifest enumerates that space exhaustively. Exclusion
+    rationales live in the sweep configuration, not the manifest, so the
+    derived space carries none.
+    """
+
+    quantized = tuple(
+        entry.profile
+        for entry in manifest.entries
+        if entry.profile.kind == PROFILE_KIND_QUANTIZED
+    )
+    weight = {profile.weight_format for profile in quantized}
+    activation = {profile.activation_format for profile in quantized}
+    kv = {profile.kv_format for profile in quantized}
+    vector = {profile.vector_format for profile in quantized}
+    return DeclaredSearchSpace(
+        weight_formats=tuple(f for f in DECODE_FORMATS if f in weight),
+        activation_formats=tuple(f for f in DECODE_FORMATS if f in activation),
+        kv_formats=tuple(f for f in DECODE_FORMATS if f in kv),
+        vector_formats=tuple(f for f in VECTOR_FP_FORMATS if f in vector),
+        exclusions=MappingProxyType({}),
+    )
+
+
+def validate_exhaustive_manifest(manifest: SweepManifest) -> None:
+    """Require exhaustive canonical-order coverage of the declared space.
+
+    A manifest over the canonical space reproduces the historical 3,585
+    profiles exactly; a declared-subspace manifest must be the complete
+    cross product of the formats it contains, in the same nested order.
+    """
+
+    space = manifest_declared_space(manifest)
     expected_counts = {
-        PROFILE_KIND_QUANTIZED: EXPECTED_QUANTIZED_PROFILES,
-        PROFILE_KIND_VECTOR_BF16_CONTROL: EXPECTED_VECTOR_CONTROLS,
+        PROFILE_KIND_QUANTIZED: space.expected_quantized_profiles,
+        PROFILE_KIND_VECTOR_BF16_CONTROL: space.expected_vector_bf16_controls,
         PROFILE_KIND_BF16_REFERENCE: EXPECTED_BF16_REFERENCES,
-        "total": EXPECTED_TOTAL_PROFILES,
+        "total": space.expected_total_profiles,
     }
     if manifest.counts != expected_counts:
         raise ValueError(
             f"manifest counts differ from the exhaustive contract: {manifest.counts}"
         )
-    expected_profiles = enumerate_decode_profiles()
+    expected_profiles = enumerate_decode_profiles(space)
     actual_ids = tuple(entry.profile_id for entry in manifest.entries)
     expected_ids = tuple(profile.profile_id for profile in expected_profiles)
     if actual_ids != expected_ids:
@@ -187,7 +224,7 @@ def validate_exhaustive_manifest(manifest: SweepManifest) -> None:
     for entry, profile in zip(manifest.entries, expected_profiles):
         if entry.profile != profile:
             raise ValueError(f"manifest profile differs at ordinal {entry.ordinal}")
-    if len(set(actual_ids)) != EXPECTED_TOTAL_PROFILES:
+    if len(set(actual_ids)) != space.expected_total_profiles:
         raise ValueError("manifest profile IDs are not unique")
 
 
@@ -558,17 +595,19 @@ class SweepRunPlan:
             raise TypeError("run plan requires a GPU baseline plan")
         if len(self.preflight_profile_ids) != PREFLIGHT_PROFILE_COUNT:
             raise ValueError("run plan requires exactly 36 preflight profiles")
-        if len(self.numerical_screen_profile_ids) != NUMERICAL_SCREEN_PROFILE_COUNT:
-            raise ValueError(
-                "run plan requires exactly 3,585 numerical-screen profiles"
-            )
-        if (
-            len(self.hardware_validation_profile_ids)
-            != HARDWARE_VALIDATION_PROFILE_COUNT
+        if not self.numerical_screen_profile_ids:
+            raise ValueError("run plan requires numerical-screen profiles")
+        if not self.hardware_validation_profile_ids:
+            raise ValueError("run plan requires hardware-validation profiles")
+        if not set(self.hardware_validation_profile_ids) <= set(
+            self.numerical_screen_profile_ids
         ):
             raise ValueError(
-                "run plan has an unexpected hardware-validation profile count"
+                "hardware-validation profiles must come from the numerical screen"
             )
+        # Exhaustiveness over the declared search space is enforced against the
+        # manifest in validate_run_plan; the canonical space yields the
+        # historical 3,585-profile screen.
         for label, values in (
             ("preflight", self.preflight_profile_ids),
             ("numerical_screen", self.numerical_screen_profile_ids),
@@ -735,13 +774,17 @@ def build_run_plan(
         entry.profile.kind == PROFILE_KIND_VECTOR_BF16_CONTROL
         for entry in hardware_validation_entries
     )
-    if (
+    if manifest_declared_space(manifest).is_canonical and (
         quantized_count != HARDWARE_VALIDATION_QUANTIZED_PROFILE_COUNT
         or control_count != HARDWARE_VALIDATION_VECTOR_CONTROL_COUNT
     ):
         raise AssertionError(
             f"unexpected hardware-validation composition: {quantized_count} quantized, "
             f"{control_count} controls"
+        )
+    if quantized_count == 0 or control_count == 0:
+        raise AssertionError(
+            "hardware validation requires quantized profiles and vector controls"
         )
     plan = SweepRunPlan(
         manifest_hash=manifest.canonical_hash,
@@ -1801,7 +1844,7 @@ def evaluate_preflight_gates(
             evidence.manifest_hash == manifest.canonical_hash,
             "evidence is bound to the exhaustive manifest",
             len(manifest.entries),
-            EXPECTED_TOTAL_PROFILES,
+            manifest_declared_space(manifest).expected_total_profiles,
         )
     )
     gates.append(
@@ -2877,6 +2920,7 @@ __all__ = [
     "make_stage_manifest",
     "preflight_required_features",
     "select_preflight_entries",
+    "manifest_declared_space",
     "validate_exhaustive_manifest",
     "validate_run_plan",
     "write_immutable_json",

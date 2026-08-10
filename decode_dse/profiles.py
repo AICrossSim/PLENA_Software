@@ -511,13 +511,144 @@ class DecodePrecisionProfile:
         return f"dqp-{self.canonical_hash}"
 
 
-def iter_quantized_profiles() -> Iterable[DecodePrecisionProfile]:
-    """Yield all 3,072 quantized profiles in canonical nested-loop order."""
+@dataclass(frozen=True)
+class DeclaredSearchSpace:
+    """The pre-declared precision subspace a sweep enumerates exhaustively.
 
-    for weight_format in DECODE_FORMATS:
-        for activation_format in DECODE_FORMATS:
-            for kv_format in DECODE_FORMATS:
-                for vector_format in VECTOR_FP_FORMATS:
+    Every axis is a canonical-order subsequence of the module's format
+    constants, so the enumeration order of a subspace is exactly the
+    canonical order with excluded formats absent. Any format missing from
+    an axis must carry a disclosed rationale; the sweep remains an
+    unpruned, deterministic enumeration over the space declared here.
+    """
+
+    weight_formats: tuple[str, ...]
+    activation_formats: tuple[str, ...]
+    kv_formats: tuple[str, ...]
+    vector_formats: tuple[str, ...]
+    exclusions: Mapping[str, Mapping[str, str]]
+
+    @property
+    def expected_quantized_profiles(self) -> int:
+        return (
+            len(self.weight_formats)
+            * len(self.activation_formats)
+            * len(self.kv_formats)
+            * len(self.vector_formats)
+        )
+
+    @property
+    def expected_vector_bf16_controls(self) -> int:
+        return (
+            len(self.weight_formats)
+            * len(self.activation_formats)
+            * len(self.kv_formats)
+        )
+
+    @property
+    def expected_total_profiles(self) -> int:
+        return self.expected_quantized_profiles + self.expected_vector_bf16_controls + 1
+
+    @property
+    def is_canonical(self) -> bool:
+        return (
+            self.weight_formats == DECODE_FORMATS
+            and self.activation_formats == DECODE_FORMATS
+            and self.kv_formats == DECODE_FORMATS
+            and self.vector_formats == VECTOR_FP_FORMATS
+        )
+
+
+CANONICAL_SEARCH_SPACE = DeclaredSearchSpace(
+    weight_formats=DECODE_FORMATS,
+    activation_formats=DECODE_FORMATS,
+    kv_formats=DECODE_FORMATS,
+    vector_formats=VECTOR_FP_FORMATS,
+    exclusions=MappingProxyType({}),
+)
+
+_SEARCH_AXES = (
+    ("weight_w", "weight_formats", DECODE_FORMATS),
+    ("act_w", "activation_formats", DECODE_FORMATS),
+    ("kv", "kv_formats", DECODE_FORMATS),
+    ("vector_fp", "vector_formats", VECTOR_FP_FORMATS),
+)
+
+
+def declared_search_space(search: Mapping[str, Any]) -> DeclaredSearchSpace:
+    """Validate and freeze the search block's declared precision subspace.
+
+    Each axis must be a non-empty, canonical-order subsequence of the
+    canonical format tuple. Every excluded format needs a non-empty
+    rationale under ``search.declared_exclusions[<axis>][<format>]``, and
+    rationales for formats that are not actually excluded are rejected, so
+    the config cannot drift from the space it claims to enumerate.
+    """
+
+    declared_exclusions = search.get("declared_exclusions", {})
+    if not isinstance(declared_exclusions, Mapping):
+        raise ValueError("search.declared_exclusions must be a mapping")
+    axes: dict[str, tuple[str, ...]] = {}
+    exclusions: dict[str, dict[str, str]] = {}
+    for key, field_name, canonical in _SEARCH_AXES:
+        declared = tuple(search.get(key, ()))
+        if not declared:
+            raise ValueError(f"search.{key} must declare at least one format")
+        unknown = [value for value in declared if value not in canonical]
+        if unknown:
+            raise ValueError(f"search.{key} has unknown formats: {unknown}")
+        canonical_subsequence = tuple(
+            value for value in canonical if value in set(declared)
+        )
+        if declared != canonical_subsequence:
+            raise ValueError(
+                f"search.{key} must keep canonical format order: "
+                f"expected {canonical_subsequence!r}, got {declared!r}"
+            )
+        excluded = tuple(value for value in canonical if value not in set(declared))
+        rationales = declared_exclusions.get(key, {})
+        if not isinstance(rationales, Mapping):
+            raise ValueError(f"search.declared_exclusions.{key} must be a mapping")
+        missing = [value for value in excluded if not str(rationales.get(value, "")).strip()]
+        if missing:
+            raise ValueError(
+                f"search.{key} excludes {missing} without a disclosed rationale "
+                "in search.declared_exclusions"
+            )
+        stray = [value for value in rationales if value not in excluded]
+        if stray:
+            raise ValueError(
+                f"search.declared_exclusions.{key} names formats that are not "
+                f"excluded: {stray}"
+            )
+        axes[field_name] = declared
+        if excluded:
+            exclusions[key] = {value: str(rationales[value]) for value in excluded}
+    unknown_axes = [key for key in declared_exclusions if key not in dict(
+        (axis, None) for axis, _, _ in _SEARCH_AXES
+    )]
+    if unknown_axes:
+        raise ValueError(f"search.declared_exclusions has unknown axes: {unknown_axes}")
+    return DeclaredSearchSpace(
+        weight_formats=axes["weight_formats"],
+        activation_formats=axes["activation_formats"],
+        kv_formats=axes["kv_formats"],
+        vector_formats=axes["vector_formats"],
+        exclusions=MappingProxyType(
+            {axis: MappingProxyType(dict(values)) for axis, values in exclusions.items()}
+        ),
+    )
+
+
+def iter_quantized_profiles(
+    space: DeclaredSearchSpace = CANONICAL_SEARCH_SPACE,
+) -> Iterable[DecodePrecisionProfile]:
+    """Yield the declared space's quantized profiles in canonical nested-loop order."""
+
+    for weight_format in space.weight_formats:
+        for activation_format in space.activation_formats:
+            for kv_format in space.kv_formats:
+                for vector_format in space.vector_formats:
                     yield DecodePrecisionProfile.quantized(
                         weight_format,
                         activation_format,
@@ -526,12 +657,14 @@ def iter_quantized_profiles() -> Iterable[DecodePrecisionProfile]:
                     )
 
 
-def iter_vector_bf16_controls() -> Iterable[DecodePrecisionProfile]:
-    """Yield one BF16-vector control for every W/A/KV triple."""
+def iter_vector_bf16_controls(
+    space: DeclaredSearchSpace = CANONICAL_SEARCH_SPACE,
+) -> Iterable[DecodePrecisionProfile]:
+    """Yield one BF16-vector control for every declared W/A/KV triple."""
 
-    for weight_format in DECODE_FORMATS:
-        for activation_format in DECODE_FORMATS:
-            for kv_format in DECODE_FORMATS:
+    for weight_format in space.weight_formats:
+        for activation_format in space.activation_formats:
+            for kv_format in space.kv_formats:
                 yield DecodePrecisionProfile.vector_bf16_control(
                     weight_format,
                     activation_format,
@@ -539,12 +672,14 @@ def iter_vector_bf16_controls() -> Iterable[DecodePrecisionProfile]:
                 )
 
 
-def enumerate_decode_profiles() -> tuple[DecodePrecisionProfile, ...]:
-    """Return the deterministic 3,585-point numerical sweep."""
+def enumerate_decode_profiles(
+    space: DeclaredSearchSpace = CANONICAL_SEARCH_SPACE,
+) -> tuple[DecodePrecisionProfile, ...]:
+    """Return the deterministic numerical sweep over the declared space."""
 
     return (
-        *iter_quantized_profiles(),
-        *iter_vector_bf16_controls(),
+        *iter_quantized_profiles(space),
+        *iter_vector_bf16_controls(space),
         DecodePrecisionProfile.bf16_reference(),
     )
 
@@ -578,6 +713,9 @@ __all__ = [
     "PROFILE_SCHEMA",
     "VECTOR_FORMATS",
     "VECTOR_FP_FORMATS",
+    "CANONICAL_SEARCH_SPACE",
+    "DeclaredSearchSpace",
+    "declared_search_space",
     "DecodePrecisionProfile",
     "FormatDescriptor",
     "MatrixSemanticsContract",

@@ -300,25 +300,83 @@ def test_aggregate_launch_preflight_and_exact_memory_arithmetic(
     assert summary["launch_preflight"]["passed"] is True
     assert summary["quantizer_provenance_hash"]
     qwen_trace_plan = summary["compiler_trace_preflight"]
-    assert qwen_trace_plan["structurally_legal_hardware_candidates"] == 471_072
-    assert qwen_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 26_496
-    assert qwen_trace_plan["compiler_base_hardware_signatures"] == 16_216
-    assert qwen_trace_plan["exact_batch_record_signatures"] == 912
-    assert qwen_trace_plan["unique_compiler_lowering_instantiations"] == 5_472
-    assert qwen_trace_plan["unique_lazy_trace_instantiations"] == 912
-    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 270_395_328
+    # The declared grid is pruned to compiler-legal Qwen3-32B geometry, so
+    # every structurally legal candidate must survive the geometry census.
+    assert qwen_trace_plan["structurally_legal_hardware_candidates"] == 55_584
+    assert qwen_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 55_584
+    assert qwen_trace_plan["compiler_geometry_rejected_hardware_candidates"] == 0
+    assert qwen_trace_plan["compiler_base_hardware_signatures"] == 648
+    assert qwen_trace_plan["exact_batch_record_signatures"] == 648
+    assert qwen_trace_plan["unique_compiler_lowering_instantiations"] == 3_888
+    assert qwen_trace_plan["unique_lazy_trace_instantiations"] == 648
+    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 18_676_224
     assert qwen_trace_plan["raw_context_point_resolutions"] == (
-        830_654_447_616
+        57_373_360_128
     )
-    assert qwen_trace_plan["physical_signature_pairs"] == 158_976
-    assert qwen_trace_plan["projected_context_timing_resolutions"] == 158_976
-    assert qwen_trace_plan["physical_context_step_outcomes"] == 488_374_272
-    assert qwen_trace_plan["projected_full_evaluator_calls"] == 158_976
-    assert qwen_trace_plan["projected_joined_identities"] == 158_976
-    assert qwen_trace_plan["projected_trace_bytes"] == 9_622_781_952
-    assert qwen_trace_plan["projected_digest_updates"] == 317_952
+    assert qwen_trace_plan["physical_signature_pairs"] == 333_504
+    assert qwen_trace_plan["projected_context_timing_resolutions"] == 333_504
+    assert qwen_trace_plan["physical_context_step_outcomes"] == 1_024_524_288
+    assert qwen_trace_plan["projected_full_evaluator_calls"] == 333_504
+    assert qwen_trace_plan["projected_joined_identities"] == 333_504
+    assert qwen_trace_plan["projected_trace_bytes"] == 6_837_239_808
+    assert qwen_trace_plan["projected_digest_updates"] == 667_008
     assert "projected_wall_clock_seconds" not in qwen_trace_plan
     assert qwen_trace_plan["compiler_trace_preflight_feasible"] is True
+
+
+def test_declared_subspace_is_exhaustive_sealed_and_disclosed() -> None:
+    from decode_dse.manifest import build_exhaustive_manifest, validate_sweep_config
+    from decode_dse.profiles import declared_search_space
+    from decode_dse.software.sweep_plan import (
+        build_run_plan,
+        manifest_declared_space,
+        validate_exhaustive_manifest,
+    )
+
+    config = _config()
+    validate_sweep_config(config)
+    space = declared_search_space(config["search"])
+    assert space.expected_total_profiles == config["search_budget"]
+
+    manifest = build_exhaustive_manifest(
+        str(config["model_name"]),
+        str(config["model_revision"]),
+        dict(config["model_architecture"]),
+        build_quantizer_provenance(REPOSITORY, config),
+        str(config["tokenizer_revision"]),
+        search_space=space,
+    )
+    validate_exhaustive_manifest(manifest)
+    derived = manifest_declared_space(manifest)
+    assert derived.weight_formats == space.weight_formats
+    assert derived.activation_formats == space.activation_formats
+    assert derived.kv_formats == space.kv_formats
+    assert derived.vector_formats == space.vector_formats
+
+    plan = build_run_plan(manifest, device_labels=("b200",))
+    assert len(plan.numerical_screen_profile_ids) == space.expected_total_profiles
+
+    # An excluded format without a disclosed rationale must fail closed.
+    undisclosed = json.loads(json.dumps(config))
+    undisclosed["search"]["declared_exclusions"] = {
+        "weight_w": {"MXINT2": "measured prior evidence"}
+    }
+    with pytest.raises(ValueError, match="without a disclosed rationale"):
+        validate_sweep_config(undisclosed)
+
+    # Reordering a declared axis must fail closed.
+    reordered = json.loads(json.dumps(config))
+    reordered["search"]["weight_w"] = list(
+        reversed(reordered["search"]["weight_w"])
+    )
+    with pytest.raises(ValueError, match="canonical format order"):
+        validate_sweep_config(reordered)
+
+    # Count drift between the declared space and the sealed totals must fail.
+    drifted = json.loads(json.dumps(config))
+    drifted["search"]["expected_quantized_profiles"] += 1
+    with pytest.raises(ValueError, match="expected_quantized_profiles"):
+        validate_sweep_config(drifted)
 
 
 def test_quantizer_sources_change_manifest_and_run_plan_identity(

@@ -33,7 +33,7 @@ from decode_dse.manifest import (
     validate_sweep_config,
     write_manifest,
 )
-from decode_dse.profiles import DECODE_FORMATS
+from decode_dse.profiles import DECODE_FORMATS, declared_search_space
 from decode_dse.software.cache_artifacts import (
     ArtifactProvenance,
     load_prefill_artifact,
@@ -720,6 +720,7 @@ def _build_manifest(
         dict(config["model_architecture"]),
         build_quantizer_provenance(repository, config),
         str(config["tokenizer_revision"]),
+        search_space=declared_search_space(config.get("search", {})),
     )
 
 

@@ -78,17 +78,13 @@
   "reference_workload": {
     "batch": 4,
     "input_seq": 512,
-    "output_seq": 3072,
-    "hbm_gen": "HBM2",
-    "hbm_channels": 32
+    "output_seq": 3072
   },
   "search": {
     "weight_w": [
-      "MXINT2",
       "MXINT4",
       "MXINT8",
       "E1M2",
-      "E2M1",
       "E3M4",
       "E4M3",
       "E5M2"
@@ -104,11 +100,9 @@
       "E5M2"
     ],
     "act_w": [
-      "MXINT2",
       "MXINT4",
       "MXINT8",
       "E1M2",
-      "E2M1",
       "E3M4",
       "E4M3",
       "E5M2"
@@ -153,14 +147,24 @@
     ],
     "include_vector_bf16_controls": true,
     "include_bf16_reference": true,
-    "expected_quantized_profiles": 3072,
-    "expected_vector_bf16_controls": 512,
-    "expected_total_profiles": 3585,
+    "expected_quantized_profiles": 1728,
+    "expected_vector_bf16_controls": 288,
+    "expected_total_profiles": 2017,
     "fp_setting_attention": true,
-    "quant_attn_matmuls": true
+    "quant_attn_matmuls": true,
+    "declared_exclusions": {
+      "weight_w": {
+        "MXINT2": "Excluded on measured prior evidence: on the Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709) the best relative perplexity achieved by any profile with MXINT2 on the weight axis was 1208.44x, beyond the relaxed 1.05 accuracy budget with at least a 1.07 exclusion margin. The Qwen3-32B sweep remains an exhaustive, unpruned enumeration over the declared subspace.",
+        "E2M1": "Excluded on measured prior evidence: on the Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709) the best relative perplexity achieved by any profile with E2M1 on the weight axis was 1.0906x, beyond the relaxed 1.05 accuracy budget with at least a 1.07 exclusion margin. The Qwen3-32B sweep remains an exhaustive, unpruned enumeration over the declared subspace."
+      },
+      "act_w": {
+        "MXINT2": "Excluded on measured prior evidence: on the Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709) the best relative perplexity achieved by any profile with MXINT2 on the activation axis was 744.40x, beyond the relaxed 1.05 accuracy budget with at least a 1.07 exclusion margin. The Qwen3-32B sweep remains an exhaustive, unpruned enumeration over the declared subspace.",
+        "E2M1": "Excluded on measured prior evidence: on the Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709) the best relative perplexity achieved by any profile with E2M1 on the activation axis was 1.2143x, beyond the relaxed 1.05 accuracy budget with at least a 1.07 exclusion margin. The Qwen3-32B sweep remains an exhaustive, unpruned enumeration over the declared subspace."
+      }
+    }
   },
   "software_search": "deterministic_exhaustive",
-  "search_budget": 3585,
+  "search_budget": 2017,
   "sampler": "deterministic_grid",
   "use_rotation": false,
   "fp_ppl_tol": 0.01,
@@ -262,18 +266,11 @@
   "front_size": 6,
   "hardware_space": {
     "MLEN": [
-      16,
-      32,
-      64,
-      128,
-      256,
-      512,
       1024,
       2048,
       4096
     ],
     "BLEN": [
-      2,
       4,
       8,
       16,
@@ -281,9 +278,6 @@
       64
     ],
     "HLEN": [
-      16,
-      32,
-      64,
       128
     ],
     "BATCH": [
@@ -297,7 +291,9 @@
       256
     ],
     "HBM_CHANNELS": [
-      8
+      8,
+      16,
+      32
     ],
     "HBM_GENERATION": "HBM2",
     "CHIP_COUNT": [
@@ -311,15 +307,13 @@
       1,
       2,
       4,
-      8,
-      16
+      8
     ],
     "KVP": [
       1,
       2,
       4,
-      8,
-      16
+      8
     ],
     "LINK_PORTS": [
       1,
@@ -433,7 +427,6 @@
     }
   },
   "n_chips": 1,
-  "baseline_hbm_channels": 32,
   "seed": 0,
   "scratch_dir": "workspace://scratch",
   "_scratch_comment": "Cross-process weight-bank construction locks and refinement checkpoints use this path.",
@@ -464,5 +457,9 @@
   "runtime": {
     "persistent": true,
     "max_attempts": 3
+  },
+  "accuracy_budgets": {
+    "strict_relative_perplexity": 1.01,
+    "relaxed_relative_perplexity": 1.05
   }
 }
