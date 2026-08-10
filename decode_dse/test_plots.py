@@ -695,3 +695,83 @@ def test_hardware_pareto_draws_dual_accuracy_envelopes(tmp_path: Path) -> None:
     )
     assert sparse
     assert all(path.is_file() and path.stat().st_size > 0 for path in sparse)
+
+
+def test_energy_efficiency_figure_and_context_semantics(tmp_path: Path) -> None:
+    from decode_dse.plots import plot_energy_efficiency
+    from decode_dse.software.gpu_baseline import build_analytic_energy_context
+
+    point = HardwarePoint(
+        profile=DecodePrecisionProfile.quantized(
+            "MXINT4", "MXINT8", "MXINT4", "FP_E5M6"
+        ),
+        candidate_id="cand-energy",
+        delta_nll=0.01,
+        relative_perplexity_percent=1.0,
+        tpot_ms=1.0,
+        tps=1000.0,
+        energy_j=0.02,
+        area_mm2=300.0,
+        max_runtime_batch=64,
+        chip_count=4,
+        energy_tier="analytic_anchored",
+        publication_timing_tier="stage_calibrated_analytic",
+    )
+    baseline_report = {
+        "energy_scope": "synchronized_board_energy_for_measured_decode_only",
+        "results": [
+            {
+                "batch_size": 32,
+                "device_label": "b200",
+                "summary": {
+                    "tokens_per_second": 1631.0,
+                    "energy": {
+                        "available": True,
+                        "energy_per_token_j": 0.5,
+                    },
+                },
+            }
+        ],
+    }
+    context = build_analytic_energy_context(
+        plena_points=(
+            {
+                "profile_id": point.profile.profile_id,
+                "candidate_id": point.candidate_id,
+                "energy_per_token_j": point.energy_j,
+                "tokens_per_second": point.tps,
+                "energy_tier": point.energy_tier,
+                "publication_timing_tier": point.publication_timing_tier,
+            },
+        ),
+        baseline_report=baseline_report,
+    )
+    assert context["not_a_headline_claim"] is True
+    assert context["numerator_tier"] == "analytic_anchored"
+    assert context["denominator_tier"] == "measured"
+    assert context["ratio_semantics"] == "model_estimate_over_measured_gpu"
+    assert context["context_energy_ratio_gpu_over_plena"] == 25.0
+
+    # A measured PLENA numerator must be refused: that is headline territory.
+    with pytest.raises(ValueError, match="headline comparison"):
+        build_analytic_energy_context(
+            plena_points=(
+                {
+                    "energy_per_token_j": 0.02,
+                    "energy_tier": "measured",
+                },
+            ),
+            baseline_report=baseline_report,
+        )
+
+    rendered = plot_energy_efficiency(
+        (point,),
+        baseline_rows=tuple(context["gpu_measured"]),
+        model_name="Synthetic decode model",
+        output_dir=tmp_path,
+        formats=("svg",),
+    )
+    assert rendered
+    assert all(path.is_file() and path.stat().st_size > 0 for path in rendered)
+    table = _hardware_table((point,))
+    assert table[0]["average_system_power_w"] == pytest.approx(20.0)

@@ -2720,6 +2720,104 @@ def _vector_table(
     return tuple(rows)
 
 
+def plot_energy_efficiency(
+    points: Sequence[HardwarePoint],
+    *,
+    baseline_rows: Sequence[Mapping[str, Any]],
+    model_name: str,
+    output_dir: Path,
+    formats: Sequence[str],
+) -> tuple[Path, ...]:
+    """Tokens-per-joule versus throughput with the measured GPU overlay.
+
+    PLENA points carry their declared analytic energy tier; the GPU rows are
+    measured NVML board energy. The two evidence tiers share one figure but
+    never one claim, matching the energy-context record's semantics.
+    """
+
+    finite = [
+        point
+        for point in points
+        if point.energy_tier
+        and math.isfinite(point.energy_j)
+        and point.energy_j > 0
+        and math.isfinite(point.tps)
+        and point.tps > 0
+    ]
+    if not finite:
+        raise ValueError("energy efficiency figure has no declared-tier points")
+    fig, ax = plt.subplots(figsize=(6.4, 4.35), constrained_layout=True)
+    tiers = tuple(sorted({str(point.energy_tier) for point in finite}))
+    tier_colours = {
+        tier: (BLUE, GREEN, PURPLE, ORANGE)[index % 4]
+        for index, tier in enumerate(tiers)
+    }
+    for tier in tiers:
+        rows = [point for point in finite if str(point.energy_tier) == tier]
+        ax.scatter(
+            [point.tps for point in rows],
+            [point.tokens_per_j for point in rows],
+            color=tier_colours[tier],
+            marker="o",
+            s=30.0,
+            alpha=0.6,
+            edgecolors=INK,
+            linewidths=0.4,
+            label=f"PLENA ({tier})",
+            rasterized=True,
+        )
+    measured = [
+        row
+        for row in baseline_rows
+        if float(row.get("energy_per_token_j", 0.0)) > 0
+    ]
+    if measured:
+        ax.scatter(
+            [float(row["tokens_per_second"]) for row in measured],
+            [float(row["tokens_per_joule"]) for row in measured],
+            color=RED,
+            marker="*",
+            s=150.0,
+            edgecolors=INK,
+            linewidths=0.7,
+            label=(
+                f"{measured[0].get('device_label', 'GPU')} (measured)"
+            ),
+            zorder=5,
+        )
+        for row in measured:
+            ax.annotate(
+                f"b{int(row['batch_size'])}",
+                xy=(
+                    float(row["tokens_per_second"]),
+                    float(row["tokens_per_joule"]),
+                ),
+                xytext=(4, 4),
+                textcoords="offset points",
+                fontsize=6.6,
+                color=MUTED,
+            )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Whole-model throughput (tokens/s, log)")
+    ax.set_ylabel("Tokens per joule (log)")
+    ax.legend(loc="best", fontsize=7.4, frameon=False)
+    _set_title(
+        ax,
+        "Energy efficiency versus throughput",
+        (
+            f"{model_name} · PLENA energy is a declared analytic tier; "
+            "GPU rows are measured board energy · not a headline ratio"
+        ),
+    )
+    return _save(
+        fig,
+        stem="06_energy_efficiency",
+        output_dir=output_dir,
+        formats=formats,
+    )
+
+
 def _hardware_table(
     points: Sequence[HardwarePoint],
 ) -> tuple[dict[str, Any], ...]:
@@ -2737,6 +2835,7 @@ def _hardware_table(
             "whole_model_tps": point.tps,
             "energy_j_per_generated_token": point.energy_j,
             "tokens_per_joule": point.tokens_per_j,
+            "average_system_power_w": point.energy_j * point.tps,
             "edp_j_s": point.edp_j_s,
             "energy_tier": point.energy_tier or "",
             "aggregate_area_mm2": point.area_mm2,
@@ -2993,6 +3092,7 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
 
     profile_by_id = {point.profile_id: point.profile for point in points}
     nll_by_id = {point.profile_id: point.mean_nll for point in points}
+    hardware_points: tuple[HardwarePoint, ...] = ()
     if args.hardware_artifact:
         raw_hardware_paths = (
             (args.hardware_artifact,)
@@ -3141,20 +3241,79 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
             None,
         ),
     }
-    supplied_publication_inputs = {
-        name: value
-        for name, value in publication_inputs.items()
-        if value is not None
+    baseline_context_names = ("config", "gpu_baseline_report", "gpu_baseline_receipt")
+    selection_names = tuple(
+        name for name in publication_inputs if name not in baseline_context_names
+    )
+    supplied_baseline_inputs = {
+        name: publication_inputs[name]
+        for name in baseline_context_names
+        if publication_inputs[name] is not None
     }
-    if supplied_publication_inputs and len(supplied_publication_inputs) != len(
-        publication_inputs
+    supplied_selection_inputs = {
+        name: publication_inputs[name]
+        for name in selection_names
+        if publication_inputs[name] is not None
+    }
+    if supplied_baseline_inputs and len(supplied_baseline_inputs) != len(
+        baseline_context_names
     ):
-        missing = sorted(set(publication_inputs) - set(supplied_publication_inputs))
+        missing = sorted(set(baseline_context_names) - set(supplied_baseline_inputs))
+        raise ValueError(
+            "the analytic energy context requires the config and both GPU "
+            "baseline artifacts; missing " + ", ".join(missing)
+        )
+    if supplied_selection_inputs and (
+        len(supplied_selection_inputs) != len(selection_names)
+        or len(supplied_baseline_inputs) != len(baseline_context_names)
+    ):
+        missing = sorted(
+            (set(selection_names) - set(supplied_selection_inputs))
+            | (set(baseline_context_names) - set(supplied_baseline_inputs))
+        )
         raise ValueError(
             "selected-deployment rendering requires all publication inputs; "
             "missing " + ", ".join(missing)
         )
-    if supplied_publication_inputs:
+    if supplied_baseline_inputs and hardware_points:
+        from decode_dse.software.gpu_baseline import build_analytic_energy_context
+
+        baseline_report_path = Path(
+            str(publication_inputs["gpu_baseline_report"])
+        ).resolve()
+        baseline_report_value = load_immutable_json(baseline_report_path)
+        energy_context = build_analytic_energy_context(
+            plena_points=tuple(
+                {
+                    "profile_id": point.profile.profile_id,
+                    "candidate_id": point.candidate_id,
+                    "energy_per_token_j": point.energy_j,
+                    "tokens_per_second": point.tps,
+                    "energy_tier": point.energy_tier,
+                    "publication_timing_tier": point.publication_timing_tier,
+                }
+                for point in hardware_points
+                if point.energy_tier
+            ),
+            baseline_report=baseline_report_value,
+        )
+        energy_context_path = output_dir / "energy_context.json"
+        energy_context_path.write_text(
+            json.dumps(energy_context, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        data_tables.append(energy_context_path)
+        source_paths.append(baseline_report_path)
+        outputs.extend(
+            plot_energy_efficiency(
+                hardware_points,
+                baseline_rows=tuple(energy_context["gpu_measured"]),
+                model_name=manifest.model_name,
+                output_dir=output_dir,
+                formats=formats,
+            )
+        )
+    if supplied_selection_inputs:
         publication_paths = {
             name: Path(str(value)).resolve()
             for name, value in publication_inputs.items()

@@ -4055,15 +4055,22 @@ def build_pipeline(
     ):
         if paths[name] is not None:
             plot_arguments.extend((flag, str(paths[name])))
+    # The measured GPU baseline always exists, so the figure stage always
+    # receives it: the analytic energy context and dual-accuracy envelopes
+    # do not depend on the publication benchmark stages being enabled.
+    plot_arguments.extend(
+        (
+            "--config",
+            str(config),
+            "--gpu-baseline-report",
+            str(baseline_report),
+            "--gpu-baseline-receipt",
+            str(baseline_receipt),
+        )
+    )
     if resources["publication_enabled"]:
         plot_arguments.extend(
             (
-                "--config",
-                str(config),
-                "--gpu-baseline-report",
-                str(baseline_report),
-                "--gpu-baseline-receipt",
-                str(baseline_receipt),
                 "--publication-contract",
                 str(required_path("publication_contract")),
                 "--publication-report",

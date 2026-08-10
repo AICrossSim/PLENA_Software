@@ -3042,6 +3042,75 @@ def gpu_baseline_energy_evidence(
     )
 
 
+ANALYTIC_ENERGY_CONTEXT_SCHEMA = "decode-energy-context/v1"
+
+
+def build_analytic_energy_context(
+    *,
+    plena_points: Sequence[Mapping[str, Any]],
+    baseline_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Contextualise analytic PLENA energy against measured GPU board energy.
+
+    This is deliberately not a headline claim: the numerator is an analytic
+    model estimate and the denominator is a measured NVML board energy, so
+    the record carries both tiers, an explicit ratio semantics label, and
+    not_a_headline_claim. Headline ratios remain the exclusive province of
+    build_headline_energy_comparison, which refuses analytic numerators.
+    """
+
+    rows = tuple(plena_points)
+    if not rows:
+        raise ValueError("the energy context requires at least one PLENA point")
+    for row in rows:
+        tier = row.get("energy_tier")
+        if not tier:
+            raise ValueError("every PLENA energy-context point needs an energy tier")
+        if tier == MEASURED_EVIDENCE_TIER:
+            raise ValueError(
+                "measured PLENA rows belong in the headline comparison, "
+                "not the analytic context"
+            )
+    gpu_rows = []
+    for result in baseline_report.get("results", ()):
+        summary = result.get("summary") or {}
+        energy = summary.get("energy") or {}
+        if not energy.get("available"):
+            continue
+        gpu_rows.append(
+            {
+                "batch_size": int(result["batch_size"]),
+                "device_label": str(result.get("device_label", "")),
+                "energy_per_token_j": float(energy["energy_per_token_j"]),
+                "tokens_per_second": float(summary["tokens_per_second"]),
+                "tokens_per_joule": 1.0 / float(energy["energy_per_token_j"]),
+                "evidence_tier": MEASURED_EVIDENCE_TIER,
+                "energy_scope": str(baseline_report.get("energy_scope", "")),
+            }
+        )
+    if not gpu_rows:
+        raise ValueError(
+            "the energy context requires at least one measured GPU energy row"
+        )
+    best_gpu = min(gpu_rows, key=lambda row: row["energy_per_token_j"])
+    best_plena = min(rows, key=lambda row: float(row["energy_per_token_j"]))
+    return {
+        "schema_version": ANALYTIC_ENERGY_CONTEXT_SCHEMA,
+        "numerator_tier": str(best_plena["energy_tier"]),
+        "denominator_tier": MEASURED_EVIDENCE_TIER,
+        "ratio_semantics": "model_estimate_over_measured_gpu",
+        "not_a_headline_claim": True,
+        "plena_analytic": [dict(row) for row in rows],
+        "plena_best": dict(best_plena),
+        "gpu_measured": gpu_rows,
+        "gpu_best": dict(best_gpu),
+        "context_energy_ratio_gpu_over_plena": (
+            float(best_gpu["energy_per_token_j"])
+            / float(best_plena["energy_per_token_j"])
+        ),
+    }
+
+
 def build_headline_energy_comparison(
     *,
     plena_measurement: EnergyEvidenceRow,
