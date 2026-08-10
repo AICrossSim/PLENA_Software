@@ -1356,8 +1356,21 @@ def prepare_refinement_schedule(
     validity_path: str | Path | None = None,
     stack_validity_path: str | Path | None = None,
     validity_output_path: str | Path | None = None,
+    strict_relative_perplexity: float | None = None,
+    relaxed_relative_perplexity: float | None = None,
 ) -> None:
-    """Build four measured refinement sources from complete upstream results."""
+    """Build four measured refinement sources from complete upstream results.
+
+    When both accuracy budgets are supplied, the promotion record also
+    carries the strict and relaxed accuracy frontiers over the same priced
+    points; refinement source selection itself is unchanged and keeps its
+    own deployment gate.
+    """
+
+    if (strict_relative_perplexity is None) != (relaxed_relative_perplexity is None):
+        raise ValueError(
+            "strict and relaxed accuracy budgets must be supplied together"
+        )
 
     manifest = load_manifest(manifest_path)
     plan_value = load_immutable_json(run_plan_path)
@@ -1567,6 +1580,17 @@ def prepare_refinement_schedule(
         reference_mean_nll=reference_mean_nll,
         epsilon=epsilon,
     )
+    accuracy_frontiers = None
+    if strict_relative_perplexity is not None:
+        from decode_dse.hardware.selection import dual_accuracy_frontiers
+
+        accuracy_frontiers = dual_accuracy_frontiers(
+            points,
+            reference_mean_nll=reference_mean_nll,
+            strict_relative_perplexity=float(strict_relative_perplexity),
+            relaxed_relative_perplexity=float(relaxed_relative_perplexity),
+            epsilon=epsilon,
+        )
     promotion = source_selection.promotion
     promoted_evidence = {
         point.profile_id: evidence[point.profile_id] for point in promotion.points
@@ -1622,6 +1646,7 @@ def prepare_refinement_schedule(
             ],
             "reference_mean_nll": reference_mean_nll,
             "source_selection": source_selection.to_dict(),
+            "dual_accuracy_frontiers": accuracy_frontiers,
             "schedule_hash": schedule.canonical_hash,
             "validity_hash": (
                 validity_manifest.canonical_hash
@@ -1656,6 +1681,8 @@ def build_schedule_parser() -> argparse.ArgumentParser:
     parser.add_argument("--promotion", required=True)
     for name in ("mean-nll", "tpot-ms", "tps", "energy-per-token-j", "area-mm2"):
         parser.add_argument(f"--epsilon-{name}", type=float, default=0.0)
+    parser.add_argument("--strict-relative-perplexity", type=float)
+    parser.add_argument("--relaxed-relative-perplexity", type=float)
     return parser
 
 
@@ -1672,6 +1699,8 @@ def build_schedule_main(argv: Iterable[str] | None = None) -> int:
         validity_path=args.validity,
         stack_validity_path=args.stack_validity,
         validity_output_path=args.validity_output,
+        strict_relative_perplexity=args.strict_relative_perplexity,
+        relaxed_relative_perplexity=args.relaxed_relative_perplexity,
         epsilon=EpsilonPolicy(
             mean_nll=args.epsilon_mean_nll,
             tpot_ms=args.epsilon_tpot_ms,

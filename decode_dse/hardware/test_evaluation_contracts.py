@@ -2469,3 +2469,61 @@ def test_parallel_block_pricing_reproduces_the_serial_artifact(
     truncated = build_study()
     with pytest.raises(RuntimeError, match="fewer blocks"):
         list(truncated.iter_factor_evaluations_from_blocks(iter(())))
+
+
+def test_dual_accuracy_frontiers_label_instead_of_filtering() -> None:
+    import math as _math
+
+    from decode_dse.hardware.selection import ParetoPoint, dual_accuracy_frontiers
+    from decode_dse.profiles import DecodePrecisionProfile
+
+    reference = 2.5
+
+    def _point(weight_format: str, mean_nll: float, tpot: float, energy: float):
+        return ParetoPoint(
+            profile=DecodePrecisionProfile.quantized(
+                weight_format, "MXINT8", "MXINT8", "FP_E5M6"
+            ),
+            mean_nll=mean_nll,
+            tpot_ms=tpot,
+            tps=1000.0 / tpot,
+            energy_per_token_j=energy,
+            area_mm2=100.0,
+            candidate_id=f"cand-{weight_format}",
+            power_calibration_id="synthetic-power",
+            cost_scope="whole_model",
+            system_calibration_id="synthetic-system",
+            head_service_calibration_id="synthetic-head",
+            whole_model_rankable=True,
+            energy_tier="analytic_anchored",
+            publication_timing_tier="stage_calibrated_analytic",
+        )
+
+    eight_bit = _point("MXINT8", reference + _math.log(1.005), 2.0, 0.10)
+    four_bit = _point("MXINT4", reference + _math.log(1.04), 1.0, 0.05)
+
+    report = dual_accuracy_frontiers(
+        (eight_bit, four_bit),
+        reference_mean_nll=reference,
+        strict_relative_perplexity=1.01,
+        relaxed_relative_perplexity=1.05,
+    )
+    budgets = report["budgets"]
+    assert budgets["strict"]["admitted_points"] == 1
+    assert budgets["relaxed"]["admitted_points"] == 2
+    strict_ids = [entry["candidate_id"] for entry in budgets["strict"]["front"]]
+    relaxed_ids = [entry["candidate_id"] for entry in budgets["relaxed"]["front"]]
+    assert strict_ids == ["cand-MXINT8"]
+    # Accuracy stays a dominance objective inside each budget, so the relaxed
+    # front keeps the accurate 8-bit point and adds the cost-dominant 4-bit
+    # point the strict budget refuses to admit.
+    assert relaxed_ids == ["cand-MXINT8", "cand-MXINT4"]
+    assert budgets["unconstrained"]["front"] == budgets["relaxed"]["front"]
+
+    with pytest.raises(ValueError, match="tighter than the strict budget"):
+        dual_accuracy_frontiers(
+            (eight_bit,),
+            reference_mean_nll=reference,
+            strict_relative_perplexity=1.05,
+            relaxed_relative_perplexity=1.01,
+        )

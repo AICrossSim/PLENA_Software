@@ -642,3 +642,56 @@ def test_numerical_figures_and_tables_render_full_manifest(tmp_path: Path) -> No
             table,
             fieldnames=tuple(table[0]),
         )
+
+
+def test_hardware_pareto_draws_dual_accuracy_envelopes(tmp_path: Path) -> None:
+    def _point(weight_format: str, ppl_percent: float, tpot: float, energy: float):
+        return HardwarePoint(
+            profile=DecodePrecisionProfile.quantized(
+                weight_format, "MXINT8", "MXINT8", "FP_E5M6"
+            ),
+            candidate_id=f"cand-{weight_format}",
+            delta_nll=ppl_percent / 100.0,
+            relative_perplexity_percent=ppl_percent,
+            tpot_ms=tpot,
+            tps=1000.0 / tpot,
+            energy_j=energy,
+            area_mm2=180.0,
+            max_runtime_batch=64,
+            chip_count=4,
+            energy_tier="analytic_anchored",
+            publication_timing_tier="stage_calibrated_analytic",
+        )
+
+    points = (
+        _point("MXINT8", 0.5, 2.0, 0.10),
+        _point("MXINT4", 4.0, 1.0, 0.05),
+    )
+    rendered = plot_hardware_pareto(
+        points,
+        model_name="Synthetic decode model",
+        output_dir=tmp_path,
+        formats=("svg",),
+        accuracy_budgets={
+            "strict_relative_perplexity": 1.01,
+            "relaxed_relative_perplexity": 1.05,
+        },
+    )
+    assert rendered
+    assert all(path.is_file() and path.stat().st_size > 0 for path in rendered)
+    # A strict budget that admits nothing must still render the relaxed
+    # envelope rather than raising.
+    sparse_dir = tmp_path / "sparse"
+    sparse_dir.mkdir()
+    sparse = plot_hardware_pareto(
+        points,
+        model_name="Synthetic decode model",
+        output_dir=sparse_dir,
+        formats=("svg",),
+        accuracy_budgets={
+            "strict_relative_perplexity": 1.001,
+            "relaxed_relative_perplexity": 1.05,
+        },
+    )
+    assert sparse
+    assert all(path.is_file() and path.stat().st_size > 0 for path in sparse)

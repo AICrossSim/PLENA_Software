@@ -320,6 +320,68 @@ def epsilon_pareto_fronts(
     return tuple(fronts)
 
 
+DUAL_ACCURACY_FRONTIERS_SCHEMA = "decode-dual-accuracy-frontiers"
+
+
+def dual_accuracy_frontiers(
+    points: Iterable[ParetoPoint],
+    *,
+    reference_mean_nll: float,
+    strict_relative_perplexity: float,
+    relaxed_relative_perplexity: float,
+    epsilon: EpsilonPolicy = EpsilonPolicy(),
+) -> dict[str, Any]:
+    """Return the strict, relaxed, and unconstrained accuracy frontiers.
+
+    Accuracy is a disclosed budget, not a filter: every point is priced, and
+    each frontier reports the first epsilon-Pareto front among the points
+    whose mean NLL sits inside its budget. The strict budget reproduces the
+    deployment gate; the relaxed budget shows what lower-precision formats
+    buy and what accuracy they cost. Empty frontiers are reported, never
+    raised, so a budget that admits nothing stays visible in the output.
+    """
+
+    if not math.isfinite(reference_mean_nll) or reference_mean_nll < 0:
+        raise ValueError("reference_mean_nll must be finite and non-negative")
+    if strict_relative_perplexity < 1.0:
+        raise ValueError("strict_relative_perplexity must be at least 1.0")
+    if relaxed_relative_perplexity < strict_relative_perplexity:
+        raise ValueError(
+            "relaxed_relative_perplexity must not be tighter than the strict budget"
+        )
+    ordered = tuple(sorted(points, key=_point_order))
+    budgets: dict[str, Any] = {}
+    for name, limit in (
+        ("strict", float(strict_relative_perplexity)),
+        ("relaxed", float(relaxed_relative_perplexity)),
+        ("unconstrained", None),
+    ):
+        if limit is None:
+            mean_nll_limit = None
+            admitted = ordered
+        else:
+            mean_nll_limit = reference_mean_nll + math.log(limit)
+            admitted = tuple(
+                point for point in ordered if point.mean_nll <= mean_nll_limit
+            )
+        fronts = epsilon_pareto_fronts(admitted, epsilon) if admitted else ()
+        front = fronts[0] if fronts else ()
+        budgets[name] = {
+            "relative_perplexity_limit": limit,
+            "mean_nll_limit": mean_nll_limit,
+            "admitted_points": len(admitted),
+            "front_size": len(front),
+            "front": [point.to_dict() for point in front],
+        }
+    return {
+        "schema_version": DUAL_ACCURACY_FRONTIERS_SCHEMA,
+        "reference_mean_nll": float(reference_mean_nll),
+        "epsilon": epsilon.to_dict(),
+        "total_points": len(ordered),
+        "budgets": budgets,
+    }
+
+
 def _point_order(point: ParetoPoint) -> tuple[Any, ...]:
     return (
         point.mean_nll,

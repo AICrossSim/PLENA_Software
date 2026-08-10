@@ -42,6 +42,7 @@ from decode_dse.profiles import (  # noqa: E402
     PROFILE_KIND_VECTOR_BF16_CONTROL,
     VECTOR_FORMATS,
     DecodePrecisionProfile,
+    format_descriptor,
 )
 from decode_dse.software.sweep_plan import load_immutable_json  # noqa: E402
 
@@ -1629,6 +1630,7 @@ def plot_hardware_pareto(
     model_name: str,
     output_dir: Path,
     formats: Sequence[str],
+    accuracy_budgets: Mapping[str, float] | None = None,
 ) -> tuple[Path, ...]:
     finite = [
         point
@@ -1716,19 +1718,77 @@ def plot_hardware_pareto(
             rasterized=True,
         )
 
-    front = []
-    if frontier_source:
-        front = sorted(
+    strict_limit = relaxed_limit = None
+    if accuracy_budgets is not None:
+        strict_limit = float(accuracy_budgets["strict_relative_perplexity"])
+        relaxed_limit = float(accuracy_budgets["relaxed_relative_perplexity"])
+
+    def _within_budget(candidates, limit):
+        threshold = (limit - 1.0) * 100.0
+        return [
+            point
+            for point in candidates
+            if point.relative_perplexity_percent <= threshold
+        ]
+
+    def _envelope(candidates):
+        return sorted(
             (
-                frontier_source[index]
-                for index in _pareto_indices(
-                    frontier_source,
-                    "tpot_ms",
-                    "energy_j",
-                )
+                candidates[index]
+                for index in _pareto_indices(candidates, "tpot_ms", "energy_j")
             ),
             key=lambda point: point.tpot_ms,
         )
+
+    front = []
+    if frontier_source and relaxed_limit is not None:
+        # Accuracy is a disclosed budget: the strict envelope reproduces the
+        # deployment gate and the relaxed envelope shows what lower-precision
+        # weight formats buy at a labelled accuracy cost.
+        strict_points = _within_budget(frontier_source, strict_limit)
+        relaxed_points = _within_budget(frontier_source, relaxed_limit)
+        relaxed_front = _envelope(relaxed_points) if relaxed_points else []
+        front = _envelope(strict_points) if strict_points else []
+        if relaxed_front:
+            latency_ax.plot(
+                [point.tpot_ms for point in relaxed_front],
+                [point.energy_j for point in relaxed_front],
+                color=PURPLE,
+                marker="o",
+                markerfacecolor=SURFACE,
+                markersize=3.6,
+                linewidth=1.2,
+                linestyle="--",
+                label=f"≤{relaxed_limit:g}× ppl front (relaxed)",
+                zorder=4,
+            )
+        if front:
+            latency_ax.plot(
+                [point.tpot_ms for point in front],
+                [point.energy_j for point in front],
+                color=INK,
+                marker="o",
+                markerfacecolor=SURFACE,
+                markersize=4.0,
+                linewidth=1.35,
+                label=f"≤{strict_limit:g}× ppl front (strict)",
+                zorder=5,
+            )
+        for envelope in (front, relaxed_front):
+            for point in envelope:
+                bits = format_descriptor(point.profile.weight_format).element_bits
+                latency_ax.annotate(
+                    f"W{bits}",
+                    xy=(point.tpot_ms, point.energy_j),
+                    xytext=(3, -9),
+                    textcoords="offset points",
+                    fontsize=6.4,
+                    color=MUTED,
+                    zorder=6,
+                )
+        frontier_source = strict_points or frontier_source
+    elif frontier_source:
+        front = _envelope(frontier_source)
         latency_ax.plot(
             [point.tpot_ms for point in front],
             [point.energy_j for point in front],
@@ -1741,6 +1801,7 @@ def plot_hardware_pareto(
             zorder=5,
         )
 
+    if frontier_source:
         callouts: dict[str, tuple[HardwarePoint, list[str]]] = {}
         for label, point in (
             ("Fastest", min(frontier_source, key=lambda item: item.tpot_ms)),
@@ -2964,12 +3025,19 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
         )
         if len(hardware_identities) != len(set(hardware_identities)):
             raise ValueError("hardware artifact partitions overlap")
+        accuracy_budgets = None
+        if args.config:
+            study_config = json.loads(
+                Path(args.config).read_text(encoding="utf-8")
+            )
+            accuracy_budgets = study_config.get("accuracy_budgets")
         outputs.extend(
             plot_hardware_pareto(
                 hardware_points,
                 model_name=manifest.model_name,
                 output_dir=output_dir,
                 formats=formats,
+                accuracy_budgets=accuracy_budgets,
             )
         )
         hardware_rows = _hardware_table(hardware_points)

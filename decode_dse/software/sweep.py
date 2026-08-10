@@ -3758,6 +3758,18 @@ def build_pipeline(
                 str(paths["refinement_validity"]),
             )
         )
+    accuracy_budgets = config.get("accuracy_budgets")
+    if accuracy_budgets is not None:
+        if not isinstance(accuracy_budgets, Mapping):
+            raise ValueError("accuracy_budgets must be a mapping when present")
+        schedule_arguments.extend(
+            (
+                "--strict-relative-perplexity",
+                str(float(accuracy_budgets["strict_relative_perplexity"])),
+                "--relaxed-relative-perplexity",
+                str(float(accuracy_budgets["relaxed_relative_perplexity"])),
+            )
+        )
     schedule_arguments.extend(
         (
             "--schedule",
