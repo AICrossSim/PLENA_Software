@@ -329,12 +329,10 @@
       "kv_resident_100"
     ],
     "KV_HEAD_REUSE": [
-      false,
-      true
+      false
     ],
     "DRAIN_OVERLAPPED": [
-      false,
-      true
+      false
     ],
     "FP_SRAM_DEPTH": 512,
     "RESOURCE_BUDGET": {

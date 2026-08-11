@@ -302,24 +302,27 @@ def test_aggregate_launch_preflight_and_exact_memory_arithmetic(
     qwen_trace_plan = summary["compiler_trace_preflight"]
     # The declared grid is pruned to compiler-legal Qwen3-32B geometry, so
     # every structurally legal candidate must survive the geometry census.
-    assert qwen_trace_plan["structurally_legal_hardware_candidates"] == 55_584
-    assert qwen_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 55_584
+    # Reuse and drain knobs are held at false until their timing evidence
+    # (packed-q1 contracts, drain-mode anchors) exists, so every declared
+    # candidate is rankable at the analytic tier.
+    assert qwen_trace_plan["structurally_legal_hardware_candidates"] == 22_320
+    assert qwen_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 22_320
     assert qwen_trace_plan["compiler_geometry_rejected_hardware_candidates"] == 0
-    assert qwen_trace_plan["compiler_base_hardware_signatures"] == 648
-    assert qwen_trace_plan["exact_batch_record_signatures"] == 648
-    assert qwen_trace_plan["unique_compiler_lowering_instantiations"] == 3_888
-    assert qwen_trace_plan["unique_lazy_trace_instantiations"] == 648
-    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 18_676_224
+    assert qwen_trace_plan["compiler_base_hardware_signatures"] == 520
+    assert qwen_trace_plan["exact_batch_record_signatures"] == 520
+    assert qwen_trace_plan["unique_compiler_lowering_instantiations"] == 3_120
+    assert qwen_trace_plan["unique_lazy_trace_instantiations"] == 520
+    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 7_499_520
     assert qwen_trace_plan["raw_context_point_resolutions"] == (
-        57_373_360_128
+        23_038_525_440
     )
-    assert qwen_trace_plan["physical_signature_pairs"] == 333_504
-    assert qwen_trace_plan["projected_context_timing_resolutions"] == 333_504
-    assert qwen_trace_plan["physical_context_step_outcomes"] == 1_024_524_288
-    assert qwen_trace_plan["projected_full_evaluator_calls"] == 333_504
-    assert qwen_trace_plan["projected_joined_identities"] == 333_504
-    assert qwen_trace_plan["projected_trace_bytes"] == 6_837_239_808
-    assert qwen_trace_plan["projected_digest_updates"] == 667_008
+    assert qwen_trace_plan["physical_signature_pairs"] == 133_920
+    assert qwen_trace_plan["projected_context_timing_resolutions"] == 133_920
+    assert qwen_trace_plan["physical_context_step_outcomes"] == 411_402_240
+    assert qwen_trace_plan["projected_full_evaluator_calls"] == 133_920
+    assert qwen_trace_plan["projected_joined_identities"] == 133_920
+    assert qwen_trace_plan["projected_trace_bytes"] == 5_486_673_920
+    assert qwen_trace_plan["projected_digest_updates"] == 267_840
     assert "projected_wall_clock_seconds" not in qwen_trace_plan
     assert qwen_trace_plan["compiler_trace_preflight_feasible"] is True
 
