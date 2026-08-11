@@ -1415,9 +1415,17 @@ class HardwareMetrics:
             "memory",
             "serialization",
             "compute",
+            "unavailable",
         }:
             raise ValueError(
                 "realized bottleneck must be memory, serialization, or compute"
+            )
+        if self.realized_bottleneck == "unavailable" and self.timing_calibrated:
+            # "unavailable" is the simulator's declared signal that timing
+            # evidence does not cover the operating point; it may only appear
+            # on rows that are recorded as timing-uncalibrated.
+            raise ValueError(
+                "an unavailable realized bottleneck requires uncalibrated timing"
             )
         for name in (
             "frac_algorithmic_memory_bound",
@@ -1933,6 +1941,7 @@ class HardwareMetrics:
             required = {
                 "schema",
                 "explicit",
+                "attention_partition",
                 "kv_head_reuse",
                 "drain_overlapped",
                 "area",
@@ -1943,6 +1952,10 @@ class HardwareMetrics:
                 )
             if not isinstance(self.architecture_options["explicit"], bool):
                 raise TypeError("architecture-option explicit flag must be boolean")
+            if not isinstance(self.architecture_options["attention_partition"], Mapping):
+                raise TypeError(
+                    "architecture-option attention partition must be an object"
+                )
         if self.capacity_throughput_chain:
             chain = self.capacity_throughput_chain
             if int(chain.get("evaluated_batch", -1)) != self.generated_tokens_per_step:

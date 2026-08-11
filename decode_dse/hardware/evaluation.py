@@ -3631,6 +3631,14 @@ class ProductionHardwareEvaluator:
                 str(exc),
             )
         except Exception as exc:
+            if "FP-SRAM/head-broadcast" in str(exc):
+                # The simulator applies its own head-broadcast geometry bound
+                # inside the decode loop; a candidate that exceeds it is
+                # structurally infeasible, not an evaluation failure.
+                return HardwareEvaluation.failed(
+                    "candidate_structurally_infeasible",
+                    f"{type(exc).__name__}: {exc}",
+                )
             return HardwareEvaluation.failed(
                 "simulator_evaluation_failed",
                 f"{type(exc).__name__}: {exc}",
