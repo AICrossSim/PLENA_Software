@@ -669,6 +669,10 @@ class PrefillHandoffArtifact:
         return artifact
 
 
+class CandidateStructurallyInfeasible(ValueError):
+    """A candidate whose declared knobs exceed a physical structural bound."""
+
+
 @dataclass(frozen=True)
 class PrecisionRequest:
     """Exact role bindings consumed by DecodeSimulator.make_precision."""
@@ -1006,8 +1010,18 @@ class SimulatorObservation:
             "memory",
             "serialization",
             "compute",
+            "unavailable",
         }:
             raise ValueError("invalid realized bottleneck")
+        if self.realized_bottleneck == "unavailable" and self.timing_calibrated:
+            # An unavailable realized bottleneck is the simulator's declared
+            # signal that timing evidence does not cover this operating point
+            # (for example a timing mode without evidence or a missing
+            # packed-q1 contract). Such rows must flow into the recorded
+            # timing_uncalibrated outcome, never into a rankable row.
+            raise ValueError(
+                "an unavailable realized bottleneck requires uncalibrated timing"
+            )
         if not isinstance(self.timing_calibrated, bool):
             raise TypeError("timing_calibrated must be boolean")
         if self.timing_calibrated != bool(self.timing_evidence_id):
@@ -1171,6 +1185,7 @@ class SimulatorObservation:
             required = {
                 "schema",
                 "explicit",
+                "attention_partition",
                 "kv_head_reuse",
                 "drain_overlapped",
                 "area",
@@ -1181,6 +1196,10 @@ class SimulatorObservation:
                 )
             if not isinstance(self.architecture_options["explicit"], bool):
                 raise TypeError("architecture-option explicit flag must be boolean")
+            if not isinstance(self.architecture_options["attention_partition"], Mapping):
+                raise TypeError(
+                    "architecture-option attention partition must be an object"
+                )
         if self.capacity_throughput_chain:
             chain = self.capacity_throughput_chain
             if int(chain.get("evaluated_batch", -1)) != self.generated_tokens_per_step:
@@ -2477,7 +2496,7 @@ class DecodeSimulatorBackend:
                 fp_sram_depth=int(getattr(hardware, "FP_SRAM_DEPTH", 512)),
             )
             if not bool(reuse["supported"]):
-                raise ValueError(
+                raise CandidateStructurallyInfeasible(
                     "KV_HEAD_REUSE exceeds FP-SRAM/head-broadcast capacity"
                 )
         self.sim._dd.set_area_model("calibrated", precision.spec)
@@ -3606,6 +3625,11 @@ class ProductionHardwareEvaluator:
                 expected_tps * 1e-9,
             ):
                 raise ValueError("simulator TPOT and TPS are inconsistent")
+        except CandidateStructurallyInfeasible as exc:
+            return HardwareEvaluation.failed(
+                "candidate_structurally_infeasible",
+                str(exc),
+            )
         except Exception as exc:
             return HardwareEvaluation.failed(
                 "simulator_evaluation_failed",
