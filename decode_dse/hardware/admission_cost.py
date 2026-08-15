@@ -37,6 +37,64 @@ ADMISSION_PERSISTENCE_CONTRACT = (
 # place of the persisted-plane fields the contract above accounts for.
 RECOMPUTABLE_ADMISSION_POLICY = "content_addressed_recompute_per_format"
 
+#: The complete vocabulary of admission persistence policies.  Anything else
+#: is unproven evidence: a receipt prepared under a policy this module cannot
+#: reason about has no persisted-byte or projection expectation to check.
+ADMISSION_PERSISTENCE_POLICIES = (
+    ADMISSION_PERSISTENCE_CONTRACT,
+    RECOMPUTABLE_ADMISSION_POLICY,
+)
+
+#: One concept, three historical spellings.  The admission persistence policy
+#: is written at the top level of the preparation receipt and its index as
+#: ``persistence_policy``, inside the persisted-contract resource projection
+#: as ``persistence_contract``, and inside the recomputable resource
+#: projection as ``policy``.  Reading it through one accessor keeps the three
+#: spellings from drifting apart while leaving the on-disk artifacts exactly
+#: as the pipeline writes them.
+ADMISSION_POLICY_KEYS = (
+    "persistence_policy",
+    "persistence_contract",
+    "policy",
+)
+
+
+def admission_persistence_policy(
+    value: Any,
+    *,
+    keys: Sequence[str] = ADMISSION_POLICY_KEYS,
+    required: bool = True,
+) -> str | None:
+    """Return the admission persistence policy one document declares.
+
+    The policy is accepted under any of its documented key names, but a
+    document that declares it more than once must declare it consistently.
+    An unrecognised policy string fails closed rather than falling through to
+    a policy-specific branch that would price it as something it is not.
+    ``required=False`` reports an undeclared policy as ``None`` so callers
+    that already have a specific "policy differs" failure can keep it.
+    """
+
+    if not isinstance(value, Mapping):
+        raise TypeError("admission policy must be read from an object")
+    declared = {
+        key: value[key] for key in keys if key in value and value[key] is not None
+    }
+    if not declared:
+        if required:
+            raise ValueError("admission persistence policy is undeclared")
+        return None
+    policies = {str(policy) for policy in declared.values()}
+    if len(policies) != 1:
+        raise ValueError(
+            "admission persistence policy is declared inconsistently: "
+            + ", ".join(f"{key}={declared[key]!r}" for key in sorted(declared))
+        )
+    policy = policies.pop()
+    if policy not in ADMISSION_PERSISTENCE_POLICIES:
+        raise ValueError(f"unknown admission persistence policy {policy!r}")
+    return policy
+
 
 def _canonical_bytes(value: Any) -> bytes:
     return json.dumps(
@@ -394,6 +452,11 @@ def _validate_recomputable_resource_projection(
 ) -> dict[str, int | float | str]:
     """Validate the projection written by the recompute-per-format policy."""
 
+    if (
+        admission_persistence_policy(value, required=False)
+        != RECOMPUTABLE_ADMISSION_POLICY
+    ):
+        raise ValueError("admission persistence contract differs")
     integer_fields = (
         "logical_total_bytes",
         "runtime_peak_format_bytes",
@@ -446,7 +509,10 @@ def _validate_resource_projection(
 ) -> dict[str, int | float | str]:
     if not isinstance(value, Mapping):
         raise TypeError("admission resource projection must be an object")
-    if value.get("persistence_contract") != ADMISSION_PERSISTENCE_CONTRACT:
+    if (
+        admission_persistence_policy(value, required=False)
+        != ADMISSION_PERSISTENCE_CONTRACT
+    ):
         raise ValueError("admission persistence contract differs")
     integer_fields = (
         "artifact_space_reserve_bytes",
@@ -507,7 +573,7 @@ def _validate_resource_projection(
     ):
         raise ValueError("admission resource projection is inconsistent")
     return {
-        "persistence_contract": str(value["persistence_contract"]),
+        "persistence_contract": ADMISSION_PERSISTENCE_CONTRACT,
         "artifact_space_safety_factor": float(safety_factor),
         **integers,
     }
@@ -612,9 +678,14 @@ def load_admission_correctness_evidence(
             int(record["payload_bytes"]) for record in records
         )
         projection = index.get("resource_projection")
+        # The projection, the receipt and the index each spell the same
+        # policy differently on disk; `admission_persistence_policy` reads
+        # all three spellings and fails closed on anything outside the
+        # declared vocabulary.
         recomputable = (
             isinstance(projection, Mapping)
-            and projection.get("policy") == RECOMPUTABLE_ADMISSION_POLICY
+            and admission_persistence_policy(projection, required=False)
+            == RECOMPUTABLE_ADMISSION_POLICY
         )
         if (
             int(receipt.get("artifact_count", -1)) != len(records)
@@ -639,9 +710,9 @@ def load_admission_correctness_evidence(
                 != persisted_bytes
                 or int(index.get("logical_artifact_bytes", -2))
                 != persisted_bytes
-                or receipt.get("persistence_policy")
+                or admission_persistence_policy(receipt, required=False)
                 != RECOMPUTABLE_ADMISSION_POLICY
-                or index.get("persistence_policy")
+                or admission_persistence_policy(index, required=False)
                 != RECOMPUTABLE_ADMISSION_POLICY
             ):
                 raise ValueError("admission aggregate counts differ")
@@ -815,6 +886,7 @@ def admission_correctness_status_valid(value: Mapping[str, Any]) -> bool:
     persisted_bytes = value.get("persisted_bytes")
     projected_bytes = value.get("projected_cold_artifact_bytes")
     numerical_view_bytes = value.get("projected_numerical_view_bytes")
+    persistence_contract = value.get("persistence_contract")
     return (
         value.get("schema_version")
         == ADMISSION_CORRECTNESS_SCHEMA
@@ -842,8 +914,6 @@ def admission_correctness_status_valid(value: Mapping[str, Any]) -> bool:
         and bool(value.get("admission_contract_id"))
         and isinstance(value.get("layout_id"), str)
         and bool(value.get("layout_id"))
-        and value.get("persistence_contract")
-        == ADMISSION_PERSISTENCE_CONTRACT
         and formats == list(DECODE_FORMATS)
         and isinstance(document_count, int)
         and not isinstance(document_count, bool)
@@ -857,9 +927,30 @@ def admission_correctness_status_valid(value: Mapping[str, Any]) -> bool:
         and tensor_count % (artifact_count * 2) == 0
         and isinstance(persisted_bytes, int)
         and not isinstance(persisted_bytes, bool)
-        and persisted_bytes > 0
+        # Each admission persistence policy pins its own persisted-byte
+        # expectation, exactly as AdmissionCorrectnessStatus.passed does:
+        # the persisted contract keeps its packed planes on disk, while the
+        # content-addressed recompute policy rebuilds every plane per format
+        # and deliberately persists nothing. Reading only one of the two here
+        # rejected every receipt prepared under the recompute policy even
+        # though the receipt itself validated. Any other policy string is
+        # unknown evidence and still fails closed.
+        and (
+            (
+                persistence_contract == ADMISSION_PERSISTENCE_CONTRACT
+                and persisted_bytes > 0
+            )
+            or (
+                persistence_contract == RECOMPUTABLE_ADMISSION_POLICY
+                and persisted_bytes == 0
+            )
+        )
         and isinstance(projected_bytes, int)
         and not isinstance(projected_bytes, bool)
+        # Under the persisted contract `persisted_bytes > 0` already forced a
+        # positive cold projection; state it directly so the recompute policy
+        # cannot admit a degenerate receipt that projects nothing to rebuild.
+        and projected_bytes > 0
         and projected_bytes >= persisted_bytes
         and isinstance(numerical_view_bytes, int)
         and not isinstance(numerical_view_bytes, bool)
@@ -879,9 +970,14 @@ __all__ = [
     "ADMISSION_CORRECTNESS_SCOPE",
     "ADMISSION_NUMERICAL_VALIDATION_SCHEMA",
     "ADMISSION_PERSISTENCE_CONTRACT",
+    "ADMISSION_POLICY_KEYS",
+    "ADMISSION_PERSISTENCE_POLICIES",
     "ADMISSION_VALIDATION_BASIS",
+    "RECOMPUTABLE_ADMISSION_POLICY",
+    "RECOMPUTABLE_ADMISSION_VALIDATION_BASIS",
     "AdmissionCorrectnessStatus",
     "admission_correctness_status_valid",
+    "admission_persistence_policy",
     "load_admission_correctness_evidence",
     "missing_admission_correctness_status",
 ]

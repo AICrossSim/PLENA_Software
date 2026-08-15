@@ -49,10 +49,16 @@ from decode_dse.hardware.design_space import (
 )
 from decode_dse.hardware.lm_head_service import (
     BF16HeadServiceStatus,
-    HEAD_SERVICE_MODE,
+    DECODE_BF16_HEAD,
+    EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_SCHEMA,
+    OUTPUT_HEAD_IDEALIZATIONS,
+    OUTPUT_HEAD_LOCATIONS,
+    OUTPUT_HEAD_SERVICE_MODES,
     composite_system_calibration_id,
     load_bf16_head_service_artifact,
+    local_head_boundary_status,
+    local_head_system_calibration_id,
 )
 from decode_dse.hardware.power_model import (
     calibrated_area_from_simulator,
@@ -64,6 +70,7 @@ from decode_dse.hardware.power_bridge import (
     analytic_energy_from_simulator,
     analytic_power_provenance,
     hbm_peak_bandwidth_bytes_per_s,
+    resolve_simulator_root,
 )
 from decode_dse.hardware.workload_events import (
     EVENT_MODEL,
@@ -93,7 +100,6 @@ PREFILL_HANDOFF_INPUT_SCHEMA = "plena-prefill-handoff-input-v1"
 PREFILL_HANDOFF_ANALYSIS_SCHEMA = "plena-prefill-handoff-analysis-v1"
 PREFILL_MEASUREMENT_SCOPE = "full_model_bf16_prompt_encoding_to_kv_ready"
 HANDOFF_LINK_GENERATIONS = frozenset({"nvlink3", "nvlink4", "ualink", "pcie5"})
-DECODE_BF16_HEAD = "decode_bf16_unmodeled"
 # The configured runtime HBM reserve is an allowance for working memory, sized
 # for whichever memory the study was first written against. Cap it at this
 # fraction of the chip it is actually reserved from: a reserve chosen for a
@@ -102,7 +108,25 @@ DECODE_BF16_HEAD = "decode_bf16_unmodeled"
 # precision, sharding or chip count. Scaling with capacity keeps the same
 # configuration meaningful across channel counts and across model sizes.
 RUNTIME_HBM_RESERVE_CAPACITY_DIVISOR = 8
-EXTERNAL_BF16_HEAD = "external_bf16_service"
+
+
+def _effective_runtime_hbm_reserve_bytes(
+    hbm_per_chip: int,
+    configured_reserve_bytes: int,
+) -> int:
+    """Per-chip runtime reserve actually priced against the physical ledger.
+
+    Every capacity decision - the cheap resource preflight and the full
+    simulator evaluation alike - must price the same reserve, or the preflight
+    admits candidates the evaluation then rejects (or worse, the reverse).
+    """
+
+    return min(
+        int(configured_reserve_bytes),
+        int(hbm_per_chip) // RUNTIME_HBM_RESERVE_CAPACITY_DIVISOR,
+    )
+
+
 _AREA_KEYS = (
     "MATRIX_SRAM_DEPTH",
     "VECTOR_SRAM_DEPTH",
@@ -208,10 +232,14 @@ def _module_source_digests() -> dict[str, str]:
 
 
 def simulator_root() -> Path:
-    """Return the PLENA_Simulator checkout the analytic models are read from."""
+    """Return the simulator checkout the analytic models are read from.
 
-    default_root = Path(__file__).resolve().parents[3] / "PLENA_Simulator"
-    return Path(os.environ.get("PLENA_SIMULATOR_PATH", default_root)).resolve()
+    Resolution is owned by ``power_bridge.resolve_simulator_root`` so the
+    module that hashes simulator sources and the module that imports the
+    energy coefficients cannot end up pointing at different checkouts.
+    """
+
+    return resolve_simulator_root().root
 
 
 def _simulator_source_digests() -> dict[str, str]:
@@ -939,9 +967,16 @@ class SimulatorObservation:
     hbm_traffic_per_batch_step: tuple[tuple[str, float], ...]
     hbm_traffic_per_generated_token: tuple[tuple[str, float], ...]
     traffic_ledger_id: str
+    # `supported` is the *pricing* verdict: it is false only when a
+    # blocking-stage limitation exists.  `issue_codes` stays the exhaustive
+    # capability record - RTL/DC-only limitations included - so nothing is
+    # silently dropped from the row, and `blocking_issue_codes` names the
+    # subset that actually withheld the price.
     packedkv_selector_supported: bool
     packedkv_selector_capability_id: str
     packedkv_selector_issue_codes: tuple[str, ...]
+    packedkv_selector_blocking_issue_codes: tuple[str, ...]
+    packedkv_selector_recorded_issue_codes: tuple[str, ...]
     bandwidth_calibration_id: str | None
     total_hbm_bytes: float
     events: tuple[DecodeEvent, ...]
@@ -1250,16 +1285,40 @@ class SimulatorObservation:
             raise ValueError(
                 "selector capability identity must be non-empty"
             )
+        # The capability record is stage-scoped, not all-or-nothing: a point
+        # prices when no BLOCKING-stage limitation exists, while the full
+        # issue list - RTL/DC-only limitations included - stays on the row.
+        # The invariant is re-expressed, not weakened: `supported` must still
+        # be exactly the emptiness of the set that is allowed to withhold a
+        # price, and every blocking code must appear in the exhaustive list.
         if self.packedkv_selector_supported != (
-            not self.packedkv_selector_issue_codes
+            not self.packedkv_selector_blocking_issue_codes
         ):
             raise ValueError("selector capability evidence is inconsistent")
-        canonical_issues = tuple(
-            sorted(set(self.packedkv_selector_issue_codes))
-        )
-        if canonical_issues != self.packedkv_selector_issue_codes:
+        for name in (
+            "packedkv_selector_issue_codes",
+            "packedkv_selector_blocking_issue_codes",
+            "packedkv_selector_recorded_issue_codes",
+        ):
+            codes = getattr(self, name)
+            if not isinstance(codes, tuple) or any(
+                not isinstance(code, str) or not code for code in codes
+            ):
+                raise TypeError(f"{name} must be a tuple of non-empty codes")
+            if tuple(sorted(set(codes))) != codes:
+                raise ValueError(
+                    "selector capability issues must be unique and sorted"
+                )
+        blocking = set(self.packedkv_selector_blocking_issue_codes)
+        recorded = set(self.packedkv_selector_recorded_issue_codes)
+        if blocking & recorded:
             raise ValueError(
-                "selector capability issues must be unique and sorted"
+                "a selector issue cannot be both blocking and recorded-only"
+            )
+        if blocking | recorded != set(self.packedkv_selector_issue_codes):
+            raise ValueError(
+                "selector capability issues must partition exhaustively "
+                "into blocking and recorded codes"
             )
         if (
             self.bandwidth_calibration_id is not None
@@ -1676,7 +1735,19 @@ def _whole_model_energy(
     decoder_tpot_ms: float,
     batch: int,
 ) -> tuple[CalibratedEnergy, str]:
-    """Compose two dedicated chips over the serialized decode dependency."""
+    """Compose the whole-model energy ledger over the decode dependency.
+
+    With a remote head service the system is two dedicated devices: the head's
+    dynamic energy is added and, because the endpoint is reserved for the whole
+    decode step, its idle draw is charged across the combined serialized token
+    latency.  That idle term dominates the ledger, and it is a cost of
+    provisioning a second device rather than a cost of the projection.
+
+    With the decode-local head (``head`` is None) there is no second device to
+    provision.  The head's weights and its per-step traffic are already inside
+    the decoder ledger, so the whole model is the decode chip itself and no
+    external idle power is charged.
+    """
 
     decoder_duration = decoder_tpot_ms / 1000.0 / batch
     if abs(decoder.duration_s - decoder_duration) > max(
@@ -1684,6 +1755,12 @@ def _whole_model_energy(
         decoder_duration * 1e-6,
     ):
         raise ValueError("decoder energy duration differs from decoder TPOT")
+    if head is None:
+        system_id = local_head_system_calibration_id(decoder.calibration_id)
+        return (
+            replace(decoder, calibration_id=system_id, energy_id=system_id),
+            system_id,
+        )
     whole_duration = (
         decoder_tpot_ms / 1000.0 + head.total_latency_s
     ) / batch
@@ -2012,6 +2089,7 @@ class DecodeSimulatorBackend:
         compiler_trace_artifacts: str | os.PathLike[str] | None = None,
         request_memory_calibration: str | os.PathLike[str] | None = None,
         head_service_artifact: str | os.PathLike[str] | None = None,
+        output_head_location: str | None = None,
         model_name: str | None = None,
         model_revision: str | None = None,
         required_batches: Sequence[int] = (),
@@ -2064,14 +2142,27 @@ class DecodeSimulatorBackend:
                 ),
                 required_batches=required_batches,
             )
-        self.output_head_location = (
-            EXTERNAL_BF16_HEAD
-            if (
-                self.head_service_status is not None
-                and self.head_service_status.passed
-            )
-            else DECODE_BF16_HEAD
+        head_service_passed = (
+            self.head_service_status is not None
+            and self.head_service_status.passed
         )
+        # The boundary is a configuration decision, not an inference from which
+        # artifacts happen to be present: the decode-local head is the headline
+        # placement and the measured remote service is the comparison arm, so
+        # a passing head-service artifact may accompany either.  Only when no
+        # boundary is requested does the artifact still select one.
+        if output_head_location is None:
+            output_head_location = (
+                EXTERNAL_BF16_HEAD if head_service_passed else DECODE_BF16_HEAD
+            )
+        if output_head_location not in OUTPUT_HEAD_LOCATIONS:
+            raise ValueError("output_head_location is unsupported")
+        if output_head_location == EXTERNAL_BF16_HEAD and not head_service_passed:
+            raise ValueError(
+                "the external output-head boundary requires a passing "
+                "BF16 head-service artifact"
+            )
+        self.output_head_location = output_head_location
         if execution_mode == COMPILER_TRACE_EXECUTION_MODE:
             from compiler_trace_timing import (
                 DEFAULT_REQUEST_CALIBRATION,
@@ -2096,7 +2187,8 @@ class DecodeSimulatorBackend:
             )
         elif self.calibrated_bandwidth:
             self.sim.use_calibrated_bandwidth()
-        root = simulator_root()
+        simulator_resolution = resolve_simulator_root()
+        root = simulator_resolution.root
         paths = {
             "model_json_sha256": _file_sha256(self.sim.model_json),
             "settings_sha256": _file_sha256(self.sim.settings_toml),
@@ -2127,6 +2219,11 @@ class DecodeSimulatorBackend:
             )
         self._provenance = {
             "backend": "DecodeSimulator",
+            # Every simulator source digest below is read from this checkout;
+            # recording which checkout it was, and which rule selected it,
+            # keeps a study priced against an unintended tree auditable
+            # rather than silently indistinguishable.
+            **simulator_resolution.to_dict(),
             "timing_mode": "rtl_serialized",
             "timing_evidence_tier": (
                 self.sim.timing_evidence.evidence_tier
@@ -2429,6 +2526,10 @@ class DecodeSimulatorBackend:
             }
         )
         hbm_per_chip = int(memory.HBM_SIZE)
+        effective_reserve = _effective_runtime_hbm_reserve_bytes(
+            hbm_per_chip,
+            workload.runtime_hbm_reserve_bytes,
+        )
         precision_id = _content_hash(precision.spec)
         ledger_key = (
             precision_id,
@@ -2441,6 +2542,7 @@ class DecodeSimulatorBackend:
             candidate.tp,
             candidate.kvp,
             candidate.sram_policy,
+            effective_reserve,
         )
         ledger = self._resource_ledger_cache.get(ledger_key)
         if ledger is None:
@@ -2451,10 +2553,7 @@ class DecodeSimulatorBackend:
                 context=workload.input_seq + workload.output_seq,
                 batch=candidate.batch,
                 hbm_capacity_bytes=hbm_per_chip,
-                runtime_hbm_reserve_bytes=min(
-                    int(workload.runtime_hbm_reserve_bytes),
-                    hbm_per_chip // RUNTIME_HBM_RESERVE_CAPACITY_DIVISOR,
-                ),
+                runtime_hbm_reserve_bytes=effective_reserve,
                 kv_layout=workload.kv_layout,
                 include_lm_head=(
                     self.output_head_location == DECODE_BF16_HEAD
@@ -2603,7 +2702,13 @@ class DecodeSimulatorBackend:
             hbm_gen=candidate.hbm_generation,
             hbm_channels=candidate.hbm_channels,
             kv_layout=workload.kv_layout,
-            runtime_hbm_reserve_bytes=workload.runtime_hbm_reserve_bytes,
+            # The same capacity-scaled reserve the resource preflight priced:
+            # the preflight admits a candidate if and only if this evaluation
+            # can find it runtime-feasible on the capacity axis.
+            runtime_hbm_reserve_bytes=_effective_runtime_hbm_reserve_bytes(
+                int(hbm["HBM_SIZE"]),
+                workload.runtime_hbm_reserve_bytes,
+            ),
             output_head_location=self.output_head_location,
         )
         if metrics.n_chips != candidate.chip_count:
@@ -2633,12 +2738,22 @@ class DecodeSimulatorBackend:
             profile,
             _selector_runtime_target(profile, candidate, shape),
         )
-        selector_issue_codes = tuple(
+        # Record every capability limitation, then decide pricing on the
+        # stage scope alone.  A limitation that lives only in the RTL
+        # implementation (or the DC flow) is disclosed on the row and forces
+        # rtl_valid false through CrossStackCapability.validity_floor, but it
+        # cannot withhold a price at a tier that never claimed RTL evidence.
+        selector_blocking_codes = tuple(
+            sorted({issue.code for issue in selector_capability.blocking_issues})
+        )
+        selector_recorded_codes = tuple(
             sorted(
-                issue.code
-                for issue in selector_capability.issues
-                if "rtl" in issue.stages
+                {issue.code for issue in selector_capability.recorded_issues}
+                - set(selector_blocking_codes)
             )
+        )
+        selector_issue_codes = tuple(
+            sorted(set(selector_blocking_codes) | set(selector_recorded_codes))
         )
         selector_capability_id = (
             "packedkv-selector-capability-"
@@ -2868,9 +2983,11 @@ class DecodeSimulatorBackend:
                 metrics.hbm_traffic_per_generated_token
             ),
             traffic_ledger_id=self.traffic_ledger_id,
-            packedkv_selector_supported=not selector_issue_codes,
+            packedkv_selector_supported=not selector_blocking_codes,
             packedkv_selector_capability_id=selector_capability_id,
             packedkv_selector_issue_codes=selector_issue_codes,
+            packedkv_selector_blocking_issue_codes=selector_blocking_codes,
+            packedkv_selector_recorded_issue_codes=selector_recorded_codes,
             bandwidth_calibration_id=metrics.bandwidth_calibration_id,
             total_hbm_bytes=total_hbm_bytes,
             events=events,
@@ -3236,37 +3353,59 @@ class ProductionHardwareEvaluator:
                 self.admission_correctness_status.to_dict()
             )
         )
-        expected_head_location = (
-            EXTERNAL_BF16_HEAD
-            if self.head_service_calibration is not None
-            else DECODE_BF16_HEAD
-        )
-        backend_location = backend.provenance.get(
-            "output_head_location"
-        )
+        # The backend owns the boundary decision; the evaluator adopts it and
+        # refuses only a boundary the evidence cannot support.
+        backend_location = getattr(backend, "output_head_location", None)
+        if backend_location is None:
+            backend_location = backend.provenance.get("output_head_location")
+        if backend_location is None:
+            backend_location = (
+                EXTERNAL_BF16_HEAD
+                if self.head_service_calibration is not None
+                else DECODE_BF16_HEAD
+            )
+        if backend_location not in OUTPUT_HEAD_LOCATIONS:
+            raise ValueError("output_head_location is unsupported")
         if (
-            backend_location is not None
-            and backend_location != expected_head_location
+            backend_location == EXTERNAL_BF16_HEAD
+            and self.head_service_calibration is None
         ):
             raise ValueError(
                 "backend and head-service artifact boundaries differ"
             )
-        self.output_head_location = expected_head_location
-        self.output_head_status = (
-            self.head_service_status.to_dict()
-            if self.head_service_status is not None
-            else {
-                "schema_version": HEAD_SERVICE_SCHEMA,
-                "artifact_sha256": None,
-                "passed": False,
-                "failures": ["missing_head_service_artifact"],
-                "calibration_id": None,
-                "provenance_id": None,
-                "service_mode": "unmodeled",
-                "service_location": None,
-                "required_batches": [],
-            }
+        self.output_head_location = backend_location
+        self.local_output_head = backend_location == DECODE_BF16_HEAD
+        # A head-service artifact supplied alongside the decode-local headline
+        # is retained as the recorded comparison arm, never as a priced cost.
+        self.head_service_comparison_only = (
+            self.local_output_head
+            and self.head_service_calibration is not None
         )
+        if self.local_output_head:
+            self.output_head_status = local_head_boundary_status()
+            if self.head_service_status is not None:
+                # Keep the measured remote evidence addressable beside the
+                # local headline so both placements can be reported together.
+                self.output_head_status = {
+                    **self.output_head_status,
+                    "comparison_status": self.head_service_status.to_dict(),
+                }
+        else:
+            self.output_head_status = (
+                self.head_service_status.to_dict()
+                if self.head_service_status is not None
+                else {
+                    "schema_version": HEAD_SERVICE_SCHEMA,
+                    "artifact_sha256": None,
+                    "passed": False,
+                    "failures": ["missing_head_service_artifact"],
+                    "calibration_id": None,
+                    "provenance_id": None,
+                    "service_mode": "unmodeled",
+                    "service_location": None,
+                    "required_batches": [],
+                }
+            )
         payload = {
             "version": EVALUATOR_VERSION,
             "event_model": EVENT_MODEL,
@@ -3288,6 +3427,11 @@ class ProductionHardwareEvaluator:
             "traffic_unit": TRAFFIC_UNIT,
             "output_head_location": self.output_head_location,
             "head_service_status": dict(self.output_head_status),
+            # The named scope limits of the priced boundary travel with the
+            # evaluator identity, so a study cannot be re-read without them.
+            "output_head_idealizations": list(
+                OUTPUT_HEAD_IDEALIZATIONS[self.output_head_location]
+            ),
             "admission_correctness_status": (
                 self.admission_correctness_status.to_dict()
             ),
@@ -3679,18 +3823,31 @@ class ProductionHardwareEvaluator:
             and observation.bandwidth_calibration_id is not None
         ):
             resolved_timing_tier = STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+        local_head = observation.output_head_location == DECODE_BF16_HEAD
+        # A head-service artifact carried alongside the local headline prices
+        # nothing; it is recorded so both placements can be reported together.
+        priced_head_estimate = None if local_head else head_estimate
+        comparison_head_estimate = head_estimate if local_head else None
         whole_rankable = (
-            head_estimate is not None
-            and observation.output_head_location == EXTERNAL_BF16_HEAD
+            (local_head or priced_head_estimate is not None)
+            and observation.output_head_location == self.output_head_location
             and observation.runtime_feasible
             and observation.timing_calibrated
             and resolved_timing_tier is not None
             and self.admission_correctness_valid
         )
+        # The decode-local head runs inside the decode step this TPOT already
+        # prices - its weights and per-step traffic are on the decode chip's
+        # ledger - so it adds no serialized latency.  Only the remote service
+        # is a second endpoint the token must wait for.
         whole_tpot_ms = (
             observation.tpot_ms
-            + head_estimate.total_latency_s * 1000.0
-            if whole_rankable and head_estimate is not None
+            + (
+                priced_head_estimate.total_latency_s * 1000.0
+                if priced_head_estimate is not None
+                else 0.0
+            )
+            if whole_rankable
             else None
         )
         whole_tps = (
@@ -3716,14 +3873,19 @@ class ProductionHardwareEvaluator:
             )
         elif not observation.packedkv_selector_supported:
             error_code = "packedkv_selector_unsupported"
+            # Name the codes that actually withheld the price; the recorded
+            # RTL/DC-only limitations travel with the row's capability record.
             error_message = (
                 "PackedKV selector capability failed: "
-                + ",".join(observation.packedkv_selector_issue_codes)
+                + ",".join(observation.packedkv_selector_blocking_issue_codes)
             )
-        elif head_estimate_error is not None:
+        elif head_estimate_error is not None and not local_head:
             error_code = "head_service_evaluation_failed"
             error_message = head_estimate_error
-        elif head_estimate is None:
+        elif priced_head_estimate is None and not local_head:
+            # Only the external boundary depends on a measured remote endpoint.
+            # The decode-local head is rankable on the decode chip's own
+            # ledger, with its compute idealization disclosed on the row.
             error_code = "output_head_unmodeled"
             error_message = (
                 "UNMODELED:LM_HEAD_BF16; a passing remote BF16 "
@@ -3760,11 +3922,11 @@ class ProductionHardwareEvaluator:
                     link_generation=observation.link_generation,
                 )
                 area_source = "analytic_full_chip"
-                if whole_rankable and head_estimate is not None:
+                if whole_rankable:
                     whole_energy, system_calibration_id = (
                         _whole_model_energy(
                             energy,
-                            head_estimate,
+                            priced_head_estimate,
                             decoder_tpot_ms=observation.tpot_ms,
                             batch=candidate.batch,
                         )
@@ -3818,11 +3980,11 @@ class ProductionHardwareEvaluator:
                     prediction_status
                 )
                 dc_valid = True
-                if whole_rankable and head_estimate is not None:
+                if whole_rankable:
                     whole_energy, system_calibration_id = (
                         _whole_model_energy(
                             energy,
-                            head_estimate,
+                            priced_head_estimate,
                             decoder_tpot_ms=observation.tpot_ms,
                             batch=candidate.batch,
                         )
@@ -3844,11 +4006,11 @@ class ProductionHardwareEvaluator:
                 area_source = "dc_calibrated_model"
                 area_calibration_id = power.calibration_id
                 energy = power.energy
-                if whole_rankable and head_estimate is not None:
+                if whole_rankable:
                     whole_energy, system_calibration_id = (
                         _whole_model_energy(
                             energy,
-                            head_estimate,
+                            priced_head_estimate,
                             decoder_tpot_ms=observation.tpot_ms,
                             batch=candidate.batch,
                         )
@@ -4037,12 +4199,17 @@ class ProductionHardwareEvaluator:
                 self.admission_correctness_status.to_dict()
             ),
             service_mode=(
-                HEAD_SERVICE_MODE
-                if self.head_service_calibration is not None
+                OUTPUT_HEAD_SERVICE_MODES[self.output_head_location]
+                if (local_head or self.head_service_calibration is not None)
                 else "unmodeled"
             ),
+            output_head_location=self.output_head_location,
+            output_head_idealizations=OUTPUT_HEAD_IDEALIZATIONS[
+                self.output_head_location
+            ],
             output_head_status=self.output_head_status,
-            output_head_service=head_estimate,
+            output_head_service=priced_head_estimate,
+            output_head_comparison=comparison_head_estimate,
             whole_model_tpot_ms=whole_tpot_ms,
             whole_model_tps=whole_tps,
             whole_model_energy=whole_energy,
@@ -4085,16 +4252,39 @@ def _load_json_object(path: str | os.PathLike[str]) -> dict[str, Any]:
     return dict(value)
 
 
+#: The declared output-head contract.  The headline is the decode-local BF16
+#: head: its weights and per-decode-step traffic are charged to the decode
+#: chip and only its compute is idealized, which the contract names outright.
+#: The measured remote service remains the comparison arm so both placements
+#: can be reported side by side with their evidence tiers.
+OUTPUT_HEAD_CONTRACT: Mapping[str, Any] = {
+    "headline_location": DECODE_BF16_HEAD,
+    "headline_precision": "BF16",
+    "headline_idealizations": list(
+        OUTPUT_HEAD_IDEALIZATIONS[DECODE_BF16_HEAD]
+    ),
+    "comparison_location": EXTERNAL_BF16_HEAD,
+    "comparison_evidence": "measured_head_service",
+    "local_low_precision": "accuracy_only",
+}
+
+
+def config_output_head_location(config: Mapping[str, Any]) -> str:
+    """Resolve the priced output-head boundary declared by a study config."""
+
+    output_head = config.get("output_head_contract")
+    if not isinstance(output_head, Mapping):
+        return DECODE_BF16_HEAD
+    location = output_head.get("headline_location")
+    if location not in OUTPUT_HEAD_LOCATIONS:
+        raise ValueError("output_head_contract headline location is unsupported")
+    return str(location)
+
+
 def _validate_system_boundary_config(config: Mapping[str, Any]) -> None:
     output_head = config.get("output_head_contract")
     if output_head is not None:
-        expected_head = {
-            "headline_location": EXTERNAL_BF16_HEAD,
-            "headline_precision": "BF16",
-            "local_bf16": "sensitivity_unrankable",
-            "local_low_precision": "accuracy_only",
-        }
-        if output_head != expected_head:
+        if output_head != dict(OUTPUT_HEAD_CONTRACT):
             raise ValueError("output_head_contract differs from the evaluator")
     hbm = config.get("hbm_sensitivity")
     if hbm is not None:
@@ -4257,11 +4447,20 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--output-head-location",
+        choices=sorted(OUTPUT_HEAD_LOCATIONS),
+        default=None,
+        help=(
+            "priced output-head boundary; defaults to the headline location "
+            "declared by the study config's output_head_contract"
+        ),
+    )
+    parser.add_argument(
         "--local-bf16-head-sensitivity",
         action="store_true",
         help=(
-            "run an explicitly unrankable local-BF16-head sensitivity "
-            "instead of the calibrated remote service"
+            "deprecated alias for --output-head-location "
+            f"{DECODE_BF16_HEAD}"
         ),
     )
     parser.add_argument("--settings-toml")
@@ -4341,11 +4540,12 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
         publication_timing_tier=args.publication_timing_tier,
     )
     if (
-        args.publication_timing_tier == STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+        args.output_head_location is not None
         and args.local_bf16_head_sensitivity
+        and args.output_head_location != DECODE_BF16_HEAD
     ):
         raise ValueError(
-            "the analytic publication tier requires the remote head service"
+            "--local-bf16-head-sensitivity and --output-head-location disagree"
         )
     if (
         args.execution_mode == LEGACY_AGGREGATE_BANDWIDTH_MODE
@@ -4369,18 +4569,29 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
             "--exact-dc-anchors and --rtl-source-tree-sha256 "
             "must be supplied together"
         )
-    if args.local_bf16_head_sensitivity:
-        if args.head_service_calibration:
-            raise ValueError(
-                "local head sensitivity cannot use a remote head artifact"
-            )
-    elif not args.head_service_calibration:
-        raise ValueError(
-            "the headline study requires --head-service-calibration"
-        )
     base_manifest = load_manifest(args.manifest)
     config = _load_json_object(args.config)
     _validate_system_boundary_config(config)
+    # Resolve the priced boundary from the explicit flag, then the deprecated
+    # alias, then the study config's declared headline.
+    if args.output_head_location is not None:
+        output_head_location = str(args.output_head_location)
+    elif args.local_bf16_head_sensitivity:
+        output_head_location = DECODE_BF16_HEAD
+    else:
+        output_head_location = config_output_head_location(config)
+    args.output_head_location = output_head_location
+    # The measured remote service is required only when it prices the head.
+    # Beside the decode-local headline the same artifact is still accepted and
+    # recorded, so the two placements stay comparable within one run.
+    if (
+        output_head_location == EXTERNAL_BF16_HEAD
+        and not args.head_service_calibration
+    ):
+        raise ValueError(
+            "the external output-head boundary requires "
+            "--head-service-calibration"
+        )
     if config.get("model_name") != base_manifest.model_name:
         raise ValueError("config and manifest model names differ")
     if config.get("model_revision") != base_manifest.model_revision:
@@ -4476,21 +4687,19 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
         compiler_trace_artifacts=args.compiler_trace_artifacts,
         request_memory_calibration=args.request_memory_calibration,
         head_service_artifact=args.head_service_calibration,
+        output_head_location=args.output_head_location,
         model_name=manifest.model_name,
         model_revision=manifest.model_revision,
         required_batches=space.batch,
     )
-    if (
-        not args.local_bf16_head_sensitivity
-        and backend.output_head_location != EXTERNAL_BF16_HEAD
-    ):
+    if backend.output_head_location != args.output_head_location:
         failures = (
             backend.head_service_status.failures
             if backend.head_service_status is not None
             else ("missing_head_service_artifact",)
         )
         raise ValueError(
-            "the remote BF16 output-head service is not rankable: "
+            "the requested output-head boundary is not available: "
             + ",".join(failures)
         )
     if (

@@ -15,18 +15,32 @@ import math
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
 
 from decode_dse.hardware import evaluation
+from decode_dse.hardware import admission_cost
+from decode_dse.hardware.admission_cost import (
+    ADMISSION_CORRECTNESS_SCHEMA,
+    ADMISSION_CORRECTNESS_SCOPE,
+    ADMISSION_PERSISTENCE_CONTRACT,
+    DECODE_FORMATS,
+    MX_BLOCK_SIZE,
+    RECOMPUTABLE_ADMISSION_POLICY,
+    admission_correctness_status_valid,
+)
 from decode_dse.hardware.design_space import (
     COMPILER_TRACE_EXECUTION_MODE,
     COMPILER_TRACE_TIMING_SET_SCHEMA,
     FULL_MODEL_DECODE_SCOPE,
     LEGACY_AGGREGATE_BANDWIDTH_MODE,
+    PHYSICAL_TRAFFIC_KEYS,
+    STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
+    TIMING_TIER_REQUIRED_VALIDITY,
     CapacityBreakdown,
     ExactHardwareSpace,
     ExactHardwareStudy,
@@ -41,26 +55,42 @@ from decode_dse.hardware.design_space import (
     _FactorizedHardwareReducer,
     _content_hash,
     _factor_join_class_id,
+    evaluate_publication_admission,
     load_hardware_artifact,
+    select_admitted_rows,
 )
 from decode_dse.hardware.lm_head_service import (
+    DECODE_BF16_HEAD,
+    EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
+    LOCAL_HEAD_COMPUTE_IDEALIZATION,
+    LOCAL_HEAD_MODE,
     composite_system_calibration_id,
     load_bf16_head_service_artifact,
+    local_head_boundary_status,
+    local_head_system_calibration_id,
 )
 from decode_dse.hardware.packedkv_claims import AttentionTopology
 from decode_dse.hardware.power_bridge import analytic_energy_from_simulator
 from decode_dse.hardware.selection import (
     PublicationCandidate,
+    individually_validated_candidates,
+    individually_validated_points,
     select_refinement_sources,
     select_final_deployment,
 )
 from decode_dse.legality import (
+    INDIVIDUAL_VALIDATION_STAGES,
+    MODEL_REQUIRED_VALIDITY_STAGES,
+    PRICING_BLOCKING_STAGES,
+    PRICING_RECORDED_STAGES,
+    ADMISSION_BASIS,
     PackedKVRuntimeTarget,
     StackValidity,
     evaluate_stack_capability,
     scope_stack_validity,
 )
+from decode_dse.hardware.workload_events import DecodeEvent
 from decode_dse.manifest import (
     QuantizerProvenance,
     QuantizerSource,
@@ -821,10 +851,18 @@ def test_exact_search_knob_choice_respects_area_and_capacity_tradeoffs() -> None
 def test_full_model_spaces_have_exact_bounded_structural_counts() -> None:
     repository = Path(__file__).resolve().parents[2]
     # The Qwen grid is pruned to compiler-legal geometry with searchable
-    # HBM channels; the Llama grid keeps its historical shape.
+    # HBM channels.  The Llama grid is now restricted the same way on the two
+    # architecture-option axes: drain-overlapped execution has no anchor in
+    # the timing evidence and the packed-q1 timing contracts have not been
+    # generated, so KV_HEAD_REUSE / DRAIN_OVERLAPPED true candidates could
+    # only ever be recorded as timing-uncalibrated.  This is a declared
+    # evidence-availability restriction, not objective pruning.  Both grids
+    # search the same three measured HBM2 calibration groups (8/16/32
+    # interface units), so the channel axis contributes an identical factor
+    # of three to each count.
     expected = {
         "qwen3_32b": 22_320,
-        "llama3_1_8b": 616_032,
+        "llama3_1_8b": 753_984,
     }
     for name, count in expected.items():
         config = json.loads(
@@ -2529,3 +2567,1894 @@ def test_dual_accuracy_frontiers_label_instead_of_filtering() -> None:
             strict_relative_perplexity=1.05,
             relaxed_relative_perplexity=1.01,
         )
+
+
+# --- Runtime HBM reserve contracts -----------------------------------------
+#
+# The configured reserve is a PER-CHIP working-memory allowance.  A reserve
+# sized for a large device (8 GiB against an 80 GB HBM3 part) must never be
+# able to render every geometry on a small HBM2 chip infeasible by
+# construction, and - critically - the cheap resource preflight and the full
+# simulator evaluation must price the *same* effective reserve, or the
+# preflight admits candidates the evaluation then rejects after paying for a
+# complete decode walk (the failure mode that marked an entire hardware study
+# runtime_infeasible).
+
+
+def test_effective_runtime_reserve_is_capacity_scaled() -> None:
+    effective = evaluation._effective_runtime_hbm_reserve_bytes
+    # 8 GiB configured against an 8 GB HBM2 chip clamps to capacity / 8.
+    assert effective(8_000_000_000, 8_589_934_592) == 1_000_000_000
+    assert effective(32_000_000_000, 8_589_934_592) == 4_000_000_000
+    # A reserve below the structural ceiling passes through unchanged, so a
+    # correctly sized configuration is priced exactly as written.
+    assert effective(8_000_000_000, 536_870_912) == 536_870_912
+    assert effective(8_000_000_000, 0) == 0
+
+
+def test_runtime_reserve_is_per_chip_on_both_topology_paths() -> None:
+    # The simulator prices the reserve per chip whether the topology is the
+    # legacy aggregate one or an explicit TP x KVP mesh; a replay without
+    # TP/KVP must not report a different physical capacity verdict than the
+    # study path for the identical system.
+    simulator = DecodeSimulator("qwen3-32b")
+    precision = simulator.make_precision(attn_w=4, ffn_w=4, kv=4, act_w=4)
+    overrides = {
+        "MLEN": 128,
+        "BLEN": 2,
+        "VLEN": 128,
+        "HLEN": 128,
+        **simulator.hbm_overrides("HBM2", 8),
+    }
+    reserve = 1 << 29
+    common = dict(
+        batch=1,
+        input_seq=16,
+        output_seq=2,
+        stride=1,
+        n_chips=4,
+        hbm_gen="HBM2",
+        hbm_channels=8,
+        runtime_hbm_reserve_bytes=reserve,
+    )
+    legacy = simulator.evaluate(precision, hw_over=dict(overrides), **common)
+    explicit = simulator.evaluate(
+        precision,
+        hw_over={
+            **overrides,
+            "TP": 4,
+            "KVP": 1,
+            "LINK_PORTS": 1,
+            "SRAM_POLICY": "streaming",
+        },
+        **common,
+    )
+    assert legacy.runtime_hbm_reserve_bytes == reserve * 4
+    assert explicit.runtime_hbm_reserve_bytes == reserve * 4
+
+
+def test_resource_preflight_prices_the_capacity_scaled_reserve() -> None:
+    entry = next(
+        row
+        for row in _synthetic_manifest().entries
+        if (
+            row.profile.kind == PROFILE_KIND_QUANTIZED
+            and row.legality.hardware_candidate
+        )
+    )
+    candidate = HardwareCandidate(
+        mlen=128,
+        blen=2,
+        vlen=128,
+        hlen=128,
+        batch=1,
+        hbm_channels=8,
+        hbm_generation="HBM2",
+        chip_count=4,
+        tp=4,
+        kvp=1,
+        link_ports=1,
+        sram_policy="streaming",
+    )
+    backend = object.__new__(evaluation.DecodeSimulatorBackend)
+    backend.sim = DecodeSimulator("qwen3-32b")
+    backend.output_head_location = evaluation.EXTERNAL_BF16_HEAD
+    backend._resource_ledger_cache = {}
+    backend._resource_area_cache = {}
+
+    oversized = evaluation.HardwareWorkload(
+        input_seq=16,
+        output_seq=8,
+        stride=1,
+        runtime_hbm_reserve_bytes=8_589_934_592,
+    )
+    status = backend.resource_preflight(entry, candidate, oversized)
+    # An oversized reserve is clamped to capacity / divisor on every chip
+    # instead of consuming more than the chip itself.
+    assert status.capacity.runtime_bytes == 4 * 1_000_000_000
+    assert status.capacity.feasible
+
+    sized = evaluation.HardwareWorkload(
+        input_seq=16,
+        output_seq=8,
+        stride=1,
+        runtime_hbm_reserve_bytes=536_870_912,
+    )
+    resized = backend.resource_preflight(entry, candidate, sized)
+    # The ledger cache is keyed by the effective reserve, so a different
+    # configured reserve can never resurrect a stale capacity verdict.
+    assert resized.capacity.runtime_bytes == 4 * 536_870_912
+    assert resized.capacity.feasible
+
+
+def test_backend_evaluation_threads_the_same_reserve_as_preflight() -> None:
+    captured: dict[str, object] = {}
+
+    class StubDD:
+        @staticmethod
+        def set_area_model(*_args, **_kwargs) -> None:
+            return None
+
+    class StubSimulator:
+        _dd = StubDD()
+
+        @staticmethod
+        def make_precision(**_kwargs):
+            return SimpleNamespace(spec={"kv_bits": 4.0, "ffn_bits": 4.0})
+
+        @staticmethod
+        def hbm_overrides(_generation, _channels):
+            return {"HBM_WIDTH": 1024, "HBM_SIZE": 8_000_000_000}
+
+        @staticmethod
+        def evaluate(*_args, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("captured simulator call")
+
+    backend = object.__new__(evaluation.DecodeSimulatorBackend)
+    backend.sim = StubSimulator()
+    backend.output_head_location = evaluation.EXTERNAL_BF16_HEAD
+    entry = next(
+        row
+        for row in _synthetic_manifest().entries
+        if (
+            row.profile.kind == PROFILE_KIND_QUANTIZED
+            and row.legality.hardware_candidate
+        )
+    )
+    candidate = HardwareCandidate(
+        mlen=128,
+        blen=2,
+        vlen=128,
+        hlen=128,
+        batch=1,
+        hbm_channels=8,
+        hbm_generation="HBM2",
+        chip_count=2,
+        tp=2,
+        kvp=1,
+        link_ports=1,
+        sram_policy="streaming",
+    )
+    workload = evaluation.HardwareWorkload(
+        input_seq=16,
+        output_seq=8,
+        stride=1,
+        runtime_hbm_reserve_bytes=8_589_934_592,
+    )
+    with pytest.raises(RuntimeError, match="captured simulator call"):
+        backend.evaluate(entry, candidate, workload)
+    assert captured["runtime_hbm_reserve_bytes"] == (
+        evaluation._effective_runtime_hbm_reserve_bytes(
+            8_000_000_000,
+            workload.runtime_hbm_reserve_bytes,
+        )
+    )
+    assert captured["runtime_hbm_reserve_bytes"] == 1_000_000_000
+
+
+# --- Stage-scoped PackedKV capability contracts ------------------------------
+#
+# The declared publication timing tiers require exactly
+# ("compiler_valid", "emulator_valid"); RTL and DC evidence is recorded and
+# disclosed, never required.  A capability limitation that lives only in the
+# RTL implementation must therefore be RECORDED on the row - full issue code
+# list, rtl_valid false - without deleting the row from the priced design
+# space.  A limitation on a stage a tier actually rests on still fails closed.
+
+
+def _packed_batched_target(**overrides) -> PackedKVRuntimeTarget:
+    """A geometrically legal packed + batched selector target."""
+
+    fields = {
+        "mlen": 512,
+        "blen": 2,
+        "hlen": 128,
+        "batch": 1,
+        "kv_heads": 2,
+        "head_dim": 128,
+        "block_size": 8,
+        "selector_bits": 4,
+        "packed_kv": True,
+        "batched_attention": True,
+    }
+    fields.update(overrides)
+    return PackedKVRuntimeTarget(**fields)
+
+
+def _selector_traffic_ledger() -> tuple[tuple[str, float], ...]:
+    return tuple(
+        (key, 1.0 if key == "weight_element_read_bytes" else 0.0)
+        for key in sorted(PHYSICAL_TRAFFIC_KEYS)
+    )
+
+
+def _selector_observation(
+    *,
+    supported: bool,
+    issue_codes: tuple[str, ...],
+    blocking_issue_codes: tuple[str, ...],
+    recorded_issue_codes: tuple[str, ...],
+) -> evaluation.SimulatorObservation:
+    """One priced-shape observation carrying a chosen capability record."""
+
+    return evaluation.SimulatorObservation(
+        profile_id="profile-selector-contract",
+        candidate_id="candidate-selector-contract",
+        tpot_ms=10.0,
+        tps=100.0,
+        total_time_s=0.08,
+        analytical_area_mm2=50.0,
+        traffic=PhysicalTraffic(
+            weight_bytes=1.0,
+            activation_bytes=0.0,
+            kv_read_bytes=0.0,
+            kv_write_bytes=0.0,
+        ),
+        capacity=CapacityBreakdown(
+            weight_bytes=1,
+            kv_cache_bytes=0,
+            runtime_bytes=0,
+            available_bytes=1_000,
+        ),
+        algorithmic_bottleneck="memory",
+        realized_bottleneck="memory",
+        frac_algorithmic_memory_bound=1.0,
+        frac_realized_memory_bound=1.0,
+        frac_serialization_bound=0.0,
+        generated_tokens_per_step=1,
+        decode_steps=8,
+        timing_mode="rtl_serialized",
+        timing_calibrated=True,
+        timing_evidence_id="timing-selector-contract",
+        timing_reason="timing_calibrated_emulator_tier",
+        execution_mode=LEGACY_AGGREGATE_BANDWIDTH_MODE,
+        compiler_trace_timing=None,
+        kv_layout=evaluation.KV_LAYOUT,
+        layout_id="layout-selector-contract",
+        capacity_model="capacity-selector-contract",
+        runtime_feasible=True,
+        max_batch=1,
+        max_resident_batch=1,
+        max_synchronous_batch=1,
+        max_runtime_batch=1,
+        fits_onchip_sram=True,
+        vector_sram_capacity_bytes=1,
+        vector_sram_required_bytes=1,
+        matrix_sram_capacity_bytes=1,
+        matrix_sram_required_bytes=1,
+        hbm_traffic_per_batch_step=_selector_traffic_ledger(),
+        hbm_traffic_per_generated_token=_selector_traffic_ledger(),
+        traffic_ledger_id="traffic-selector-contract",
+        packedkv_selector_supported=supported,
+        packedkv_selector_capability_id="packedkv-selector-capability-test",
+        packedkv_selector_issue_codes=issue_codes,
+        packedkv_selector_blocking_issue_codes=blocking_issue_codes,
+        packedkv_selector_recorded_issue_codes=recorded_issue_codes,
+        bandwidth_calibration_id="bandwidth-selector-contract",
+        total_hbm_bytes=8.0,
+        events=(
+            DecodeEvent("LINEAR:MXINT8xMXINT8", 1, 512, 2),
+            DecodeEvent("UNMODELED:LM_HEAD_BF16", 1, 512, 2),
+        ),
+        output_head_location=evaluation.DECODE_BF16_HEAD,
+        system_area_mm2=50.0,
+        area_evidence_tier="analytical_uncalibrated",
+        logic_area_mm2=25.0,
+    )
+
+
+def _selector_evaluation(
+    observation: evaluation.SimulatorObservation,
+) -> HardwareEvaluation:
+    """Drive the fail-closed evaluator over one injected observation."""
+
+    entry = next(
+        row
+        for row in _synthetic_manifest().entries
+        if (
+            row.profile.kind == PROFILE_KIND_QUANTIZED
+            and row.legality.hardware_candidate
+        )
+    )
+    candidate = HardwareCandidate(
+        mlen=512,
+        blen=2,
+        vlen=512,
+        hlen=128,
+        batch=1,
+        hbm_channels=8,
+        hbm_generation="HBM2",
+        chip_count=1,
+        tp=1,
+        kvp=1,
+        link_ports=0,
+        sram_policy="streaming",
+    )
+    bound = replace(
+        observation,
+        profile_id=entry.profile_id,
+        candidate_id=candidate.candidate_id,
+    )
+
+    class StubBackend:
+        provenance = {"backend": "selector-capability-contract"}
+
+        @staticmethod
+        def evaluate(*_args, **_kwargs):
+            return bound
+
+    evaluator = evaluation.ProductionHardwareEvaluator(
+        StubBackend(),
+        evaluation.HardwareWorkload(
+            input_seq=16,
+            output_seq=8,
+            stride=1,
+            runtime_hbm_reserve_bytes=536_870_912,
+        ),
+        publication_timing_tier=STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
+    )
+    return evaluator(
+        entry,
+        candidate,
+        {
+            "state": "succeeded",
+            "result": {"mean_nll": 1.0, "token_count": 64},
+        },
+    )
+
+
+def test_declared_tiers_never_require_the_recorded_stages() -> None:
+    # The whole gate rests on this: no publication tier asks for RTL or DC
+    # validity, so no RTL-or-DC-only limitation may withhold a price.
+    assert set(PRICING_BLOCKING_STAGES) & set(PRICING_RECORDED_STAGES) == set()
+    for tier, required in TIMING_TIER_REQUIRED_VALIDITY.items():
+        recorded_only = {
+            f"{stage}_valid" for stage in PRICING_RECORDED_STAGES
+        } | {"dc_calibrated"}
+        assert not set(required) & recorded_only, tier
+        assert set(required) <= {
+            f"{stage}_valid" for stage in PRICING_BLOCKING_STAGES
+        }, tier
+
+
+def test_mxfp_packed_batched_profile_is_recorded_and_still_priced() -> None:
+    # E4M3 is the best-measured hardware-legal format in the numerical screen
+    # and it is MXFP, so the batched selector's MXINT-only implementation is
+    # precisely the limitation that must not delete it.  (E3M4 scores well too
+    # but is excluded by an independent and correct legality rule: it is not a
+    # HARDWARE_MXFP_FORMATS operand at all.)
+    for token in ("E4M3", "E5M2"):
+        profile = DecodePrecisionProfile.quantized(
+            token,
+            token,
+            token,
+            "FP_E3M2",
+        )
+        capability = evaluate_stack_capability(profile, _packed_batched_target())
+        codes = tuple(issue.code for issue in capability.issues)
+        assert codes == ("rtl_batched_mxfp_unsupported",)
+        assert all(issue.stages == ("rtl",) for issue in capability.issues)
+        # Recorded, never required.
+        assert capability.blocking_issues == ()
+        assert capability.prices_at_publication_tier is True
+        assert tuple(
+            issue.code for issue in capability.recorded_issues
+        ) == codes
+        # The row still carries the RTL failure in its validity floor.
+        assert capability.validity_floor.rtl_valid is False
+        assert capability.validity_floor.compiler_valid is None
+        assert capability.validity_floor.emulator_valid is None
+        assert capability.stage_support["rtl"] is False
+        assert capability.stage_support["compiler"] is True
+        assert capability.stage_support["emulator"] is True
+
+    observation = _selector_observation(
+        supported=True,
+        issue_codes=("rtl_batched_mxfp_unsupported",),
+        blocking_issue_codes=(),
+        recorded_issue_codes=("rtl_batched_mxfp_unsupported",),
+    )
+    # The exhaustive issue list survives on the row; only the pricing verdict
+    # is stage-scoped.
+    assert observation.packedkv_selector_issue_codes == (
+        "rtl_batched_mxfp_unsupported",
+    )
+    outcome = _selector_evaluation(observation)
+    # The row travels all the way past the selector gate to the next real
+    # gate; the recorded RTL limitation no longer terminates it.  The
+    # decode-local output head is no longer a terminal gate either, so the
+    # next unmet requirement is the stub's absent admission evidence.
+    assert outcome.error_code == "admission_correctness_unverified"
+
+
+def test_blocking_stage_selector_limits_still_fail_closed() -> None:
+    # A misaligned packed geometry is a compiler/emulator-stage limitation:
+    # the tiers rest on those stages, so the point must remain unrankable.
+    profile = DecodePrecisionProfile.quantized(
+        "MXINT8",
+        "MXINT8",
+        "MXINT8",
+        "FP_E3M2",
+    )
+    capability = evaluate_stack_capability(
+        profile,
+        _packed_batched_target(head_dim=64),
+    )
+    blocking = tuple(issue.code for issue in capability.blocking_issues)
+    assert "packedkv_selector_stride" in blocking
+    assert capability.prices_at_publication_tier is False
+    assert capability.validity_floor.compiler_valid is False
+    assert capability.validity_floor.emulator_valid is False
+
+    observation = _selector_observation(
+        supported=False,
+        issue_codes=("packedkv_selector_stride",),
+        blocking_issue_codes=("packedkv_selector_stride",),
+        recorded_issue_codes=(),
+    )
+    outcome = _selector_evaluation(observation)
+    assert outcome.error_code == "packedkv_selector_unsupported"
+    assert outcome.error_message == (
+        "PackedKV selector capability failed: packedkv_selector_stride"
+    )
+
+
+def test_selector_observation_contract_rejects_inconsistent_evidence() -> None:
+    # supported must remain exactly the emptiness of the BLOCKING codes, the
+    # partition must stay exhaustive, and the lists must stay canonical.
+    with pytest.raises(ValueError, match="capability evidence is inconsistent"):
+        _selector_observation(
+            supported=True,
+            issue_codes=("packedkv_selector_stride",),
+            blocking_issue_codes=("packedkv_selector_stride",),
+            recorded_issue_codes=(),
+        )
+    with pytest.raises(ValueError, match="capability evidence is inconsistent"):
+        _selector_observation(
+            supported=False,
+            issue_codes=("rtl_batched_mxfp_unsupported",),
+            blocking_issue_codes=(),
+            recorded_issue_codes=("rtl_batched_mxfp_unsupported",),
+        )
+    with pytest.raises(ValueError, match="partition exhaustively"):
+        # Dropping an RTL limitation from the recorded list is exactly the
+        # silent loss of evidence this contract exists to prevent.
+        _selector_observation(
+            supported=True,
+            issue_codes=("rtl_batched_mxfp_unsupported",),
+            blocking_issue_codes=(),
+            recorded_issue_codes=(),
+        )
+    with pytest.raises(ValueError, match="blocking and recorded"):
+        _selector_observation(
+            supported=False,
+            issue_codes=("packedkv_selector_stride",),
+            blocking_issue_codes=("packedkv_selector_stride",),
+            recorded_issue_codes=("packedkv_selector_stride",),
+        )
+    with pytest.raises(ValueError, match="unique and sorted"):
+        _selector_observation(
+            supported=False,
+            issue_codes=("packedkv_selector_stride", "packedkv_block_alignment"),
+            blocking_issue_codes=(
+                "packedkv_selector_stride",
+                "packedkv_block_alignment",
+            ),
+            recorded_issue_codes=(),
+        )
+
+
+def _admission_status_dict(**overrides: object) -> dict[str, object]:
+    """A serialized admission status shaped like the live workspace receipt.
+
+    The live receipt is prepared under the content-addressed recompute policy,
+    which persists nothing; the persisted contract is the other declared
+    policy. Both must read as valid evidence, and nothing else may.
+    """
+
+    document_count = 48
+    artifact_count = document_count * (len(DECODE_FORMATS) + 1)
+    status: dict[str, object] = {
+        "schema_version": ADMISSION_CORRECTNESS_SCHEMA,
+        "scope": ADMISSION_CORRECTNESS_SCOPE,
+        "passed": True,
+        "failures": [],
+        "receipt_sha256": "a" * 64,
+        "evidence_id": "admission-correctness-" + "b" * 64,
+        "manifest_hash": "c" * 64,
+        "run_plan_hash": "d" * 64,
+        "prompt_manifest_hash": "e" * 64,
+        "admission_contract_id": "packedkv-admission-2c4458e60da527dd",
+        "admission_index_hash": "f" * 64,
+        "numerical_validation_hash": "0" * 64,
+        "admission_code_revision": "1" * 64,
+        "runtime_environment_fingerprint": "2" * 64,
+        "sample_bundle_hash": "3" * 64,
+        "layout_id": "packed-gqa-mlen1024-block8-native-encoding",
+        "persistence_contract": RECOMPUTABLE_ADMISSION_POLICY,
+        "formats": list(DECODE_FORMATS),
+        "document_count": document_count,
+        "artifact_count": artifact_count,
+        "tensor_count": artifact_count * 64,
+        "persisted_bytes": 0,
+        "projected_cold_artifact_bytes": 36546648474,
+        "projected_numerical_view_bytes": 43098611184,
+        "source_dtype": "BF16",
+        "block_size": MX_BLOCK_SIZE,
+        "steady_state_tpot_included": False,
+        "hardware_latency_calibrated": False,
+        "hardware_energy_calibrated": False,
+        "ttft_rankable": False,
+        "admission_energy_rankable": False,
+    }
+    status.update(overrides)
+    return status
+
+
+def test_recomputable_admission_status_reads_as_valid_evidence() -> None:
+    # The recompute policy rebuilds every packed plane per format and
+    # deliberately persists nothing. Requiring persisted_bytes > 0 here
+    # rejected every receipt the pipeline actually prepares, which failed
+    # 100% of study rows with admission_correctness_unverified.
+    assert admission_correctness_status_valid(_admission_status_dict())
+
+
+def test_persisted_admission_status_reads_as_valid_evidence() -> None:
+    assert admission_correctness_status_valid(
+        _admission_status_dict(
+            persistence_contract=ADMISSION_PERSISTENCE_CONTRACT,
+            persisted_bytes=36546648474,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # Each policy pins its own persisted-byte expectation; crossing them
+        # is unproven evidence, not a relaxation.
+        {"persisted_bytes": 1},
+        {
+            "persistence_contract": ADMISSION_PERSISTENCE_CONTRACT,
+            "persisted_bytes": 0,
+        },
+        # An undeclared policy has no persisted-byte expectation at all.
+        {"persistence_contract": "content_addressed_recompute"},
+        {"persistence_contract": None},
+        {"persistence_contract": ""},
+        # A receipt that projects nothing to rebuild proves nothing; under the
+        # persisted contract this was already implied by persisted_bytes > 0.
+        {"projected_cold_artifact_bytes": 0},
+        {"projected_numerical_view_bytes": 0},
+        # Booleans are not byte counts.
+        {"persisted_bytes": False},
+    ],
+)
+def test_admission_status_validity_stays_fail_closed(
+    overrides: dict[str, object],
+) -> None:
+    assert not admission_correctness_status_valid(
+        _admission_status_dict(**overrides)
+    )
+
+
+def test_admission_status_validity_still_requires_full_identity() -> None:
+    # Widening the persistence policy must not widen anything else.
+    for field in (
+        "receipt_sha256",
+        "manifest_hash",
+        "run_plan_hash",
+        "prompt_manifest_hash",
+        "admission_index_hash",
+        "numerical_validation_hash",
+        "admission_code_revision",
+        "runtime_environment_fingerprint",
+        "sample_bundle_hash",
+    ):
+        assert not admission_correctness_status_valid(
+            _admission_status_dict(**{field: None})
+        ), field
+        assert not admission_correctness_status_valid(
+            _admission_status_dict(**{field: "not-a-sha256"})
+        ), field
+    assert not admission_correctness_status_valid(
+        _admission_status_dict(passed=False)
+    )
+    assert not admission_correctness_status_valid(
+        _admission_status_dict(failures=["boom"])
+    )
+    assert not admission_correctness_status_valid(
+        _admission_status_dict(scope="hardware_energy")
+    )
+
+
+def _write_admission_receipt(
+    path: Path,
+    *,
+    manifest_hash: str,
+) -> Path:
+    """A receipt that is well-formed exactly up to its manifest identity.
+
+    The identity comparison is the first check the loader makes, so a receipt
+    that stops being valid immediately afterwards still proves whether that
+    comparison fired and which hash it fired against.
+    """
+
+    body = {
+        "schema_version": admission_cost.ADMISSION_PREPARATION_SCHEMA,
+        "manifest_hash": manifest_hash,
+    }
+    body["content_hash"] = admission_cost._content_hash(
+        {key: value for key, value in body.items() if key != "content_hash"}
+    )
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def test_admission_receipt_is_bound_to_the_hash_it_is_given(
+    tmp_path: Path,
+) -> None:
+    # Admission is a workspace-level operation, so the evaluator validates the
+    # receipt against the workspace manifest that sits beside it, never the
+    # per-shard manifest passed as --manifest. This check is what makes that
+    # binding meaningful; it must stay exact in both directions.
+    workspace_hash = "e" * 64
+    shard_hash = "9" * 64
+    receipt = _write_admission_receipt(
+        tmp_path / "admission_preparation.json",
+        manifest_hash=workspace_hash,
+    )
+
+    mismatched = admission_cost.load_admission_correctness_evidence(
+        receipt,
+        manifest_hash=shard_hash,
+    )
+    assert not mismatched.passed
+    assert mismatched.failures == (
+        "ValueError: admission receipt manifest identity mismatch",
+    )
+
+    # The matching hash gets past the identity gate and fails later on the
+    # parts this stub receipt deliberately omits, which is how we know the
+    # gate is hash-specific rather than always-on.
+    matched = admission_cost.load_admission_correctness_evidence(
+        receipt,
+        manifest_hash=workspace_hash,
+    )
+    assert not matched.passed
+    assert "manifest identity mismatch" not in matched.failures[0]
+
+
+def test_admission_receipt_rejects_a_malformed_manifest_hash(
+    tmp_path: Path,
+) -> None:
+    receipt = _write_admission_receipt(
+        tmp_path / "admission_preparation.json",
+        manifest_hash="f" * 64,
+    )
+    for bad in ("", "not-a-sha256", "F" * 64, "f" * 63):
+        status = admission_cost.load_admission_correctness_evidence(
+            receipt,
+            manifest_hash=bad,
+        )
+        assert not status.passed, bad
+        assert status.failures[0].startswith("ValueError:"), bad
+
+
+# --- Study configuration parity ---------------------------------------------
+
+
+def test_study_configs_declare_the_same_calibrated_hbm_and_accuracy_budgets() -> None:
+    """Both studies search the receipted HBM2 groups under one accuracy budget.
+
+    The Llama grid previously searched a single HBM channel group and declared
+    no accuracy budget, which made its promotion record carry a null
+    `dual_accuracy_frontiers` and its Pareto figure render no envelopes - an
+    absent disclosure rather than a narrower claim.
+    """
+
+    repository = Path(__file__).resolve().parents[2]
+    configs = {
+        name: json.loads(
+            (repository / "decode_dse" / "configs" / f"{name}.json")
+            .read_text(encoding="utf-8")
+        )
+        for name in ("llama3_1_8b", "qwen3_32b")
+    }
+    budgets = {
+        "strict_relative_perplexity": 1.01,
+        "relaxed_relative_perplexity": 1.05,
+    }
+    for name, config in configs.items():
+        space = config["hardware_space"]
+        assert space["HBM_GENERATION"] == "HBM2", name
+        assert space["HBM_CHANNELS"] == [8, 16, 32], name
+        assert config["accuracy_budgets"] == budgets, name
+        # A per-config baseline channel count nothing reads is a claim with no
+        # consumer; the searched channel set is the only declaration.
+        assert "baseline_hbm_channels" not in config, name
+
+
+# --- Simulator checkout resolution ------------------------------------------
+
+
+def test_simulator_root_resolution_is_explicit_and_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A study must record which simulator checkout priced it.
+
+    Falling back to a sibling directory named `PLENA_Simulator` lets a
+    worktree price against a different checkout than the one under test, and
+    without the resolved root in provenance the two outcomes are
+    indistinguishable after the fact.
+    """
+
+    from decode_dse.hardware import power_bridge
+
+    checkout = tmp_path / "simulator-checkout"
+    (checkout / "analytic_models" / "disagg_serve").mkdir(parents=True)
+
+    monkeypatch.setenv(power_bridge.SIMULATOR_ROOT_ENV_VAR, str(checkout))
+    resolved = power_bridge.resolve_simulator_root()
+    assert resolved.root == checkout.resolve()
+    assert resolved.source == power_bridge.SIMULATOR_ROOT_FROM_ENVIRONMENT
+    assert resolved.to_dict() == {
+        "simulator_root": str(checkout.resolve()),
+        "simulator_root_source": power_bridge.SIMULATOR_ROOT_FROM_ENVIRONMENT,
+    }
+    # Every reader of the simulator tree resolves through the same rule.
+    assert evaluation.simulator_root() == checkout.resolve()
+
+    monkeypatch.setenv(power_bridge.SIMULATOR_ROOT_ENV_VAR, "   ")
+    with pytest.raises(ValueError, match="empty value"):
+        power_bridge.resolve_simulator_root()
+
+    monkeypatch.setenv(
+        power_bridge.SIMULATOR_ROOT_ENV_VAR,
+        str(tmp_path / "not-a-checkout"),
+    )
+    with pytest.raises(FileNotFoundError, match="not a simulator checkout"):
+        power_bridge.resolve_simulator_root()
+
+    monkeypatch.delenv(power_bridge.SIMULATOR_ROOT_ENV_VAR, raising=False)
+    sibling = Path(power_bridge.__file__).resolve().parents[3] / "PLENA_Simulator"
+    if (sibling / "analytic_models" / "disagg_serve").is_dir():
+        implicit = power_bridge.resolve_simulator_root()
+        assert implicit.root == sibling.resolve()
+        assert (
+            implicit.source
+            == power_bridge.SIMULATOR_ROOT_FROM_SIBLING_DEFAULT
+        )
+    else:
+        with pytest.raises(FileNotFoundError):
+            power_bridge.resolve_simulator_root()
+
+
+def test_analytic_power_provenance_records_the_resolved_simulator_root() -> None:
+    from decode_dse.hardware import power_bridge
+
+    provenance = power_bridge.analytic_power_provenance()
+    resolved = power_bridge.resolve_simulator_root()
+    assert provenance["simulator_root"] == str(resolved.root)
+    assert provenance["simulator_root_source"] == resolved.source
+    assert provenance["energy_tier"] == "analytic_anchored"
+
+
+# --- Admission persistence policy naming ------------------------------------
+#
+# The admission persistence policy is one concept written under three key
+# names: `persistence_policy` at the top level of the preparation receipt and
+# its index, `persistence_contract` inside the persisted-contract resource
+# projection, and `policy` inside the recomputable resource projection. All
+# three carry values from the same two-element vocabulary, so they are read
+# through one accessor that fails closed on anything else. The on-disk
+# artifacts are untouched.
+
+
+def test_admission_policy_reads_every_documented_key_name() -> None:
+    for key in admission_cost.ADMISSION_POLICY_KEYS:
+        assert (
+            admission_cost.admission_persistence_policy(
+                {key: RECOMPUTABLE_ADMISSION_POLICY}
+            )
+            == RECOMPUTABLE_ADMISSION_POLICY
+        )
+        assert (
+            admission_cost.admission_persistence_policy(
+                {key: ADMISSION_PERSISTENCE_CONTRACT}
+            )
+            == ADMISSION_PERSISTENCE_CONTRACT
+        )
+    # One document may spell the policy more than once, but only consistently.
+    assert (
+        admission_cost.admission_persistence_policy(
+            {
+                "persistence_policy": RECOMPUTABLE_ADMISSION_POLICY,
+                "policy": RECOMPUTABLE_ADMISSION_POLICY,
+            }
+        )
+        == RECOMPUTABLE_ADMISSION_POLICY
+    )
+
+
+def test_admission_policy_fails_closed_on_unknown_or_conflicting_values() -> None:
+    with pytest.raises(ValueError, match="unknown admission persistence policy"):
+        admission_cost.admission_persistence_policy(
+            {"persistence_policy": "content_addressed_recompute"}
+        )
+    with pytest.raises(ValueError, match="declared inconsistently"):
+        admission_cost.admission_persistence_policy(
+            {
+                "persistence_policy": RECOMPUTABLE_ADMISSION_POLICY,
+                "policy": ADMISSION_PERSISTENCE_CONTRACT,
+            }
+        )
+    with pytest.raises(ValueError, match="undeclared"):
+        admission_cost.admission_persistence_policy({})
+    assert (
+        admission_cost.admission_persistence_policy({}, required=False) is None
+    )
+    assert (
+        admission_cost.admission_persistence_policy(
+            {"persistence_policy": None},
+            required=False,
+        )
+        is None
+    )
+    with pytest.raises(TypeError, match="must be read from an object"):
+        admission_cost.admission_persistence_policy(
+            RECOMPUTABLE_ADMISSION_POLICY
+        )
+
+
+def test_admission_cost_exports_its_recompute_policy() -> None:
+    assert "RECOMPUTABLE_ADMISSION_POLICY" in admission_cost.__all__
+    assert "admission_persistence_policy" in admission_cost.__all__
+
+    from decode_dse.hardware import selection
+
+    assert "dual_accuracy_frontiers" in selection.__all__
+
+
+# --- decode-local BF16 output head ------------------------------------------
+#
+# The headline output-head boundary is the decode-local BF16 head: its weights
+# and its per-decode-step traffic are charged to the decode chip's own physical
+# ledger, and only its compute is idealized.  These tests pin the three things
+# that keeps honest: the idealization is always disclosed on the row, the
+# decode chip actually pays for the head, and the measured remote service
+# remains available as a comparison arm at its own evidence tier.
+
+
+def _head_service_calibration(tmp_path: Path):
+    """A passing synthetic remote-head calibration for the comparison arm."""
+
+    path, model = _assembled_synthetic_head_artifact(tmp_path)
+    status = load_bf16_head_service_artifact(
+        path,
+        model_name=model["model_name"],
+        model_revision=model["model_revision"],
+        hidden_size=model["hidden_size"],
+        vocab_size=model["vocab_size"],
+        tie_embeddings=model["tie_embeddings"],
+        required_batches=(1, 4, 8),
+    )
+    assert status.passed, status.failures
+    return status
+
+
+def _boundary_metrics(
+    *,
+    location: str,
+    head_estimate=None,
+    comparison=None,
+    head_status: Mapping[str, object] | None = None,
+    rankable: bool = True,
+    energy=None,
+    system_calibration_id: str | None = None,
+) -> HardwareMetrics:
+    """One priced row at the requested output-head boundary."""
+
+    from decode_dse.hardware.design_space import OUTPUT_HEAD_SERVICE_MODES
+
+    tpot_ms = 10.0
+    batch = head_estimate.batch if head_estimate is not None else (
+        comparison.batch if comparison is not None else 1
+    )
+    head_latency_ms = (
+        head_estimate.total_latency_s * 1000.0
+        if head_estimate is not None
+        else 0.0
+    )
+    whole_tpot_ms = tpot_ms + head_latency_ms
+    return HardwareMetrics(
+        tpot_ms=tpot_ms,
+        tps=batch * 1_000.0 / tpot_ms,
+        area_mm2=1.0,
+        traffic=PhysicalTraffic(1.0, 0.0, 0.0, 0.0),
+        capacity=CapacityBreakdown(1, 0, 0, batch),
+        algorithmic_bottleneck="memory",
+        realized_bottleneck="memory",
+        frac_algorithmic_memory_bound=1.0,
+        frac_realized_memory_bound=1.0,
+        frac_serialization_bound=0.0,
+        timing_calibrated=True,
+        timing_evidence_id="timing-" + "a" * 64,
+        timing_reason="calibrated",
+        execution_mode=LEGACY_AGGREGATE_BANDWIDTH_MODE,
+        bandwidth_calibration_id="bandwidth-operating-point-" + "b" * 64,
+        service_mode=OUTPUT_HEAD_SERVICE_MODES[location],
+        output_head_location=location,
+        output_head_status=(
+            dict(head_status)
+            if head_status is not None
+            else (
+                local_head_boundary_status()
+                if location == DECODE_BF16_HEAD
+                else {}
+            )
+        ),
+        output_head_service=head_estimate,
+        output_head_comparison=comparison,
+        whole_model_tpot_ms=whole_tpot_ms if rankable else None,
+        whole_model_tps=(
+            batch * 1_000.0 / whole_tpot_ms if rankable else None
+        ),
+        whole_model_energy=energy,
+        system_calibration_id=system_calibration_id,
+        whole_model_rankable=rankable,
+        publication_timing_tier=(
+            STAGE_CALIBRATED_ANALYTIC_TIMING_TIER if rankable else None
+        ),
+    )
+
+
+def test_local_bf16_head_is_rankable_and_discloses_its_idealization() -> None:
+    metrics = _boundary_metrics(location=DECODE_BF16_HEAD)
+    boundary = metrics.to_dict()["output_head_boundary"]
+
+    # Rankable at the analytic publication tier without any remote endpoint.
+    assert metrics.whole_model_rankable is True
+    assert metrics.publication_timing_tier == (
+        STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+    )
+    # The local head runs inside the decode step the decoder TPOT already
+    # prices, so the whole model adds no serialized latency.
+    assert metrics.whole_model_tpot_ms == metrics.tpot_ms
+    assert metrics.whole_model_tps == metrics.tps
+
+    # The idealization is on the row, named, and machine readable.
+    assert boundary["location"] == DECODE_BF16_HEAD
+    assert boundary["service_mode"] == LOCAL_HEAD_MODE
+    assert boundary["scope_idealizations"] == [
+        LOCAL_HEAD_COMPUTE_IDEALIZATION
+    ]
+    # Nothing here may be mistaken for a measured head.
+    assert boundary["estimate"] is None
+    assert boundary["status"]["passed"] is False
+    assert LOCAL_HEAD_COMPUTE_IDEALIZATION in boundary["status"]["failures"]
+
+
+def test_local_head_disclosure_cannot_be_dropped_or_forged() -> None:
+    # The disclosure is derived from the priced boundary, so a caller can
+    # neither omit it nor attach it to the measured remote service.
+    assert _boundary_metrics(
+        location=DECODE_BF16_HEAD
+    ).output_head_idealizations == (LOCAL_HEAD_COMPUTE_IDEALIZATION,)
+    with pytest.raises(ValueError, match="idealizations must match"):
+        replace(
+            _boundary_metrics(location=DECODE_BF16_HEAD),
+            output_head_location=EXTERNAL_BF16_HEAD,
+            output_head_idealizations=(LOCAL_HEAD_COMPUTE_IDEALIZATION,),
+        )
+
+
+def test_local_head_charges_its_weights_and_traffic_to_the_decode_hbm() -> None:
+    # The whole point of the local boundary: the decode chip pays for the
+    # head's BF16 weights in capacity and re-reads them every decode step.
+    from decode_dse.hardware.power_bridge import _simulator_module
+    from decode_dse.simulator_bridge import _disagg
+
+    dd = _disagg()
+    ledger = _simulator_module("physical_ledger")
+    dims = {
+        "hidden": 4096,
+        "heads": 32,
+        "kv_heads": 8,
+        "head_dim": 128,
+        "layers": 4,
+        "inter": 14336,
+        "vocab": 128256,
+        "tie_embeddings": False,
+        "model_type": "llama",
+        "num_experts": 1,
+        "experts_per_token": 1,
+        "sliding_window": 0,
+        "n_sliding": 0,
+        "n_full": 4,
+        "qk_norm": False,
+    }
+    prec = {
+        "attn_bits": 8.0,
+        "attn_elem": 8,
+        "ffn_bits": 8.0,
+        "ffn_elem": 8,
+        "kv_bits": 8.0,
+        "kv_elem": 8,
+        "block_size": 8,
+    }
+    head_bytes = dims["hidden"] * dims["vocab"] * 2
+
+    assert dd.decoder_owns_output_head(DECODE_BF16_HEAD) is True
+    assert dd.decoder_owns_output_head(EXTERNAL_BF16_HEAD) is False
+
+    with_head = ledger.weight_ledger(dims, prec, include_lm_head=True)
+    without_head = ledger.weight_ledger(dims, prec, include_lm_head=False)
+    capacity_delta = (
+        with_head.resident.total_aligned - without_head.resident.total_aligned
+    )
+    assert capacity_delta >= head_bytes
+
+    step_with = ledger.decode_step_traffic_ledger(
+        dims,
+        prec,
+        context=128,
+        batch=1,
+        mlen=1024,
+        kv_layout="dense_selector",
+        weights=with_head,
+        include_lm_head=True,
+    )
+    step_without = ledger.decode_step_traffic_ledger(
+        dims,
+        prec,
+        context=128,
+        batch=1,
+        mlen=1024,
+        kv_layout="dense_selector",
+        weights=without_head,
+        include_lm_head=False,
+    )
+    assert step_with.read_bytes - step_without.read_bytes >= head_bytes
+
+
+def test_external_head_arm_still_prices_and_stays_measured(
+    tmp_path: Path,
+) -> None:
+    status = _head_service_calibration(tmp_path)
+    estimate = status.calibration.estimate(1)
+    metrics = _boundary_metrics(
+        location=EXTERNAL_BF16_HEAD,
+        head_estimate=estimate,
+        head_status=status.to_dict(),
+    )
+    boundary = metrics.to_dict()["output_head_boundary"]
+
+    assert boundary["location"] == EXTERNAL_BF16_HEAD
+    assert boundary["service_mode"] == HEAD_SERVICE_MODE
+    # The measured arm claims no idealization at all.
+    assert boundary["scope_idealizations"] == []
+    assert boundary["estimate"]["calibration_id"] == estimate.calibration_id
+    # The remote endpoint is a second, serialized device.
+    assert metrics.whole_model_tpot_ms > metrics.tpot_ms
+
+
+def test_head_service_artifact_is_recorded_beside_a_local_headline(
+    tmp_path: Path,
+) -> None:
+    status = _head_service_calibration(tmp_path)
+    estimate = status.calibration.estimate(1)
+    metrics = _boundary_metrics(
+        location=DECODE_BF16_HEAD,
+        comparison=estimate,
+    )
+    boundary = metrics.to_dict()["output_head_boundary"]
+
+    # Both placements stay reportable from one row, and the comparison arm is
+    # kept strictly out of the priced cost.
+    assert boundary["location"] == DECODE_BF16_HEAD
+    assert boundary["estimate"] is None
+    assert boundary["comparison_estimate"]["calibration_id"] == (
+        estimate.calibration_id
+    )
+    assert metrics.whole_model_tpot_ms == metrics.tpot_ms
+    with pytest.raises(ValueError, match="belongs to the local boundary"):
+        _boundary_metrics(
+            location=EXTERNAL_BF16_HEAD,
+            head_estimate=estimate,
+            comparison=estimate,
+            head_status=status.to_dict(),
+        )
+
+
+def test_local_head_energy_charges_no_external_idle_power(
+    tmp_path: Path,
+) -> None:
+    from decode_dse.hardware.design_space import CalibratedEnergy
+
+    decoder = CalibratedEnergy(
+        calibration_id="analytic-decode-energy-" + "a" * 64,
+        compute_j=1.0,
+        vector_j=0.0,
+        sram_j=0.0,
+        hbm_j=1.0,
+        leakage_j=0.01,
+        duration_s=0.01,
+        energy_tier="analytic_anchored",
+        energy_id="analytic-decode-energy-" + "a" * 64,
+        token_latency_s=0.01,
+    )
+    estimate = _head_service_calibration(tmp_path).calibration.estimate(1)
+
+    external, external_id = evaluation._whole_model_energy(
+        decoder,
+        estimate,
+        decoder_tpot_ms=10.0,
+        batch=1,
+    )
+    local, local_id = evaluation._whole_model_energy(
+        decoder,
+        None,
+        decoder_tpot_ms=10.0,
+        batch=1,
+    )
+
+    # Reserving a whole external endpoint charges its idle draw across the
+    # decode step; a decode chip that owns its own head has no second device
+    # to provision, so no idle power is charged at all.
+    assert external.leakage_j > decoder.leakage_j
+    assert local.leakage_j == decoder.leakage_j
+    assert local.total_j == decoder.total_j
+    assert local.total_j < external.total_j
+    # The two systems can never share an identity.
+    assert local_id != external_id
+    assert local_id == local_head_system_calibration_id(
+        decoder.calibration_id
+    )
+    assert local_id.startswith("decode-local-head-system-")
+
+
+def test_study_config_declares_the_local_head_as_the_headline() -> None:
+    for name in ("llama3_1_8b", "qwen3_32b"):
+        config = json.loads(
+            (
+                Path(evaluation.__file__).resolve().parents[1]
+                / "configs"
+                / f"{name}.json"
+            ).read_text(encoding="utf-8")
+        )
+        contract = config["output_head_contract"]
+        assert contract["headline_location"] == DECODE_BF16_HEAD
+        assert contract["headline_idealizations"] == [
+            LOCAL_HEAD_COMPUTE_IDEALIZATION
+        ]
+        # The measured service is retained as the comparison arm.
+        assert contract["comparison_location"] == EXTERNAL_BF16_HEAD
+        assert evaluation.config_output_head_location(config) == (
+            DECODE_BF16_HEAD
+        )
+        # The evaluator accepts the declared contract unchanged.
+        evaluation._validate_system_boundary_config(config)
+
+
+# --- publication eligibility rests on the blocking stages --------------------
+#
+# The declared contract is that RTL evidence is recorded, never required: both
+# publication timing tiers rest on compiler-emitted programs executed under the
+# calibrated emulator contract (see TIMING_TIER_REQUIRED_VALIDITY).  The
+# deployment gate must therefore admit an RTL-unvalidated candidate while still
+# refusing a candidate whose *blocking* stages are missing or failed.
+
+
+def _publication_fixture(
+    *,
+    validity: StackValidity,
+    output_head_location: str = EXTERNAL_BF16_HEAD,
+):
+    """One complete publication set, parameterised on validity and boundary."""
+
+    power_id = "analytic-decode-energy-" + "a" * 64
+    head_id = "bf16-head-service-" + "c" * 64
+    head_provenance = "bf16-head-provenance-" + "d" * 64
+    timing = _TimingEvidence("timing-" + "e" * 64)
+    head = _HeadEvidence(head_id, head_provenance)
+    local = output_head_location == DECODE_BF16_HEAD
+    system_id = (
+        local_head_system_calibration_id(power_id)
+        if local
+        else composite_system_calibration_id(
+            power_id,
+            head_id,
+            head_provenance,
+        )
+    )
+
+    def candidate(role: str, index: int) -> PublicationCandidate:
+        return PublicationCandidate(
+            evaluation_class=role,
+            profile_id=f"profile-{index}",
+            candidate_id=f"candidate-{index}",
+            profile_kind="quantized",
+            perplexity=10.0,
+            tpot_ms=2.0,
+            energy_per_token_j=0.5 - index * 0.01,
+            energy_tier="analytic_anchored",
+            validity=validity,
+            power_calibration_id=power_id,
+            cost_scope="whole_model",
+            system_calibration_id=system_id,
+            head_service_calibration_id=None if local else head_id,
+            output_head_location=output_head_location,
+            output_head_idealizations=(
+                (LOCAL_HEAD_COMPUTE_IDEALIZATION,) if local else ()
+            ),
+            whole_model_rankable=True,
+            timing_calibrated=True,
+            timing_evidence_id=timing.evidence_id,
+            task_delta_lower_ci=(("gsm8k", 0.0), ("ifeval", 0.0)),
+            ruler_scores=tuple(
+                (length, 1.0, 1.0)
+                for length in (4096, 8192, 16384, 32768)
+            ),
+        )
+
+    reference = PublicationCandidate(
+        evaluation_class="bf16_reference",
+        profile_id="reference",
+        candidate_id="accuracy-only",
+        profile_kind=PROFILE_KIND_BF16_REFERENCE,
+        perplexity=10.0,
+        tpot_ms=None,
+        energy_per_token_j=None,
+        validity=StackValidity(software_valid=True),
+        hardware_candidate=False,
+    )
+    values = (
+        reference,
+        candidate("uniform_i8", 1),
+        candidate("uniform_i4", 2),
+        candidate("pareto_candidate", 3),
+    )
+    return values, timing, (None if local else head)
+
+
+def test_publication_admits_a_candidate_whose_rtl_is_unvalidated() -> None:
+    for rtl_valid in (False, None):
+        values, timing, head = _publication_fixture(
+            validity=StackValidity(
+                software_valid=True,
+                compiler_valid=True,
+                emulator_valid=True,
+                rtl_valid=rtl_valid,
+                dc_calibrated=None,
+            ),
+        )
+        decision = select_final_deployment(
+            values,
+            calibration=None,
+            timing_evidence=timing,
+            head_service_evidence=head,
+        )
+        assert decision.global_failures == (), decision.global_failures
+        assert decision.selected is values[-1]
+        failures = dict(decision.candidate_failures)
+        assert failures["profile-3/candidate-3"] == ()
+
+        selected = decision.selected
+        # Admitted, and the gap is disclosed rather than hidden.
+        assert selected.priced_evidence_complete is True
+        assert selected.rests_on_unimplemented_rtl_path is True
+        assert selected.all_stages_valid is False
+        record = selected.to_dict()
+        assert record["rests_on_unimplemented_rtl_path"] is True
+        assert record["all_stages_valid"] is False
+        assert record["recorded_validity"] == {
+            "rtl_valid": rtl_valid,
+            "dc_calibrated": None,
+        }
+
+
+def _stack(**overrides: Any) -> StackValidity:
+    fields = {
+        "software_valid": True,
+        "compiler_valid": True,
+        "emulator_valid": True,
+        "rtl_valid": True,
+        "dc_calibrated": True,
+    }
+    fields.update(overrides)
+    return StackValidity(**fields)
+
+
+def test_publication_still_rejects_blocking_stage_failures() -> None:
+    """A measured failure, and unmeasured software validity, still exclude.
+
+    Software validity is not geometry scoped, so its absence is a genuine gap.
+    A measured ``False`` on the compiler or emulator stage is evidence about
+    the point itself and excludes it regardless of the pricing model.
+    """
+
+    cases = (
+        ("software_valid", False),
+        ("software_valid", None),
+        ("compiler_valid", False),
+        ("emulator_valid", False),
+    )
+    for field, value in cases:
+        values, timing, head = _publication_fixture(
+            validity=_stack(**{field: value}),
+        )
+        decision = select_final_deployment(
+            values,
+            calibration=None,
+            timing_evidence=timing,
+            head_service_evidence=head,
+        )
+        assert decision.selected is None
+        failures = dict(decision.candidate_failures)
+        assert "cross_stack_validity" in failures[
+            "profile-3/candidate-3"
+        ], (field, value)
+
+
+def test_publication_admits_unmeasured_compiler_and_emulator_coverage() -> None:
+    """Unmeasured individual validation is disclosed, never disqualifying.
+
+    Compiler and emulator evidence is scoped to the geometry it was measured
+    at, so a candidate priced away from that geometry carries ``None``.  It is
+    eligible because the pricing model it was priced by is validated, and its
+    record says plainly that it was not individually validated.
+    """
+
+    values, timing, head = _publication_fixture(
+        validity=_stack(compiler_valid=None, emulator_valid=None),
+    )
+    decision = select_final_deployment(
+        values,
+        calibration=None,
+        timing_evidence=timing,
+        head_service_evidence=head,
+    )
+    assert decision.global_failures == (), decision.global_failures
+    selected = decision.selected
+    assert selected is values[-1]
+    assert dict(decision.candidate_failures)["profile-3/candidate-3"] == ()
+    assert selected.priced_evidence_complete is True
+    assert selected.individually_validated is False
+    # The strict record never silently promotes an unmeasured stage.
+    assert selected.all_stages_valid is False
+    record = selected.to_dict()
+    assert record["individually_validated"] is False
+    assert record["individual_validation_stages"] == {
+        "compiler": None,
+        "emulator": None,
+    }
+    assert record["all_stages_valid"] is False
+    assert record["admission_basis"] == ADMISSION_BASIS
+
+
+def test_strict_subset_selector_returns_only_individually_validated() -> None:
+    """Both framings are selectable from the same admitted population."""
+
+    validated, timing, head = _publication_fixture(validity=_stack())
+    unvalidated, _, _ = _publication_fixture(
+        validity=_stack(compiler_valid=None, emulator_valid=None),
+    )
+    population = (*validated, *unvalidated)
+    strict = individually_validated_candidates(population)
+    assert strict
+    assert len(strict) < len(population)
+    assert all(value.individually_validated for value in strict)
+    assert all(
+        value.validity.compiler_valid is True
+        and value.validity.emulator_valid is True
+        for value in strict
+    )
+    # Every strict candidate is also admitted under the model-validated view.
+    assert all(value.priced_evidence_complete for value in strict)
+
+
+def test_dc_calibrated_energy_still_requires_measured_dc_validity() -> None:
+    # RTL is never required, but a candidate that claims the DC-calibrated
+    # energy tier must actually carry DC validity: there the tier is the claim.
+    values, timing, head = _publication_fixture(
+        validity=StackValidity(
+            software_valid=True,
+            compiler_valid=True,
+            emulator_valid=True,
+            rtl_valid=None,
+            dc_calibrated=None,
+        ),
+    )
+    claimed = replace(values[-1], energy_tier="dc_calibrated")
+    assert claimed.priced_evidence_complete is False
+    assert values[-1].priced_evidence_complete is True
+
+
+def test_publication_admits_the_local_head_without_a_remote_service() -> None:
+    values, timing, head = _publication_fixture(
+        validity=StackValidity(
+            software_valid=True,
+            compiler_valid=True,
+            emulator_valid=True,
+            rtl_valid=False,
+            dc_calibrated=None,
+        ),
+        output_head_location=DECODE_BF16_HEAD,
+    )
+    assert head is None
+    decision = select_final_deployment(
+        values,
+        calibration=None,
+        timing_evidence=timing,
+        head_service_evidence=None,
+        output_head_location=DECODE_BF16_HEAD,
+    )
+    # The local headline never hard-requires the remote endpoint...
+    assert decision.global_failures == (), decision.global_failures
+    assert decision.selected is values[-1]
+    record = decision.to_dict()
+    assert record["output_head_location"] == DECODE_BF16_HEAD
+    assert record["output_head_idealizations"] == [
+        LOCAL_HEAD_COMPUTE_IDEALIZATION
+    ]
+
+    # ...and the external arm keeps working exactly as before.
+    external_values, external_timing, external_head = _publication_fixture(
+        validity=StackValidity(
+            software_valid=True,
+            compiler_valid=True,
+            emulator_valid=True,
+            rtl_valid=False,
+            dc_calibrated=None,
+        ),
+        output_head_location=EXTERNAL_BF16_HEAD,
+    )
+    external_decision = select_final_deployment(
+        external_values,
+        calibration=None,
+        timing_evidence=external_timing,
+        head_service_evidence=external_head,
+    )
+    assert external_decision.global_failures == ()
+    assert external_decision.selected is external_values[-1]
+    assert external_decision.to_dict()["output_head_location"] == (
+        EXTERNAL_BF16_HEAD
+    )
+
+
+def test_local_head_candidate_cannot_borrow_a_head_service_identity() -> None:
+    with pytest.raises(
+        ValueError,
+        match="carries no head-service calibration",
+    ):
+        PublicationCandidate(
+            evaluation_class="pareto_candidate",
+            profile_id="profile-1",
+            candidate_id="candidate-1",
+            profile_kind="quantized",
+            perplexity=10.0,
+            tpot_ms=2.0,
+            energy_per_token_j=0.5,
+            energy_tier="analytic_anchored",
+            validity=StackValidity(True, True, True),
+            power_calibration_id="analytic-decode-energy-" + "a" * 64,
+            cost_scope="whole_model",
+            system_calibration_id="decode-local-head-system-" + "b" * 64,
+            head_service_calibration_id="bf16-head-service-" + "c" * 64,
+            output_head_location=DECODE_BF16_HEAD,
+            output_head_idealizations=(LOCAL_HEAD_COMPUTE_IDEALIZATION,),
+            whole_model_rankable=True,
+            timing_calibrated=True,
+            timing_evidence_id="timing-" + "e" * 64,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Publication admission: priced by a validated model, coverage disclosed
+# ---------------------------------------------------------------------------
+
+_ADMISSION_DROP = object()
+"""Sentinel marking an admission input a case removes rather than falsifies."""
+
+
+def _model_validated_row(**overrides: Any) -> dict[str, Any]:
+    """A row priced by the validated pricing model at an unvalidated geometry.
+
+    Compiler and emulator evidence is ``None`` because ``scope_stack_validity``
+    confined the measured observation to the geometry it was taken at.  Every
+    pricing-model identity the admission test requires is present.
+    """
+
+    row: dict[str, Any] = {
+        "profile_id": "dqp-model-validated",
+        "candidate_id": "hw-model-validated",
+        "record_hash": "0" * 64,
+        "deployment_valid": False,
+        "error_code": None,
+        "packedkv_selector_valid": False,
+        "packedkv_selector_evidence": {
+            "kind": "static_capability",
+            "reason": "selector_is_wired_only_to_the_mxint_matrix_path",
+            "evidence_id": "packedkv-selector-static-0",
+        },
+        "capability": {
+            "issues": [
+                {
+                    "code": "rtl_batched_mxfp_unsupported",
+                    "message": (
+                        "The packed batched attention selector is implemented "
+                        "only on the MXINT matrix path."
+                    ),
+                    "stages": ["rtl"],
+                }
+            ],
+            "stage_support": {
+                "software": True,
+                "compiler": True,
+                "emulator": True,
+                "rtl": False,
+                "dc": True,
+            },
+            "target": {
+                "mlen": 512,
+                "blen": 2,
+                "hlen": 128,
+                "batch": 4,
+                "kv_heads": 2,
+                "head_dim": 128,
+                "block_size": 8,
+                "selector_bits": 4,
+                "packed_kv": True,
+                "batched_attention": True,
+            },
+        },
+        "validity": {
+            "software_valid": True,
+            "compiler_valid": None,
+            "emulator_valid": None,
+            "rtl_valid": False,
+            "dc_calibrated": None,
+        },
+        "numerical_summary": {"state": "succeeded"},
+        "legality": {"hardware_candidate": True},
+        "metrics": {
+            "timing_calibrated": True,
+            "timing_evidence_id": "timing-" + "a" * 64,
+            "timing_mode": "rtl_serialized",
+            "memory_timing_calibrated": True,
+            "bandwidth_calibration_id": "bandwidth-operating-point-" + "b" * 64,
+            "area_source": "analytic_full_chip",
+            "area_calibration_id": None,
+            "area_scope": "decode_chip_only",
+            "area_mm2": 100.0,
+            "layout_id": "packed-kv-0",
+            "runtime_feasible": True,
+            "capacity": {"feasible": True},
+            "runtime_capacity_evidence": {"max_runtime_batch": 4},
+            "resource_budget": {"feasible": True},
+            "output_head_boundary": {
+                "estimate": {"calibration_id": "bf16-head-service-" + "c" * 64}
+            },
+            "whole_model": {
+                "rankable": True,
+                "publication_timing_tier": "stage_calibrated_analytic",
+                "tpot_ms": 10.0,
+                "tps": 100.0,
+                "system_calibration_id": "decode-head-system-" + "d" * 64,
+                "calibrated_energy": {
+                    "energy_tier": "analytic_anchored",
+                    "energy_id": "analytic-decode-energy-" + "e" * 64,
+                    "total_j": 1.0,
+                },
+            },
+        },
+    }
+    row.update(overrides)
+    return row
+
+
+def _individually_validated_row(**overrides: Any) -> dict[str, Any]:
+    """The same row, additionally compiled and emulated at its own geometry."""
+
+    row = _model_validated_row(**overrides)
+    row["validity"] = {
+        **row["validity"],
+        "compiler_valid": True,
+        "emulator_valid": True,
+    }
+    return row
+
+
+def _mutate_row(row: dict[str, Any], path: tuple[str, ...], value: Any) -> dict[str, Any]:
+    copied = json.loads(json.dumps(row))
+    target: Any = copied
+    for key in path[:-1]:
+        target = target[key]
+    if value is _ADMISSION_DROP:
+        target.pop(path[-1], None)
+    else:
+        target[path[-1]] = value
+    return copied
+
+
+def test_admission_admits_a_model_validated_row_without_individual_evidence() -> None:
+    """The pricing model is validated; this point was not separately emulated."""
+
+    admission = evaluate_publication_admission(_model_validated_row())
+    assert admission.admitted is True
+    assert admission.reason is None
+    assert admission.individually_validated is False
+
+    coverage = admission.coverage
+    assert coverage is not None
+    assert coverage.individually_validated is False
+    assert coverage.validated_stages == ()
+    assert coverage.unmeasured_stages == ("compiler", "emulator")
+    assert coverage.failed_stages == ()
+    # Nothing is promoted: the row is not claimed to sit at any evidence target.
+    assert coverage.evidence_target is None
+    assert coverage.runtime_target is not None
+    assert coverage.required_stage_validity == {"software": True}
+
+    record = admission.to_dict()
+    assert record["individually_validated"] is False
+    assert record["admission_basis"] == ADMISSION_BASIS
+    assert record["individual_validation_coverage"]["unmeasured_stages"] == [
+        "compiler",
+        "emulator",
+    ]
+    # The models behind every cost are named on the row itself.
+    pricing = record["pricing_model"]
+    assert pricing["timing_evidence_id"].startswith("timing-")
+    assert pricing["bandwidth_calibration_id"].startswith(
+        "bandwidth-operating-point-"
+    )
+    assert pricing["energy_tier"] == "analytic_anchored"
+    assert pricing["energy_id"].startswith("analytic-decode-energy-")
+    assert pricing["area_source"] == "analytic_full_chip"
+    assert pricing["system_calibration_id"].startswith("decode-head-system-")
+
+
+def test_admission_marks_an_individually_validated_row_true() -> None:
+    """A point compiled and emulated at its own geometry says so."""
+
+    admission = evaluate_publication_admission(_individually_validated_row())
+    assert admission.admitted is True
+    assert admission.individually_validated is True
+
+    coverage = admission.coverage
+    assert coverage is not None
+    assert coverage.validated_stages == ("compiler", "emulator")
+    assert coverage.unmeasured_stages == ()
+    # Measured compiler and emulator evidence survives scoping only at the
+    # geometry it was taken at, so the row's own target is that target.
+    assert coverage.evidence_target == coverage.runtime_target
+    assert coverage.evidence_target is not None
+    assert coverage.evidence_target["mlen"] == 512
+
+
+def test_admission_requires_every_model_validation_input_individually() -> None:
+    """Each pricing-model input is load-bearing on its own."""
+
+    cases: tuple[tuple[tuple[str, ...], Any, str], ...] = (
+        (("metrics", "timing_calibrated"), False, "timing_calibration"),
+        (
+            ("metrics", "timing_evidence_id"),
+            _ADMISSION_DROP,
+            "timing_evidence_identity",
+        ),
+        (("metrics", "timing_evidence_id"), "", "timing_evidence_identity"),
+        (
+            ("metrics", "whole_model", "publication_timing_tier"),
+            "uncalibrated",
+            "publication_timing_tier",
+        ),
+        (
+            ("metrics", "memory_timing_calibrated"),
+            False,
+            "memory_timing_calibration",
+        ),
+        (
+            ("metrics", "bandwidth_calibration_id"),
+            _ADMISSION_DROP,
+            "bandwidth_calibration_identity",
+        ),
+        (
+            ("metrics", "whole_model", "calibrated_energy", "energy_tier"),
+            "modelled",
+            "energy_tier",
+        ),
+        (
+            ("metrics", "whole_model", "calibrated_energy", "energy_id"),
+            _ADMISSION_DROP,
+            "energy_identity",
+        ),
+        (
+            ("metrics", "area_source"),
+            _ADMISSION_DROP,
+            "area_model_identity",
+        ),
+        (
+            ("metrics", "area_source"),
+            "dc_calibrated",
+            "area_calibration_identity",
+        ),
+        (
+            ("metrics", "output_head_boundary", "estimate"),
+            _ADMISSION_DROP,
+            "output_head_boundary",
+        ),
+        (
+            ("metrics", "whole_model", "system_calibration_id"),
+            _ADMISSION_DROP,
+            "system_calibration_identity",
+        ),
+        (("metrics", "layout_id"), "", "layout_identity"),
+        (("metrics", "capacity", "feasible"), False, "capacity_feasibility"),
+        (("metrics", "runtime_feasible"), False, "runtime_feasibility"),
+        (
+            ("metrics", "runtime_capacity_evidence"),
+            _ADMISSION_DROP,
+            "capacity_evidence",
+        ),
+        (
+            ("metrics", "resource_budget", "feasible"),
+            False,
+            "resource_budget",
+        ),
+        (("numerical_summary", "state"), "failed", "numerical_state"),
+        (
+            ("legality", "hardware_candidate"),
+            False,
+            "static_hardware_legality",
+        ),
+        (("error_code",), "capacity_overflow", "error_code"),
+        # Software validity is not geometry scoped, so it stays required.
+        (("validity", "software_valid"), None, "blocking_stage_validity"),
+        # A measured failure is evidence about the point, not a coverage gap.
+        (("validity", "compiler_valid"), False, "blocking_stage_validity"),
+        (("validity", "emulator_valid"), False, "blocking_stage_validity"),
+    )
+    for path, value, expected_reason in cases:
+        row = _mutate_row(_model_validated_row(), path, value)
+        admission = evaluate_publication_admission(row)
+        assert admission.admitted is False, (path, value)
+        assert admission.reason == expected_reason, (path, value)
+        # A refusal still discloses coverage rather than going silent.
+        assert admission.coverage is not None
+
+
+def test_admission_strict_view_selects_only_individually_validated_rows() -> None:
+    """Both framings come from one predicate over one admitted population."""
+
+    priced = _model_validated_row()
+    validated = _individually_validated_row(
+        candidate_id="hw-individually-validated",
+    )
+    population = (priced, validated)
+
+    admitted = select_admitted_rows(population)
+    assert len(admitted) == 2
+
+    strict = select_admitted_rows(
+        population,
+        require_individual_validation=True,
+    )
+    assert len(strict) == 1
+    assert strict[0]["candidate_id"] == "hw-individually-validated"
+
+    # The strict view refuses for the coverage reason, never by pretending the
+    # pricing evidence was missing.
+    refusal = evaluate_publication_admission(
+        priced,
+        require_individual_validation=True,
+    )
+    assert refusal.admitted is False
+    assert refusal.reason == "individual_validation"
+    assert refusal.coverage is not None
+    assert refusal.coverage.unmeasured_stages == ("compiler", "emulator")
+
+    # A row refused on the pricing evidence reports that reason even in the
+    # strict view; missing coverage never masks a missing model input.
+    broken = _mutate_row(priced, ("metrics", "timing_calibrated"), False)
+    assert (
+        evaluate_publication_admission(
+            broken,
+            require_individual_validation=True,
+        ).reason
+        == "timing_calibration"
+    )
+
+
+def test_downstream_promotion_accepts_a_newly_admitted_row() -> None:
+    """The promotion consumer prices the row and carries its coverage."""
+
+    profile = DecodePrecisionProfile(
+        kind=PROFILE_KIND_QUANTIZED,
+        weight_format="MXINT4",
+        activation_format="MXINT8",
+        key_format="MXINT4",
+        value_format="MXINT4",
+        vector_format="FP_E4M7",
+        block_size=MX_BLOCK_SIZE,
+    )
+    point = _hardware_point(
+        _model_validated_row(),
+        profile=profile,
+        mean_nll=1.0,
+    )
+    assert point is not None
+    assert point.individually_validated is False
+    assert point.whole_model_rankable is True
+    record = point.to_dict()
+    assert record["individually_validated"] is False
+    assert record["individual_validation_coverage"]["unmeasured_stages"] == [
+        "compiler",
+        "emulator",
+    ]
+    assert record["pricing_model"]["timing_evidence_id"].startswith("timing-")
+
+    validated_point = _hardware_point(
+        _individually_validated_row(),
+        profile=profile,
+        mean_nll=1.0,
+    )
+    assert validated_point is not None
+    assert validated_point.individually_validated is True
+    assert individually_validated_points((point, validated_point)) == (
+        validated_point,
+    )
+
+
+def test_stage_split_partitions_the_blocking_stages() -> None:
+    """The two stage sets are an exhaustive, disjoint split, by construction."""
+
+    assert set(INDIVIDUAL_VALIDATION_STAGES) | set(
+        MODEL_REQUIRED_VALIDITY_STAGES
+    ) == set(PRICING_BLOCKING_STAGES)
+    assert not set(INDIVIDUAL_VALIDATION_STAGES) & set(
+        MODEL_REQUIRED_VALIDITY_STAGES
+    )
+    # The split follows scope_stack_validity: exactly the stages it demotes
+    # from True to None off-geometry are the individually validated ones.
+    observed = StackValidity(
+        software_valid=True,
+        compiler_valid=True,
+        emulator_valid=True,
+        rtl_valid=True,
+        dc_calibrated=True,
+    )
+    scoped = scope_stack_validity(
+        observed,
+        evidence_target=PackedKVRuntimeTarget(),
+        runtime_target=PackedKVRuntimeTarget(mlen=2048),
+    )
+    demoted = {
+        stage
+        for stage in PRICING_BLOCKING_STAGES
+        if getattr(scoped, f"{stage}_valid") is None
+    }
+    assert demoted == set(INDIVIDUAL_VALIDATION_STAGES)

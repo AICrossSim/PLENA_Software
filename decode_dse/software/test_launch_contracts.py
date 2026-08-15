@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -312,9 +313,11 @@ def test_aggregate_launch_preflight_and_exact_memory_arithmetic(
     assert qwen_trace_plan["exact_batch_record_signatures"] == 520
     assert qwen_trace_plan["unique_compiler_lowering_instantiations"] == 3_120
     assert qwen_trace_plan["unique_lazy_trace_instantiations"] == 520
-    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 7_499_520
+    # Profile-candidate pairs scale with the declared precision space; the
+    # priced work does not, because profiles join onto shared hardware factors.
+    assert qwen_trace_plan["raw_profile_candidate_pairs"] == 14_374_080
     assert qwen_trace_plan["raw_context_point_resolutions"] == (
-        23_038_525_440
+        44_157_173_760
     )
     assert qwen_trace_plan["physical_signature_pairs"] == 133_920
     assert qwen_trace_plan["projected_context_timing_resolutions"] == 133_920
@@ -748,23 +751,36 @@ def test_model_general_resource_and_dry_run_contracts(
         first["cost_declaration"]["total_profile_evaluations"] + 6
     )
     llama_trace_plan = first["compiler_trace_preflight"]
-    assert llama_trace_plan["structurally_legal_hardware_candidates"] == 616_032
-    assert llama_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 90_720
-    assert llama_trace_plan["compiler_base_hardware_signatures"] == 21_192
-    assert llama_trace_plan["exact_batch_record_signatures"] == 3_144
-    assert llama_trace_plan["unique_compiler_lowering_instantiations"] == 18_864
-    assert llama_trace_plan["unique_lazy_trace_instantiations"] == 3_144
-    assert llama_trace_plan["raw_profile_candidate_pairs"] == 353_602_368
+    # The Llama hardware space is restricted to KV_HEAD_REUSE=false and
+    # DRAIN_OVERLAPPED=false: neither architecture option has usable timing
+    # evidence (no drain-mode anchors, no generated packed-q1 timing
+    # contracts), so those candidates could only ever be recorded as
+    # timing-uncalibrated.  Every downstream projection below shrinks with
+    # that declared evidence-availability restriction.
+    #
+    # HBM_CHANNELS carries all three measured HBM2 calibration groups
+    # (8/16/32), matching the Qwen space, so every candidate-side projection
+    # is exactly three times its single-channel-group value.  The signature-
+    # side counts (compiler base signatures, exact batch records, lowering
+    # and lazy trace instantiations, projected trace bytes) are independent
+    # of the channel count and are unchanged.
+    assert llama_trace_plan["structurally_legal_hardware_candidates"] == 753_984
+    assert llama_trace_plan["compiler_geometry_eligible_hardware_candidates"] == 106_272
+    assert llama_trace_plan["compiler_base_hardware_signatures"] == 17_248
+    assert llama_trace_plan["exact_batch_record_signatures"] == 2_448
+    assert llama_trace_plan["unique_compiler_lowering_instantiations"] == 14_688
+    assert llama_trace_plan["unique_lazy_trace_instantiations"] == 2_448
+    assert llama_trace_plan["raw_profile_candidate_pairs"] == 754_737_984
     assert llama_trace_plan["raw_context_point_resolutions"] == (
-        1_086_266_474_496
+        2_318_555_086_848
     )
-    assert llama_trace_plan["physical_signature_pairs"] == 544_320
-    assert llama_trace_plan["projected_context_timing_resolutions"] == 544_320
-    assert llama_trace_plan["physical_context_step_outcomes"] == 1_672_151_040
-    assert llama_trace_plan["projected_full_evaluator_calls"] == 544_320
-    assert llama_trace_plan["projected_joined_identities"] == 544_320
-    assert llama_trace_plan["projected_trace_bytes"] == 13_392_936_960
-    assert llama_trace_plan["projected_digest_updates"] == 1_088_640
+    assert llama_trace_plan["physical_signature_pairs"] == 637_632
+    assert llama_trace_plan["projected_context_timing_resolutions"] == 637_632
+    assert llama_trace_plan["physical_context_step_outcomes"] == 1_958_805_504
+    assert llama_trace_plan["projected_full_evaluator_calls"] == 637_632
+    assert llama_trace_plan["projected_joined_identities"] == 637_632
+    assert llama_trace_plan["projected_trace_bytes"] == 10_428_088_320
+    assert llama_trace_plan["projected_digest_updates"] == 1_275_264
     assert "projected_wall_clock_seconds" not in llama_trace_plan
     assert (
         first["cost_declaration"]["projection_status"]
@@ -1669,6 +1685,290 @@ def test_refinement_hardware_points_preserve_energy_identity_and_tier() -> None:
         _deduplicate_profile_points((analytic, calibrated))[profile.profile_id]
         is calibrated
     )
+
+
+_DROP = object()
+"""Sentinel marking a field that a gate test removes rather than falsifies."""
+
+
+def _rtl_recorded_row(**overrides: Any) -> dict[str, Any]:
+    """A row that priced cleanly but carries only RTL-stage limitations.
+
+    This mirrors the shape produced by the factorized loader: the strict
+    ``deployment_valid`` record is false and the conservative selector flag is
+    false, because the RTL FP-to-MXINT activation path is unvalidated for
+    MXINT2 activations.  Compiler and emulator evidence -- the stages the
+    publication timing tiers actually require -- are measured valid.
+    """
+
+    row: dict[str, Any] = {
+        "candidate_id": "candidate-rtl-recorded",
+        "profile_id": "dqp-rtl-recorded",
+        "deployment_valid": False,
+        "packedkv_selector_valid": False,
+        "packedkv_selector_evidence": {
+            "kind": "capability_or_measured_failure",
+            "reason": "selector_capability_or_validation_failed",
+            "evidence_id": "packedkv-selector-failure-0",
+            "issue_codes": ["rtl_mxint_activation_requant_unvalidated"],
+        },
+        "capability": {
+            "issues": [
+                {
+                    "code": "rtl_mxint_activation_requant_unvalidated",
+                    "message": (
+                        "The RTL FP-to-MXINT activation path is validated "
+                        "for MXINT4 and MXINT8."
+                    ),
+                    "stages": ["rtl"],
+                }
+            ],
+            "stage_support": {
+                "software": True,
+                "compiler": True,
+                "emulator": True,
+                "rtl": False,
+                "dc": True,
+            },
+        },
+        "validity": {
+            "software_valid": True,
+            "compiler_valid": True,
+            "emulator_valid": True,
+            "rtl_valid": False,
+            "dc_calibrated": None,
+        },
+        "numerical_summary": {"state": "succeeded"},
+        "legality": {"hardware_candidate": True},
+        "error_code": None,
+        "metrics": {
+            "area_source": "analytic_full_chip",
+            "area_mm2": 100.0,
+            "timing_calibrated": True,
+            "timing_evidence_id": "timing-evidence-0",
+            "bandwidth_calibration_id": "bandwidth-operating-point-0",
+            "runtime_feasible": True,
+            "memory_timing_calibrated": True,
+            "layout_id": "packed-kv-0",
+            "resource_budget": {"feasible": True},
+            "runtime_capacity_evidence": {"resident_bytes": 1},
+            "capacity": {"feasible": True},
+            "whole_model": {
+                "rankable": True,
+                "publication_timing_tier": "stage_calibrated_analytic",
+                "tpot_ms": 10.0,
+                "tps": 100.0,
+                "system_calibration_id": "system-calibration",
+                "calibrated_energy": {
+                    "energy_tier": "analytic_anchored",
+                    "energy_id": "analytic-energy",
+                    "total_j": 1.0,
+                },
+            },
+            "output_head_boundary": {
+                "estimate": {"calibration_id": "head-calibration"}
+            },
+        },
+    }
+    row.update(overrides)
+    return row
+
+
+def test_hardware_point_admits_rtl_recorded_row_and_discloses_it() -> None:
+    """RTL-stage limitations are recorded on the point, never excluding."""
+
+    profile = _small_manifest().entries[0].profile
+    point = _hardware_point(_rtl_recorded_row(), profile=profile, mean_nll=1.0)
+    assert point is not None
+    assert point.whole_model_rankable is True
+    assert point.rtl_valid is False
+    assert point.recorded_issue_codes == (
+        "rtl_mxint_activation_requant_unvalidated",
+    )
+    assert point.rests_on_unimplemented_rtl_path is True
+    disclosed = point.to_dict()
+    assert disclosed["rtl_valid"] is False
+    assert disclosed["recorded_issue_codes"] == [
+        "rtl_mxint_activation_requant_unvalidated"
+    ]
+
+
+def test_hardware_point_admits_mxfp_selector_gap_as_recorded() -> None:
+    """The selector's MXINT-only wiring is an RTL-stage disclosure."""
+
+    profile = _small_manifest().entries[0].profile
+    row = _rtl_recorded_row(
+        packedkv_selector_evidence={
+            "kind": "static_capability",
+            "reason": "selector_is_wired_only_to_the_mxint_matrix_path",
+            "evidence_id": "packedkv-selector-static-0",
+        },
+        capability={
+            "issues": [
+                {
+                    "code": "rtl_batched_mxfp_unsupported",
+                    "message": (
+                        "The packed batched attention selector is "
+                        "implemented only on the MXINT matrix path."
+                    ),
+                    "stages": ["rtl"],
+                }
+            ],
+            "stage_support": {
+                "software": True,
+                "compiler": True,
+                "emulator": True,
+                "rtl": False,
+                "dc": True,
+            },
+        },
+    )
+    point = _hardware_point(row, profile=profile, mean_nll=1.0)
+    assert point is not None
+    assert point.recorded_issue_codes == ("rtl_batched_mxfp_unsupported",)
+
+
+def test_hardware_point_rejects_blocking_stage_selector_issue() -> None:
+    """A capability issue touching a required stage still excludes the row."""
+
+    profile = _small_manifest().entries[0].profile
+    row = _rtl_recorded_row(
+        capability={
+            "issues": [
+                {
+                    "code": "compiler_packed_kv_unsupported",
+                    "message": "The compiler cannot lower this selector.",
+                    "stages": ["compiler", "rtl"],
+                }
+            ],
+            "stage_support": {
+                "software": True,
+                "compiler": False,
+                "emulator": True,
+                "rtl": False,
+                "dc": True,
+            },
+        },
+    )
+    assert _hardware_point(row, profile=profile, mean_nll=1.0) is None
+
+
+def test_hardware_point_rejects_failed_or_unmeasured_software_validity() -> None:
+    """Software validity is not geometry scoped, so it stays required."""
+
+    profile = _small_manifest().entries[0].profile
+    for observed in (False, None):
+        validity = dict(_rtl_recorded_row()["validity"])
+        validity["software_valid"] = observed
+        row = _rtl_recorded_row(validity=validity)
+        assert (
+            _hardware_point(row, profile=profile, mean_nll=1.0) is None
+        ), f"software_valid={observed} must exclude the row"
+
+
+def test_hardware_point_rejects_failed_compiler_or_emulator_validity() -> None:
+    """A *measured failure* is evidence about the point and still excludes it."""
+
+    profile = _small_manifest().entries[0].profile
+    for field_name in ("compiler_valid", "emulator_valid"):
+        validity = dict(_rtl_recorded_row()["validity"])
+        validity[field_name] = False
+        row = _rtl_recorded_row(validity=validity)
+        assert (
+            _hardware_point(row, profile=profile, mean_nll=1.0) is None
+        ), f"{field_name}=False must exclude the row"
+
+
+def test_hardware_point_admits_unmeasured_compiler_and_emulator_evidence() -> None:
+    """An unmeasured stage is disclosed coverage, not an exclusion.
+
+    Compiler and emulator evidence is scoped to the geometry it was measured
+    at, so a point priced away from that geometry carries ``None`` rather than
+    a failure.  It is priced by the validated model and says so.
+    """
+
+    profile = _small_manifest().entries[0].profile
+    validity = dict(_rtl_recorded_row()["validity"])
+    validity["compiler_valid"] = None
+    validity["emulator_valid"] = None
+    row = _rtl_recorded_row(validity=validity)
+    point = _hardware_point(row, profile=profile, mean_nll=1.0)
+    assert point is not None
+    assert point.individually_validated is False
+    disclosed = point.to_dict()
+    assert disclosed["individually_validated"] is False
+    assert disclosed["individual_validation_coverage"]["unmeasured_stages"] == [
+        "compiler",
+        "emulator",
+    ]
+
+
+def test_hardware_point_rejects_bf16_reference_selector() -> None:
+    """The BF16 accuracy reference never enters the hardware frontier."""
+
+    profile = _small_manifest().entries[0].profile
+    row = _rtl_recorded_row(
+        packedkv_selector_evidence={
+            "kind": "static_capability",
+            "reason": "bf16_reference_is_not_a_packedkv_hardware_profile",
+            "evidence_id": None,
+        },
+    )
+    assert _hardware_point(row, profile=profile, mean_nll=1.0) is None
+
+
+def test_hardware_point_keeps_every_genuine_gate() -> None:
+    """Each non-RTL gate still excludes the row when it is violated."""
+
+    profile = _small_manifest().entries[0].profile
+    baseline = _hardware_point(
+        _rtl_recorded_row(), profile=profile, mean_nll=1.0
+    )
+    assert baseline is not None
+
+    def mutate(path: tuple[str, ...], value: Any) -> dict[str, Any]:
+        row = _rtl_recorded_row()
+        target: Any = row
+        for key in path[:-1]:
+            target = target[key]
+        if value is _DROP:
+            target.pop(path[-1], None)
+        else:
+            target[path[-1]] = value
+        return row
+
+    violations: tuple[tuple[str, ...], Any] = (
+        (("error_code",), "capacity_overflow"),
+        (("legality", "hardware_candidate"), False),
+        (("numerical_summary", "state"), "failed"),
+        (("metrics", "whole_model", "rankable"), False),
+        (("metrics", "whole_model", "publication_timing_tier"), "uncalibrated"),
+        (("metrics", "whole_model", "calibrated_energy", "energy_tier"), "modelled"),
+        (("metrics", "whole_model", "calibrated_energy", "energy_id"), ""),
+        (("metrics", "timing_calibrated"), False),
+        # The pricing-model identities admission now rests on.  Each one is
+        # individually load-bearing: without it the row cannot name the
+        # validated model that produced its numbers.
+        (("metrics", "timing_evidence_id"), _DROP),
+        (("metrics", "timing_evidence_id"), ""),
+        (("metrics", "bandwidth_calibration_id"), _DROP),
+        (("metrics", "bandwidth_calibration_id"), ""),
+        (("metrics", "area_source"), _DROP),
+        (("metrics", "area_source"), ""),
+        (("metrics", "whole_model", "system_calibration_id"), _DROP),
+        (("metrics", "runtime_feasible"), False),
+        (("metrics", "capacity", "feasible"), False),
+        (("metrics", "resource_budget", "feasible"), False),
+        (("metrics", "memory_timing_calibrated"), False),
+        (("metrics", "layout_id"), ""),
+        (("metrics", "runtime_capacity_evidence"), _DROP),
+        (("metrics", "output_head_boundary", "estimate"), _DROP),
+    )
+    for path, value in violations:
+        row = mutate(path, value)
+        assert (
+            _hardware_point(row, profile=profile, mean_nll=1.0) is None
+        ), f"{'.'.join(path)} must remain a genuine exclusion"
 
 
 def test_stubbed_stage_pipeline_is_idempotent_end_to_end(

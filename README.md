@@ -56,14 +56,24 @@ for the full config schema, output format, and known limitations.
 
 `decode_dse/` evaluates a dedicated PLENA decode chip for disaggregated serving
 of Qwen3-32B and Llama-3.1-8B. Unlike the online search above, it enumerates its
-grid exhaustively — 3,585 precision profiles crossed with the legal hardware
-space — and keeps numerical accuracy, compiler support, emulator support, RTL
-validation, timing calibration and power calibration as separate claims, each
-with its own evidence tier.
+grid exhaustively — every point of a pre-declared precision space crossed with
+the legal hardware space, with no performance, bandwidth or objective-based
+pruning inside that space. Llama-3.1-8B declares the canonical space (3,585
+precision profiles); Qwen3-32B declares a subspace with disclosed,
+measured-evidence exclusions (2,017). It keeps numerical accuracy, compiler
+support, emulator support, RTL validation, timing calibration and power
+calibration as separate claims, each with its own evidence tier, and refuses a
+comparison across tiers rather than making it silently.
 
-It requires three sibling checkouts (`PLENA_Simulator`, `PLENA_RTL`, `mase`) and
-a host with two BF16-capable GPUs. Start with
-[decode_dse/README.md](decode_dse/README.md) for the study design, and
-`decode_dse/docs/server_setup.md` for execution-host bring-up and the launch
+Every physical number comes from a `PLENA_Simulator` checkout's analytic
+models, resolved via `PLENA_SIMULATOR_PATH` or, failing that, `../PLENA_Simulator`
+with the fallback recorded in provenance, so that checkout is a hard dependency
+of every pricing stage. The study also
+requires `PLENA_RTL` and `mase` checked out alongside, and an execution host
+with two exclusively-held BF16-capable GPUs (the sealed plan fixes two sweep
+workers, and the BF16 output-head service calibration is measured on two idle
+boards). Start with [decode_dse/README.md](decode_dse/README.md) for the study
+design, `decode_dse/docs/evidence_tiers.md` for what each reported label claims,
+and `decode_dse/docs/server_setup.md` for execution-host bring-up and the launch
 order.
 

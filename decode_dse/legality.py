@@ -32,7 +32,15 @@ from decode_dse.profiles import (
 
 HARDWARE_MXINT_WEIGHT_FORMATS = ("MXINT4", "MXINT8")
 HARDWARE_MXINT_OPERAND_FORMATS = ("MXINT2", "MXINT4", "MXINT8")
-HARDWARE_MXFP_FORMATS = ("E1M2", "E2M1", "E4M3", "E5M2")
+#: MXFP operands the matrix datapath is priced for. Every entry is 8 bits or
+#: narrower and carries the same layer validity as the rest of the space
+#: (software only; compiler, emulator and RTL evidence is recorded, not
+#: required). ``E3M4`` sits one mantissa bit beyond the area census grid
+#: (exponent 1/2/4/5, mantissa 1/2/3), so its area comes from the measured
+#: precision law rather than from a measured point; that law fits the four
+#: census formats to within 0.30%, and the extrapolation is disclosed with the
+#: format's rows rather than resolved by dropping the format.
+HARDWARE_MXFP_FORMATS = ("E1M2", "E2M1", "E3M4", "E4M3", "E5M2")
 
 
 @dataclass(frozen=True)
@@ -463,7 +471,66 @@ def validate_accumulator_width(
 
 
 CAPABILITY_STAGES = ("software", "compiler", "emulator", "rtl", "dc")
+# The declared publication timing tiers rest on compiler-emitted programs
+# executed under the calibrated emulator contract, and both tiers require
+# exactly ("compiler_valid", "emulator_valid") measured validity - see
+# TIMING_TIER_REQUIRED_VALIDITY in decode_dse.hardware.design_space.  A
+# capability limitation on one of those stages (or on the software
+# implementation feeding them) therefore disqualifies a point from pricing:
+# nothing downstream could be evaluated at all.  A limitation that lives only
+# in the RTL implementation or the DC calibration flow is orthogonal to what
+# the tiers claim; it is RECORDED on the row (it forces rtl_valid / dc
+# calibration false through CrossStackCapability.validity_floor) and
+# disclosed, but it must never delete the row from the priced design space.
+PRICING_BLOCKING_STAGES = ("software", "compiler", "emulator")
+PRICING_RECORDED_STAGES = ("rtl", "dc")
 RTL_MXINT_ACTIVATION_FORMATS = ("MXINT4", "MXINT8")
+
+# The blocking stages split again, this time by how far a *successful*
+# measurement carries.  ``scope_stack_validity`` confines a passing compiler or
+# emulator observation to the exact geometry it was measured at, so evidence
+# for those two stages describes one design point and nothing else.  A passing
+# software observation is not scoped: the profile's software implementation
+# either ran or it did not, everywhere.
+#
+# Admission therefore requires measured validity for the
+# unscoped stage and *discloses* coverage of the scoped ones, rather than
+# restricting the priced design space to the single geometry at which the
+# hardware-validation stage happened to run.  A measured failure on any
+# blocking stage still excludes the point: that is evidence about the point,
+# not a coverage gap.
+INDIVIDUAL_VALIDATION_STAGES = ("compiler", "emulator")
+MODEL_REQUIRED_VALIDITY_STAGES = tuple(
+    stage
+    for stage in PRICING_BLOCKING_STAGES
+    if stage not in INDIVIDUAL_VALIDATION_STAGES
+)
+
+#: One sentence stating exactly what an admitted row claims.  It is emitted on
+#: every admission and result record so the claim cannot drift from the
+#: code that enforces it.
+ADMISSION_BASIS = (
+    "priced by a validated, identified pricing model; individual compiler and "
+    "emulator validation of this exact design point is disclosed per row, not "
+    "required"
+)
+
+if set(PRICING_BLOCKING_STAGES) | set(PRICING_RECORDED_STAGES) != set(
+    CAPABILITY_STAGES
+) or set(PRICING_BLOCKING_STAGES) & set(PRICING_RECORDED_STAGES):
+    raise AssertionError(
+        "the blocking/recorded stage split must partition CAPABILITY_STAGES"
+    )
+
+if set(INDIVIDUAL_VALIDATION_STAGES) | set(
+    MODEL_REQUIRED_VALIDITY_STAGES
+) != set(PRICING_BLOCKING_STAGES) or set(INDIVIDUAL_VALIDATION_STAGES) & set(
+    MODEL_REQUIRED_VALIDITY_STAGES
+):
+    raise AssertionError(
+        "the individual/model-required split must partition "
+        "PRICING_BLOCKING_STAGES"
+    )
 
 
 @dataclass(frozen=True)
@@ -551,6 +618,49 @@ class CrossStackCapability:
             stage: self.stage_supported(stage)
             for stage in CAPABILITY_STAGES
         }
+
+    def issues_for_stages(
+        self,
+        stages: Sequence[str],
+    ) -> tuple[LegalityIssue, ...]:
+        """Return every issue that touches at least one of ``stages``."""
+
+        unknown = sorted(set(stages) - set(CAPABILITY_STAGES))
+        if unknown:
+            raise ValueError(f"unknown capability stages: {unknown}")
+        scope = set(stages)
+        return tuple(
+            issue for issue in self.issues if scope & set(issue.stages)
+        )
+
+    @property
+    def blocking_issues(self) -> tuple[LegalityIssue, ...]:
+        """Issues that disqualify the point from publication-tier pricing.
+
+        An issue is blocking when it touches a stage the declared publication
+        timing tiers actually require.  Everything else is recorded, not
+        required: see PRICING_BLOCKING_STAGES.
+        """
+
+        return self.issues_for_stages(PRICING_BLOCKING_STAGES)
+
+    @property
+    def recorded_issues(self) -> tuple[LegalityIssue, ...]:
+        """Issues confined to stages that are disclosed but never required.
+
+        An issue that also touches a blocking stage is *not* reported here;
+        it is blocking, and this partition is exhaustive with
+        ``blocking_issues`` over ``issues``.
+        """
+
+        blocking = set(self.blocking_issues)
+        return tuple(issue for issue in self.issues if issue not in blocking)
+
+    @property
+    def prices_at_publication_tier(self) -> bool:
+        """True when no blocking-stage limitation stands in the way."""
+
+        return not self.blocking_issues
 
     @property
     def validity_floor(self) -> StackValidity:
@@ -872,6 +982,11 @@ load_built_stack_validity = load_stack_validity
 
 __all__ = [
     "CAPABILITY_STAGES",
+    "INDIVIDUAL_VALIDATION_STAGES",
+    "MODEL_REQUIRED_VALIDITY_STAGES",
+    "ADMISSION_BASIS",
+    "PRICING_BLOCKING_STAGES",
+    "PRICING_RECORDED_STAGES",
     "DEFAULT_PACKED_KV_TARGET",
     "HARDWARE_MXFP_FORMATS",
     "HARDWARE_MXINT_OPERAND_FORMATS",

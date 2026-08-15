@@ -70,9 +70,13 @@
     "decode_kv_admission": "quantize_once"
   },
   "output_head_contract": {
-    "headline_location": "external_bf16_service",
+    "headline_location": "decode_bf16_unmodeled",
     "headline_precision": "BF16",
-    "local_bf16": "sensitivity_unrankable",
+    "headline_idealizations": [
+      "local_bf16_head_compute_idealized"
+    ],
+    "comparison_location": "external_bf16_service",
+    "comparison_evidence": "measured_head_service",
     "local_low_precision": "accuracy_only"
   },
   "reference_workload": {
@@ -249,7 +253,7 @@
       "gsm8k": 2048,
       "ruler": 512
     },
-    "output_head_location": "external_bf16_service",
+    "output_head_location": "decode_bf16_unmodeled",
     "output_head_precision": "BF16"
   },
   "eval_ppl_nsamples": 32,
@@ -297,7 +301,9 @@
       256
     ],
     "HBM_CHANNELS": [
-      8
+      8,
+      16,
+      32
     ],
     "HBM_GENERATION": "HBM2",
     "CHIP_COUNT": [
@@ -335,12 +341,10 @@
       "kv_resident_100"
     ],
     "KV_HEAD_REUSE": [
-      false,
-      true
+      false
     ],
     "DRAIN_OVERLAPPED": [
-      false,
-      true
+      false
     ],
     "FP_SRAM_DEPTH": 512,
     "RESOURCE_BUDGET": {
@@ -415,16 +419,16 @@
     },
     "resources": {
       "stride": 1,
-      "runtime_hbm_reserve_bytes": 8589934592,
+      "runtime_hbm_reserve_bytes": 536870912,
       "rtl_source_tree_sha256": null,
       "refinement_enabled": true,
       "refinement_execution": "four_logical_shards",
       "refinement_decode_microbatch_size": 8,
       "bootstrap_replicates": 2000,
-      "publication_enabled": false,
+      "publication_enabled": true,
       "publication_executor": "decode_dse.software.benchmark_evaluator:create_executor",
       "publication_timing_tier": "stage_calibrated_analytic",
-      "study_parallel_workers": 48,
+      "study_parallel_workers": 192,
       "figure_formats": [
         "png",
         "pdf",
@@ -433,7 +437,6 @@
     }
   },
   "n_chips": 1,
-  "baseline_hbm_channels": 32,
   "seed": 0,
   "scratch_dir": "workspace://scratch",
   "gpu_min_free_mb": 24000,
@@ -463,5 +466,9 @@
   "runtime": {
     "persistent": true,
     "max_attempts": 3
+  },
+  "accuracy_budgets": {
+    "strict_relative_perplexity": 1.01,
+    "relaxed_relative_perplexity": 1.05
   }
 }

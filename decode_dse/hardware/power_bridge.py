@@ -6,27 +6,115 @@ import importlib
 import math
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
 from decode_dse.hardware.design_space import CalibratedEnergy, HardwareCandidate
 
+#: Environment variable naming the simulator checkout every analytic model,
+#: coefficient table and calibration artifact is read from.
+SIMULATOR_ROOT_ENV_VAR = "PLENA_SIMULATOR_PATH"
+
+#: Relative path a directory must contain to be a simulator checkout.
+_SIMULATOR_MARKER = Path("analytic_models") / "disagg_serve"
+
+#: Directory name of the sibling checkout used when the environment declares
+#: nothing.  A worktree sits beside its own siblings, so this default can name
+#: a *different* checkout than the one under test; every resolution therefore
+#: records which of the two rules produced it.
+_SIBLING_DEFAULT_NAME = "PLENA_Simulator"
+
+SIMULATOR_ROOT_FROM_ENVIRONMENT = "environment"
+SIMULATOR_ROOT_FROM_SIBLING_DEFAULT = "repository_sibling_default"
+
+
+@dataclass(frozen=True)
+class SimulatorRootResolution:
+    """The simulator checkout in use and the rule that selected it."""
+
+    root: Path
+    source: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "simulator_root": str(self.root),
+            "simulator_root_source": self.source,
+        }
+
+
+def resolve_simulator_root() -> SimulatorRootResolution:
+    """Resolve the simulator checkout, preferring the explicit declaration.
+
+    ``PLENA_SIMULATOR_PATH`` wins whenever it is set; an empty value is a
+    declaration error rather than a silent fallback, and a value that does
+    not name a simulator checkout fails immediately instead of importing a
+    partial tree.  Only a completely undeclared environment falls back to the
+    sibling checkout, and that fallback is reported through ``source`` so a
+    study priced against an unintended checkout is visible in provenance
+    rather than indistinguishable from a declared one.
+    """
+
+    declared = os.environ.get(SIMULATOR_ROOT_ENV_VAR)
+    if declared is None:
+        root = (
+            Path(__file__).resolve().parents[3] / _SIBLING_DEFAULT_NAME
+        ).resolve()
+        source = SIMULATOR_ROOT_FROM_SIBLING_DEFAULT
+    else:
+        token = declared.strip()
+        if not token:
+            raise ValueError(
+                f"{SIMULATOR_ROOT_ENV_VAR} is set to an empty value; unset it "
+                "to accept the sibling checkout or set it to a simulator root"
+            )
+        root = Path(token).expanduser().resolve()
+        source = SIMULATOR_ROOT_FROM_ENVIRONMENT
+    if not (root / _SIMULATOR_MARKER).is_dir():
+        raise FileNotFoundError(
+            f"{root} is not a simulator checkout (missing "
+            f"{_SIMULATOR_MARKER}); set {SIMULATOR_ROOT_ENV_VAR} to the "
+            f"checkout root [resolved from: {source}]"
+        )
+    return SimulatorRootResolution(root=root, source=source)
+
+
+def simulator_root() -> Path:
+    """Return the resolved simulator checkout root."""
+
+    return resolve_simulator_root().root
+
 
 def _simulator_module(name: str):
-    default_root = Path(__file__).resolve().parents[3] / "PLENA_Simulator"
-    root = Path(os.environ.get("PLENA_SIMULATOR_PATH", default_root)).resolve()
-    source = root / "analytic_models" / "disagg_serve"
-    if not source.is_dir():
-        raise FileNotFoundError(f"simulator energy models are missing: {source}")
+    root = resolve_simulator_root().root
     token = str(root)
     if token not in sys.path:
         sys.path.insert(0, token)
     return importlib.import_module(f"analytic_models.disagg_serve.{name}")
 
 
+def _optional_record(module: Any, name: str) -> dict[str, Any]:
+    """Return a declared provenance record, or an explicit absence marker.
+
+    Provenance records are added to the power model as evidence arrives, so a
+    resolved checkout may legitimately not carry one yet. Returning the reason
+    keeps a missing record visible instead of letting it read as an empty pass.
+    """
+
+    record = getattr(module, name, None)
+    if isinstance(record, Mapping):
+        return dict(record)
+    return {
+        "unavailable": (
+            f"the resolved simulator checkout declares no {name} record"
+        ),
+    }
+
+
 def analytic_power_provenance() -> dict[str, Any]:
     """Return the coefficient identity and declared evidence scopes."""
 
+    resolution = resolve_simulator_root()
     model = _simulator_module("decode_power")
     return {
         "engine": "decode_analytic_power_bridge",
@@ -35,9 +123,19 @@ def analytic_power_provenance() -> dict[str, Any]:
         "sram": dict(model.SRAM_ENERGY_SOURCE),
         "leakage": dict(model.LEAKAGE_SOURCE),
         "link": dict(model.LINK_ENERGY_SOURCE),
+        # Gate-level evidence that bears on the coefficients without having
+        # changed any of them. It travels with the provenance so a reader can
+        # see what was checked, at what corner, and what the check did not do.
+        # A simulator checkout that predates the campaign simply has no such
+        # record; that reads as absent rather than as a check that passed.
+        "compute_energy_cross_check": _optional_record(
+            model,
+            "COMPUTE_ENERGY_CROSS_CHECK",
+        ),
         "sram_access_accounting": (
             "HBM fills plus four vector-workspace reads and one write per step"
         ),
+        **resolution.to_dict(),
     }
 
 
@@ -178,7 +276,13 @@ def analytic_energy_from_simulator(
 
 
 __all__ = [
+    "SIMULATOR_ROOT_ENV_VAR",
+    "SIMULATOR_ROOT_FROM_ENVIRONMENT",
+    "SIMULATOR_ROOT_FROM_SIBLING_DEFAULT",
+    "SimulatorRootResolution",
     "analytic_energy_from_simulator",
     "analytic_power_provenance",
     "hbm_peak_bandwidth_bytes_per_s",
+    "resolve_simulator_root",
+    "simulator_root",
 ]

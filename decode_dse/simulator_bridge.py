@@ -8,8 +8,11 @@ small typed surface (`Precision`, `DecodeMetrics`, `DecodeSimulator`). Everythin
 else in the DSE imports from here, so if the simulator becomes a real package
 only this file changes.
 
-Set ``PLENA_SIMULATOR_PATH`` to the simulator checkout; the default is the
-``PLENA_Simulator`` checkout beside this repository.
+Set ``PLENA_SIMULATOR_PATH`` to the simulator checkout; when it is unset the
+sibling ``PLENA_Simulator`` checkout is used and that fallback is recorded in
+evaluator provenance.  Resolution itself lives in
+``decode_dse.hardware.power_bridge`` so every reader of the simulator tree
+resolves the same root.
 """
 
 from __future__ import annotations
@@ -24,9 +27,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 
-_DEFAULT_SIM_ROOT = str(
-    Path(__file__).resolve().parents[2] / "PLENA_Simulator"
-)
 _BANDWIDTH_TRAFFIC_CLASSES = ("weights_kv", "activations", "writeback")
 STEP_COMPOSITION = "max_compute_memory"
 COMPILER_TRACE_POINT_SCHEMA = "plena-compiler-trace-point-v1"
@@ -76,12 +76,17 @@ def _model_mapping(value: Any) -> dict[str, Any]:
 
 
 def _sim_root() -> Path:
-    root = Path(os.environ.get("PLENA_SIMULATOR_PATH", _DEFAULT_SIM_ROOT)).expanduser()
+    # Imported lazily: the resolver lives beside the analytic-power bridge,
+    # which imports the hardware design space, and this module is imported
+    # from inside it.
+    from decode_dse.hardware.power_bridge import resolve_simulator_root
+
+    root = resolve_simulator_root().root
     perf = root / "analytic_models" / "performance"
     if not perf.exists():
         raise FileNotFoundError(
-            f"PLENA_Simulator not found at {root} (missing {perf}). Clone it or set "
-            f"PLENA_SIMULATOR_PATH to the checkout root."
+            f"simulator checkout at {root} is incomplete (missing {perf}). "
+            f"Clone it or set PLENA_SIMULATOR_PATH to the checkout root."
         )
     return root
 

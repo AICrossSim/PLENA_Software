@@ -23,13 +23,16 @@ rather than silently made.
 
 - [Execution contract](#execution-contract) — how prefill, admission and decode divide
 - [Declared search space](#declared-search-space) — the per-study precision grid and what admits to hardware pricing
+- [Declared hardware space](#declared-hardware-space) — the structural grid, the knobs held closed, and the runtime reserve
 - [Workflow](#workflow) — the four protocols, launch checks, and module map
 - [Validity scope](#validity-scope) — what evidence does and does not carry over
 - [Publication outcomes](#publication-outcomes) — how results may be framed
 - [Pipeline stages](#pipeline-stages) — what `sweep pipeline` runs, in order
+- [Operator notes](#operator-notes) — the simulator dependency, admission persistence, and re-sealing
 
 To run the study on an execution host, follow `docs/server_setup.md`; this
-document describes the design, not the bring-up.
+document describes the design, not the bring-up. `docs/evidence_tiers.md` is the
+single reference for every tier string this package emits.
 
 ## Execution contract
 
@@ -38,14 +41,26 @@ document describes the design, not the bring-up.
 - Decode admission quantizes K/V once into the selected PackedKV format.
 - New `q_len=1` K/V entries are quantized directly into that format.
 - Admission time and energy belong to TTFT; cached decode contributes TPOT.
-- Embeddings remain BF16. The headline path executes the BF16 LM head as a
-  calibrated reserved endpoint on the same prefill chip after each decode-chip
-  final RMSNorm; no third device is introduced.
+- Embeddings remain BF16. The headline path executes the BF16 LM head **on the
+  decode chip**: its BF16 weights are charged to decode HBM capacity and its
+  projection traffic is re-read every decode step, exactly like every other
+  resident tensor. Only the head's *compute* is idealized - no measured
+  instruction-level timing or energy signature is bound to it - and every row
+  priced at this boundary carries the disclosure
+  `local_bf16_head_compute_idealized`.
+- The alternative placement, a calibrated reserved BF16 endpoint on the prefill
+  chip, remains fully supported as the **comparison arm** at its own measured
+  evidence tier. Both placements can be reported side by side.
 
 The evaluator uses an immutable BF16 prefill artifact and a content-addressed
-admission catalog. One KV format is deterministically recomputed and verified
-at a time, then released before the next format, so the approximately 149 GiB
-Qwen logical admission write volume is not retained simultaneously. Screening
+admission catalog under the `content_addressed_recompute_per_format` persistence
+policy. One KV format is deterministically recomputed and verified at a time,
+then released before the next, so the large logical admission write volume the
+run plan projects is never retained simultaneously. Under this policy the
+persisted total is exactly zero and the logical rebuild cost is reported
+separately through the resource projection; the run plan carries the projected
+figure for the model actually being run. See
+[Admission persistence policies](#admission-persistence-policies). Screening
 and refinement report `post_handoff_greedy_conditioned_nll`: the
 prefill-greedy handoff token is unscored, and later dataset tokens use cached
 `q_len=1` teacher forcing with exact cache positions and one-entry growth. It
@@ -89,16 +104,17 @@ hardware search evaluates the complete precision-by-hardware cross-product.
 Final selection is joint under the accuracy, area, and HBM constraints; there
 is no staged partial-objective decomposition of the canonical search.
 
-Static datapath legality admits the hardware-pricing rows per declared
-space (574 for the canonical Llama space; 336 for the declared Qwen
-subspace). The Qwen hardware grid is pruned to compiler-legal geometry —
-head_dim fixes HLEN at 128, the grouped-query head-broadcast bound requires
-MLEN of at least 1,024 and TP and KVP of at most 8 — so its geometry census
-records zero compiler rejections; compiler-legality pruning removes
-impossible programs, never unpromising ones. HBM channels are searchable at
-8, 16, and 32 interface units, all measured aggregate-calibration groups,
-and the chip-side HBM PHY is charged per interface unit so attached
-bandwidth trades against silicon area. The factorized artifact stores the
+Static datapath legality admits the hardware-pricing rows per declared space:
+574 of the 3,585 Llama IDs, 336 of the 2,017 Qwen IDs. Every one of those rows
+prices, including the ones whose RTL selector path is unimplemented — see
+[RTL capability is recorded, never
+blocking](#rtl-capability-is-recorded-never-blocking). Every priced row is
+admitted on the validated pricing model and discloses whether it was
+additionally compiled and emulated at its own geometry — see [Admission is
+model validation, disclosed per
+row](#admission-is-model-validation-disclosed-per-row).
+
+The factorized artifact stores the
 physical-cost evaluation rows plus the ordered memberships required to
 reconstruct every eligible conceptual join; it never materializes the raw
 cross-product. The scheduler compresses this work only by exact
@@ -108,6 +124,85 @@ hard-resource-gated, simulator-priced, and joined counts. Within the
 declared space it performs no performance, bandwidth demand, memory-bound,
 or objective-based pruning; accuracy is priced for every profile and stamped
 as an `accuracy_within_limit` label, never used as a filter.
+
+## Declared hardware space
+
+`hardware_space` in each study config declares the structural grid;
+`ExactHardwareSpace.iter_candidates` enumerates it exhaustively in canonical
+lexical order, dropping only geometrically impossible points (MLEN divisible by
+BLEN and HLEN, `BLEN <= HLEN <= MLEN`, hidden size divisible by MLEN and TP,
+`TP * KVP == CHIP_COUNT`, enough link ports for the declared parallelism).
+
+The Qwen grid is additionally narrowed to compiler-legal geometry — head_dim
+fixes HLEN at 128, and the grouped-query head-broadcast bound requires MLEN of
+at least 1,024 with TP and KVP at most 8 — so its geometry census records zero
+compiler rejections. Compiler-legality pruning removes impossible programs,
+never unpromising ones.
+
+### Knobs held closed for want of timing evidence
+
+`KV_HEAD_REUSE` and `DRAIN_OVERLAPPED` are declared as `[false]` for both
+models. This is an **evidence-availability restriction, not objective pruning**,
+and it is disclosed as such:
+
+- the drain-overlapped timing mode has no anchor in the timing evidence; and
+- the packed-`q_len=1` timing contracts have not been generated.
+
+A candidate using either knob could therefore only ever be recorded as
+`timing_uncalibrated` — enumerated and priced structurally, but not rankable —
+so the grid does not spend enumeration on it. Opening both knobs takes the Llama structural
+census from 251,328 to 616,032 candidates and the Qwen census from 22,320 to
+55,584. Nothing about those candidates has been shown to be worse; they have
+only not been shown at all. Generating the missing timing contracts is the
+whole of what would be required to reopen them.
+
+Note that the knobs are not free even structurally: when enabled,
+`analytic_models/performance/disagg_decode.py::system_area` charges a KV
+head-reuse control block and a drain-overlap accumulator bank, and both carry
+the `declared_structural_estimate` tier.
+
+### HBM channels and the chip-side PHY
+
+Channels are searchable at 8, 16, and 32 interface units at HBM2 — the channel
+planes with measured aggregate calibration. The Qwen study declares all three;
+the Llama study declares 8. `validate_calibrated_hardware_space` fails closed on
+any generation/channel pair without a rankable measured calibration, so an
+uncalibrated headline operating point cannot be enumerated by accident.
+
+Attached bandwidth is not free. Each interface unit is charged
+0.6875 mm² of chip-side HBM PHY, I/O and beachfront silicon on every chip
+(`PLENA_Simulator/analytic_models/area/hbm_phy.py`, threaded through
+`estimate_system_area` → `disagg_serve/area.py` →
+`performance/disagg_decode.py::system_area`, surfacing as the `HBMPhys`
+breakdown entry). That block's evidence tier is `declared_structural_estimate`:
+its die-edge occupancy is published, its beachfront depth is declared. So
+channel count trades against silicon area in the Pareto ranking, at a disclosed
+tier weaker than the calibrated compute-and-SRAM census it is added to.
+
+### Runtime HBM reserve
+
+`publication_pipeline.resources.runtime_hbm_reserve_bytes` is an allowance for
+working memory outside the weight, KV and activation ledger. Both configs
+declare 512 MiB.
+
+Three properties are worth stating because they are easy to assume otherwise:
+
+- **The reserve is per chip on every topology path.** The explicit `TP × KVP`
+  ledger scales it by chip count internally, and the legacy aggregate ledger
+  multiplies it by chip count so the two topologies agree about the feasibility
+  of the identical physical system.
+- **It is clamped to a structural fraction of per-chip capacity.**
+  `_effective_runtime_hbm_reserve_bytes` takes the minimum of the configured
+  value and per-chip HBM capacity divided by
+  `RUNTIME_HBM_RESERVE_CAPACITY_DIVISOR` (8). A reserve chosen against a large
+  memory can therefore never exceed — let alone dominate — a smaller one, and a
+  reserve larger than the chip cannot render every geometry infeasible
+  regardless of precision, sharding or chip count.
+- **Preflight and pricing use the identical clamped value**, and that value is
+  part of the resource-ledger cache key. The cheap resource preflight admits a
+  candidate if and only if the full simulator evaluation finds it
+  capacity-feasible; the two cannot disagree, and a reserve change cannot be
+  served from a stale ledger.
 
 ## Workflow
 
@@ -131,7 +226,10 @@ Both model configurations require explicit single-device placement, BF16,
 `sm_100`, minimum package versions, and declarative resource requirements.
 Planning includes the full immutable manifest, run plan, provenance, logical
 write volume, concurrency-bounded peak footprint, device requirement, and the
-42-hour ceiling. Preflight reports only the machine on which it actually runs;
+run plan's `max_projected_hours` ceiling (168 h unless the plan narrows it),
+against which the launch gate checks the projection. Any tighter operational
+budget belongs in the model's runbook, not here.
+Preflight reports only the machine on which it actually runs;
 it does not substitute or project a remote host. It also does not invent a
 wall-clock projection before the first completed measured profile; the runner
 records that first duration and updates the ETA continuously.
@@ -224,6 +322,122 @@ batch requested by the candidate. Compiler, emulator, RTL, and timing evidence
 never carries over to a different batch, even when its geometry otherwise
 matches.
 
+### RTL capability is recorded, never blocking
+
+`legality.py` partitions the five capability stages into two disjoint sets:
+
+```text
+PRICING_BLOCKING_STAGES  = ("software", "compiler", "emulator")
+PRICING_RECORDED_STAGES  = ("rtl", "dc")
+```
+
+The split follows from what the timing tiers actually claim.
+`TIMING_TIER_REQUIRED_VALIDITY` admits both declared publication tiers on
+compiler and emulator validity alone, so a structural limitation in one of those
+stages — or in the software implementation feeding them — means nothing
+downstream could be evaluated at all, and the point cannot be priced. A
+limitation confined to the RTL implementation or the DC flow is orthogonal to
+what those tiers claim.
+
+`CrossStackCapability` therefore exposes `blocking_issues`, `recorded_issues`
+(an exhaustive partition of `issues`), and `prices_at_publication_tier`, and
+`hardware/evaluation.py` carries all three onto the row:
+`packedkv_selector_blocking_issue_codes` decides whether a price is withheld,
+`packedkv_selector_recorded_issue_codes` is disclosed alongside it, and
+`packedkv_selector_issue_codes` remains the complete record. A recorded issue
+still forces `rtl_valid=False` through `CrossStackCapability.validity_floor`; it
+simply does not delete the row.
+
+The PackedKV limitations that land in the recorded set today are:
+
+| Code | What is unimplemented |
+| --- | --- |
+| `rtl_batched_mxfp_unsupported` | the packed batched-attention selector exists only on the MXINT matrix path |
+| `rtl_mxint_scale_segment_mismatch` | the MXINT MCU requires BLEN to divide the MX block size |
+| `rtl_mxint_activation_requant_unvalidated` | the RTL FP-to-MXINT activation path is validated for MXINT4 and MXINT8 only |
+
+**This is the single largest change to what the study reports.** Under the
+previous all-or-nothing rule, any RTL limitation withheld the analytic price, so
+of the 574 hardware-legal Llama profiles only 84 priced; the remaining 490 (448
+MXFP profiles and 42 MXINT profiles with an unvalidated activation format at the
+default target) were absent from the design space rather than disclosed within
+it. All 574 now price. The Qwen space moves the same way, 84 of 336 to 336 of
+336.
+
+Stated plainly: **every published MXFP number rests on compiler and emulator
+evidence with an explicitly unimplemented RTL selector path.** It is an analytic
+price at a tier that never claimed RTL execution, carrying the reason the RTL
+selector cannot execute it. It is not an RTL result, and `rtl_valid` is false on
+every one of those rows.
+
+### Admission is model validation, disclosed per row
+
+A row is admitted into the reported results when it was **priced by a
+validated, identified pricing model** — calibrated timing bound to a
+timing-evidence identity at a declared timing tier, calibrated memory timing
+bound to a bandwidth calibration identity, an energy tier plus the identity of
+the coefficient set behind it, an identified area model, a priced output-head
+boundary, a layout and composed system identity, and demonstrated capacity,
+runtime and resource-budget feasibility — with a succeeded numerical run, measured
+software-stage validity, and no structural capability limitation on a blocking
+stage. `evaluate_publication_admission` in `hardware/design_space.py` is that
+test. This is the usual architecture-DSE contract: validate the model against a
+reference implementation, then explore the space with the validated model and
+report the model's error.
+
+It deliberately does **not** claim that each individual design point was
+separately compiled and emulated. A successful compiler or emulator observation
+is scoped by `scope_stack_validity` to the exact geometry it was measured at,
+so requiring it per point would confine the reported study to the one geometry
+the hardware-validation stage ran at. `legality.py` therefore splits the
+blocking stages again:
+
+```text
+MODEL_REQUIRED_VALIDITY_STAGES = ("software",)             # required, not scoped
+INDIVIDUAL_VALIDATION_STAGES   = ("compiler", "emulator")  # scoped, disclosed
+```
+
+For the scoped pair the three `StackValidity` states stay distinct evidence: a
+measured `False` is evidence about the point and **excludes** it, a `True`
+marks the row individually validated, and a `None` means "not measured here" —
+admitted, and said so. Nothing is silently promoted.
+
+Every admitted row therefore carries `individually_validated`, the per-stage
+coverage, its own runtime target and — when individually validated — the
+evidence target the measurement was taken at, alongside the identities of the
+pricing models its numbers rest on. Those fields appear on the admission
+verdict, on promotion and selection records, in `hardware_points.csv`, in the
+figure receipt (`pricing_model_validation`, with the admitted and
+individually-validated point counts), in the final selection record and on
+each HBM-sensitivity source.
+
+The strict view remains selectable from the same predicate, so both framings
+can be reported side by side:
+`evaluate_publication_admission(row, require_individual_validation=True)`,
+`select_admitted_rows(rows, require_individual_validation=True)`, and
+`selection.individually_validated_points` /
+`individually_validated_candidates`. `all_stages_valid` remains the strict,
+fail-closed record that every stage including RTL and DC passed.
+
+On the completed Llama study this is the difference between reporting the
+validated model's design space and reporting one point of it: of 16,384 priced
+rows across 574 profiles, **135 rows across 100 profiles are individually
+validated**, all at the single validation geometry (MLEN 1024 / BLEN 8 /
+HLEN 128 / batch 1 / 8 KV heads, best 135 tok/s). The other 16,249 rows are
+priced by the same validated models, are marked `individually_validated:
+false`, and reach 2,226 tok/s whole-model. Widening the individual coverage
+means additional hardware-validation points, never a relaxed scoping predicate.
+
+The validation quality the models rest on is read from the calibration
+artifacts by `hardware/model_validation.py` and travels with the claim: the
+timing model's analytical-versus-emulator MAPE against its limit, the
+bandwidth calibration's descriptor-aware holdout median / P95 / P99 and its
+worst retained group, the area census's per-family and full-chip holdout errors
+together with the fitted MLEN/BLEN grid and an inside/outside verdict, and the
+analytic energy tier with each component's evidence scope. All of these are
+simulator-calibrated model errors, not measured-silicon errors, and the record
+says so on every entry.
+
 ## Publication outcomes
 
 PackedKV is framed capacity first:
@@ -241,9 +455,18 @@ Power and timing are rankable only after their holdout gates pass. BF16 is the
 software accuracy reference; it is not represented as a PLENA BF16 matrix-chip
 realization.
 
-The local BF16 LM head is an explicitly unrankable hardware sensitivity. A
-locally quantized LM head is accuracy-only and cannot supply hardware costs or
-enter deployment selection.
+The decode-local BF16 LM head is the rankable headline boundary. It is
+optimistic in exactly one named respect - the head's compute carries no
+measured cost evidence - and that idealization is recorded on every row it
+prices, in `metrics.output_head_boundary.scope_idealizations` and in the
+evaluator identity, so it can never be read as a modelled head. The external
+BF16 head service stays rankable at its measured tier as the comparison arm.
+
+Reserving a whole external endpoint dominates the energy ledger with that
+device's idle draw rather than with the projection itself, which is why the
+local boundary is the headline: it prices the projection where the model
+actually runs. A locally *quantized* LM head remains accuracy-only and cannot
+supply hardware costs or enter deployment selection.
 
 HBM technology does not multiply the 3,585-point numerical manifest. Four
 selected native-datapath hardware profiles receive a separate 20-point
@@ -276,7 +499,9 @@ that model's plan and preflight evidence pass. It executes in this order:
    whose output is byte-identical to the serial order.
 7. **Joint source selection** over the verified partitions; when the config
    declares `accuracy_budgets`, the promotion record also carries the strict
-   and relaxed accuracy frontiers.
+   and relaxed accuracy frontiers. Pass that record to the figure stage with
+   `--refinement-promotion` so `05_hardware_pareto` draws the emitted
+   frontiers instead of recomputing its own.
 8. **Refinement**, following the declared protocol.
 9. **Repricing** of the selected refined profiles.
 10. **Publication benchmarks and final selection**, only when
@@ -304,22 +529,54 @@ recorded and disclosed on every row but never required.
 
 ### HBM operating points
 
-The calibrated bandwidth model is measured at the emulator's 2 Gb/s pin rate
-with channel groups at 8, 16, and 32 interface units; those are the only
-rankable headline operating points, and `validate_calibrated_hardware_space`
-fails closed on anything else. The calibration rows labelled HBM3 were also
-measured at the emulator rate and are not used for headline pricing. Faster
-HBM generations appear only through the separate `hbm_sensitivity`
+The calibrated bandwidth model is measured at the emulator's 2 Gb/s pin rate.
+For HBM2 that *is* the production pin rate, so HBM2 at 8, 16, and 32 interface
+units are the only rankable headline operating points, and
+`validate_calibrated_hardware_space` fails closed on anything else. The
+calibration rows labelled HBM3 were measured at the same 2 Gb/s emulator rate
+rather than a production HBM3 rate, and are not used for headline pricing.
+Faster HBM generations appear only through the separate `hbm_sensitivity`
 disclosure, which never ranks across generations.
+
+Those three channel planes rest on a receipted Ramulator2 calibration: 11,520
+isolated observations over four channel planes (8, 16, 32 and 128), with one
+immutable receipt binding every process invocation, its op-statistics, the
+emulator and compiler state, and the toolchain. On a descriptor-aware holdout
+the model's absolute latency error is 6.27% median and 23.22% at P95.
+
+The tail is not uniform across the planes, and it must travel with the results.
+**The hardest retained group is HBM2 matrix prefetch at 32 channels, at 47.43%
+P95 (16 channels: 20.42%; 8 channels: 9.78%), and 32 channels is also the
+weakest plane for vector store (34.00% P95) and vector prefetch (31.26% P95).**
+That band must be quoted wherever 32-channel results are reported. These are
+simulator-calibrated model errors, not measured-silicon errors. See
+`PLENA_Simulator/analytic_models/disagg_serve/CALIBRATION_PROVENANCE.md`.
 
 ### Energy tiers
 
-Every rankable study row prices energy per generated token on the
-literature-anchored analytic power model and carries the
-`analytic_anchored` tier. Supplying `artifacts.power_calibration` and
-`artifacts.area_config` switches pricing to the DC-calibrated event-power
-engine (`dc_calibrated` tier), which fails closed outside its measured
-interpolation domain. The figure stage writes `energy_context.json`, which
+Every rankable study row prices energy per generated token through
+`hardware/power_bridge.py` onto the simulator's analytic decode-power model
+(`analytic_models/disagg_serve/decode_power.py`) and carries the
+`analytic_anchored` tier. That total is the sum of five separately reported
+terms, and their evidence is deliberately mixed rather than uniform:
+
+| Term | Evidence |
+| --- | --- |
+| HBM read/write per-bit energy | published experimental data, per generation |
+| HBM background power | midpoint of a reported range, labelled as such |
+| SRAM read energy | median of the vendored ASAP7 macro library internal-power extraction — 0.0479 pJ/bit over 36 macros at TT / 0.7 V / 25 C, replacing a scaled textbook estimate that sat at the optimistic edge of the same extracted range |
+| Compute | 0.203 pJ/MAC at 4-bit operands, literature-anchored to a reported whole-chip figure |
+| Leakage | 0.05 W/mm², **declared** — no complete-chip leakage report exists |
+
+The coefficient set is hashed into an `energy_id` stamped on every priced row,
+so rows priced under different coefficients are never silently mixed.
+
+Supplying `artifacts.power_calibration` and `artifacts.area_config` together
+switches pricing to the DC-calibrated event-power engine
+(`analytic_models/power`, `dc_calibrated` tier), which fails closed outside its
+measured interpolation domain. That is a different engine, not a different
+setting: no code changes, and neither engine's numbers are adjusted to resemble
+the other's. The figure stage writes `energy_context.json`, which
 places the best analytic PLENA point next to the measured GPU board energy
 with both tiers, an explicit `model_estimate_over_measured_gpu` ratio
 semantics, and `not_a_headline_claim`; measured-versus-measured headline
@@ -367,16 +624,23 @@ choice. Three inputs live under the workspace `external/` boundary:
    geometry; the artifact carries `evidence_tier: emulator` and every consumer
    surfaces that tier. An RTL-tier artifact satisfies the same gate.
 2. **The full-model independent-request compiler trace set.**
-3. **The BF16 output-head service calibration.**
+3. **The BF16 output-head service calibration**, which prices the comparison
+   arm.
 
-The third cannot be produced by timing `lm_head` on the execution GPU. The
-headline boundary places a dedicated BF16 endpoint on the prefill chip, so the
-artifact requires measurements taken at that physical endpoint: repeated and
-holdout logits, remote-link request and response timing, component dynamic
-energy, and leakage. The first pipeline command validates it against the pinned
-model and every searched batch, and fails before any GPU sweep work if it is
-missing or incomplete. No component energy or link measurement is ever inferred
-from GPU timing.
+The third cannot be produced by timing `lm_head` on the execution GPU. It
+describes a dedicated BF16 endpoint on the prefill chip, so the artifact
+requires measurements taken at that physical endpoint: repeated and holdout
+logits, remote-link request and response timing, component dynamic energy, and
+leakage. The first pipeline command validates it against the pinned model and
+every searched batch, and fails before any GPU sweep work if it is missing or
+incomplete. No component energy or link measurement is ever inferred from GPU
+timing.
+
+The headline no longer depends on it: with `output_head_contract.headline_location`
+set to `decode_bf16_unmodeled` the study prices the head on the decode chip and
+records the service artifact beside it as the comparison arm. The evaluator
+takes the boundary from `--output-head-location`, defaulting to the contract
+the study config declares.
 
 ### Refinement and benchmarks
 
@@ -400,3 +664,88 @@ RULER is either omitted entirely or supplied as the complete 4K/8K/16K/32K set;
 a partial set is not accepted. Contract construction, benchmark execution, the
 post-accuracy exact hardware join, and the fail-closed final selection receipt
 all remain inside the same restartable pipeline.
+
+## Operator notes
+
+### Resolving the simulator checkout
+
+`decode_dse` obtains every physical number — area, bandwidth, latency, energy —
+from a `PLENA_Simulator` checkout. Resolution has one owner,
+`hardware/power_bridge.py::resolve_simulator_root`; the simulator bridge, the
+source-digest provenance and the analytic power bridge all call it, so they
+cannot end up reading different trees.
+
+`PLENA_SIMULATOR_PATH` wins whenever it is set. An empty value is a
+declaration error, and a value that does not contain
+`analytic_models/disagg_serve` fails immediately rather than importing a
+partial tree. Only a completely undeclared environment falls back to the
+*sibling directory literally named* `PLENA_Simulator` — which, from a worktree
+checked out under any other name, is a different checkout than the one under
+test. That fallback no longer happens silently: every evaluation records
+`simulator_root` and `simulator_root_source`
+(`environment` or `repository_sibling_default`) in backend provenance and in
+`analytic_power_provenance()`, so a study priced against an unintended tree is
+visible in its own artifacts. Export the variable for every command;
+`scripts/launch_pipeline.sh` does this and should be the only entry point.
+
+### Admission persistence policies
+
+`hardware/admission_cost.py` accepts exactly two persistence policies, and each
+pins its own persisted-byte expectation. The policy is one concept that the
+on-disk artifacts spell three ways — `persistence_policy` at the top level of
+the preparation receipt and its index, `persistence_contract` inside the
+persisted-contract resource projection, and `policy` inside the recomputable
+resource projection — so it is read through the single accessor
+`admission_persistence_policy`, which accepts all three key names, rejects a
+document that declares them inconsistently, and fails closed on any policy
+string outside the two below. The artifact format is unchanged.
+
+| `persistence_contract` | Persisted bytes | Meaning |
+| --- | --- | --- |
+| `packed_planes_plus_bf16_numerical_view` | must be `> 0` | packed element and scale planes plus the BF16 numerical view are kept on disk |
+| `content_addressed_recompute_per_format` | must be exactly `0` | nothing survives preparation; each format is deterministically rebuilt from its source when required |
+
+Any other policy string fails closed — it is unknown evidence, not a default.
+Under the recompute policy the receipt still accounts for the work: the summed
+per-record size is reported as the *logical* rebuild cost through
+`resource_projection`, and the projected cold-artifact total must be positive,
+so a degenerate receipt that projects nothing to rebuild is rejected. Both the
+receipt and the index must agree on the policy and on both totals.
+
+The recompute policy is what makes the execution contract above possible: one
+KV format is rebuilt, verified and released before the next, so a large logical
+admission write volume is never retained simultaneously. Reading only the
+persisted contract — as the correctness check previously did — rejected every
+receipt prepared under the recompute policy even when the receipt itself
+validated.
+
+### The source-tree hash and re-sealing
+
+`software/gpu_baseline.py::_source_tree_hash` digests every `.py`, `.json` **and
+`.md`** file under `decode_dse/`, and that digest is bound into a sealed
+workspace's provenance. Editing documentation therefore invalidates a sealed
+workspace exactly as editing code does. This is intentional — the sealed
+identity covers everything that describes the study — but it means
+documentation changes are never free on a live run, and must not be made
+against a tree a run is executing from.
+
+Re-sealing after any change under `decode_dse/`:
+
+1. **Set aside** — never delete — the stale derived immutables:
+   `provenance.json`, `runtime_environment.json`, `admission_preparation.json`,
+   `publication_evidence_gate.json`, `preflight_evidence.json`,
+   `preflight_gate_report.json`, `pipeline/contract.json`, `pipeline/completed/`,
+   `gpu_baseline/`, `artifacts/prefill_bf16`, and the per-stage
+   `invocation.json` files. Moving them aside keeps the superseded evidence
+   auditable; deleting them destroys the record of what the workspace used to
+   claim.
+2. Re-capture prefill (`inputs prefill`).
+3. Re-run `stage plan`.
+4. Re-run `inputs admission`.
+5. Resume the pipeline.
+
+**Measured artifacts are not regenerated by this procedure.** The numerical
+screen, the hardware-validation results and the external evidence artifacts
+under `external/` are measurements, not derived immutables; re-sealing rebinds
+them, it does not re-measure them. Re-measuring would discard evidence, not
+refresh it.

@@ -64,3 +64,26 @@ The sealed plan fixes two workers, so exactly two GPU ids are passed
 regardless of the number of physical boards. Verify with NVML that both
 chosen boards are idle and hold no foreign compute processes before the
 head-service measurement and before launch.
+
+The measured GPU baseline itself is single-device: `gpu_baseline.first_gpu_only`
+is true, so the baseline is measured on the first visible GPU and the run plan's
+`--device-label` is the device the results are attributed to.
+
+## Editing anything under `decode_dse/`
+
+`_source_tree_hash` covers every `.py`, `.json` **and `.md`** file under
+`decode_dse/`, and that digest is bound into a sealed workspace. Editing
+documentation invalidates a sealed workspace exactly as editing code does, so
+never edit a tree a run is executing from — work in a separate worktree and
+re-seal deliberately.
+
+The re-seal procedure — which derived immutables to set aside, in what order to
+re-capture and re-plan, and which measured artifacts are *not* regenerated — is
+in the *Operator notes* section of `decode_dse/README.md`.
+
+## Reading the results
+
+`decode_dse/docs/evidence_tiers.md` is the reference for every tier label the
+pipeline emits: capability stages, timing tiers, energy tiers, area tiers,
+calibration grades, accuracy labels and the measured tier. Anything reported out
+of this study should be quoted with its tier.

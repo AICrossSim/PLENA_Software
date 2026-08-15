@@ -14,11 +14,23 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 from decode_dse.hardware.statistics import percentile, spearman_rank_correlation
 from decode_dse.hardware.lm_head_service import (
+    DECODE_BF16_HEAD,
+    EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
+    OUTPUT_HEAD_IDEALIZATIONS,
+    OUTPUT_HEAD_LOCATIONS,
     composite_system_calibration_id,
+    local_head_system_calibration_id,
     require_content_addressed_id,
 )
-from decode_dse.legality import StackValidity
+from decode_dse.legality import (
+    INDIVIDUAL_VALIDATION_STAGES,
+    MODEL_REQUIRED_VALIDITY_STAGES,
+    PRICING_BLOCKING_STAGES,
+    PRICING_RECORDED_STAGES,
+    ADMISSION_BASIS,
+    StackValidity,
+)
 from decode_dse.profiles import (
     PROFILE_KIND_BF16_REFERENCE,
     PROFILE_KIND_QUANTIZED,
@@ -32,6 +44,37 @@ DEFAULT_REQUIRED_TASKS = ("gsm8k", "ifeval")
 DEFAULT_RULER_LENGTHS = (4096, 8192, 16384, 32768)
 BF16_REFERENCE_SCOPE = "split_execution_software_accuracy"
 ENERGY_TIERS = frozenset({"analytic_anchored", "dc_calibrated"})
+_STAGE_VALIDITY_FIELD: Mapping[str, str] = {
+    "software": "software_valid",
+    "compiler": "compiler_valid",
+    "emulator": "emulator_valid",
+    "rtl": "rtl_valid",
+    "dc": "dc_calibrated",
+}
+#: Stages the declared publication timing tiers rest on.  A capability
+#: limitation on any of them still withholds the price entirely; what differs
+#: between them is whether *measured* validity is required per point.
+BLOCKING_VALIDITY_FIELDS: tuple[str, ...] = tuple(
+    _STAGE_VALIDITY_FIELD[stage] for stage in PRICING_BLOCKING_STAGES
+)
+#: Blocking stages whose measured validity is required on every candidate,
+#: because it is not scoped to a geometry: a profile's software implementation
+#: either ran or it did not.
+MODEL_REQUIRED_VALIDITY_FIELDS: tuple[str, ...] = tuple(
+    _STAGE_VALIDITY_FIELD[stage] for stage in MODEL_REQUIRED_VALIDITY_STAGES
+)
+#: Blocking stages whose successful evidence ``scope_stack_validity`` confines
+#: to the geometry it was measured at.  These are reported as individual
+#: validation coverage rather than required; a measured failure still excludes.
+INDIVIDUAL_VALIDATION_FIELDS: tuple[str, ...] = tuple(
+    _STAGE_VALIDITY_FIELD[stage] for stage in INDIVIDUAL_VALIDATION_STAGES
+)
+#: Stages whose validity is recorded and disclosed on the candidate but never
+#: required.  Neither publication tier claims RTL-simulated or DC-calibrated
+#: evidence, so their absence cannot withhold eligibility.
+RECORDED_VALIDITY_FIELDS: tuple[str, ...] = tuple(
+    _STAGE_VALIDITY_FIELD[stage] for stage in PRICING_RECORDED_STAGES
+)
 
 
 def _energy_tier_rank(value: str | None) -> int:
@@ -40,6 +83,34 @@ def _energy_tier_rank(value: str | None) -> int:
     if value == "analytic_anchored":
         return 1
     return 2
+
+
+def _bound_output_head_boundary(
+    location: str,
+    idealizations: Sequence[str],
+    head_service_calibration_id: str | None,
+) -> bool:
+    """Validate one output-head boundary and report whether it is identified.
+
+    Both placements must name themselves and their scope limits.  Only the
+    external service carries a measured head calibration identity: the
+    decode-local head is priced inside the decode chip's own ledger, so its
+    boundary is identified by the declared idealization instead.
+    """
+
+    if location not in OUTPUT_HEAD_LOCATIONS:
+        raise ValueError("output_head_location is unsupported")
+    if tuple(idealizations) != OUTPUT_HEAD_IDEALIZATIONS[location]:
+        raise ValueError(
+            "output-head idealizations must match the priced boundary"
+        )
+    if location == EXTERNAL_BF16_HEAD:
+        return bool(head_service_calibration_id)
+    if head_service_calibration_id:
+        raise ValueError(
+            "the decode-local head carries no head-service calibration"
+        )
+    return True
 
 
 class CalibrationEvidence(Protocol):
@@ -113,12 +184,48 @@ class ParetoPoint:
     cost_scope: str | None = None
     system_calibration_id: str | None = None
     head_service_calibration_id: str | None = None
+    #: Priced output-head placement.  The external service is measured and
+    #: carries a head-service calibration identity; the decode-local head has
+    #: no second endpoint and instead discloses its idealizations.
+    output_head_location: str = EXTERNAL_BF16_HEAD
+    output_head_idealizations: tuple[str, ...] = ()
     whole_model_rankable: bool = False
     energy_tier: str | None = None
     publication_timing_tier: str | None = None
+    # Disclosure of evidence that is recorded but never required by the
+    # publication tiers.  ``rtl_valid`` false or null means the point rests on
+    # an RTL path that is unvalidated or unmeasured; the codes name why.
+    rtl_valid: bool | None = None
+    recorded_issue_codes: tuple[str, ...] = ()
+    #: Individual-validation coverage for this exact design point: whether it
+    #: was *additionally* compiled and emulated at its own geometry, on top of
+    #: being priced by the validated pricing model that admitted it.  ``None``
+    #: means the point was built without a coverage record; it is reported as
+    #: unknown rather than assumed either way.
+    individually_validated: bool | None = None
+    individual_validation_coverage: Mapping[str, Any] | None = None
+    #: The identities of the pricing models this point's numbers rest on.
+    pricing_model: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _finite_optional("mean_nll", self.mean_nll)
+        if self.individually_validated is not None and not isinstance(
+            self.individually_validated, bool
+        ):
+            raise ValueError("individually_validated must be boolean or null")
+        for name in ("individual_validation_coverage", "pricing_model"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if not isinstance(value, Mapping):
+                raise ValueError(f"{name} must be a mapping or null")
+            object.__setattr__(self, name, dict(value))
+        if self.rtl_valid is not None and not isinstance(self.rtl_valid, bool):
+            raise ValueError("rtl_valid must be boolean or null")
+        codes = tuple(
+            sorted({str(code) for code in self.recorded_issue_codes if str(code)})
+        )
+        object.__setattr__(self, "recorded_issue_codes", codes)
         for name in ("tpot_ms", "tps", "energy_per_token_j", "area_mm2"):
             _finite_optional(name, getattr(self, name), positive=True)
         if self.publication_timing_tier is not None:
@@ -155,12 +262,22 @@ class ParetoPoint:
                 self.energy_per_token_j,
             )
         )
+        object.__setattr__(
+            self,
+            "output_head_idealizations",
+            tuple(str(code) for code in self.output_head_idealizations),
+        )
+        head_boundary_bound = _bound_output_head_boundary(
+            self.output_head_location,
+            self.output_head_idealizations,
+            self.head_service_calibration_id,
+        )
         if has_system_cost:
             if (
                 not self.whole_model_rankable
                 or self.cost_scope != "whole_model"
                 or not self.system_calibration_id
-                or not self.head_service_calibration_id
+                or not head_boundary_bound
             ):
                 raise ValueError(
                     "serving costs require a calibrated whole-model boundary"
@@ -212,8 +329,39 @@ class ParetoPoint:
             "head_service_calibration_id": (
                 self.head_service_calibration_id
             ),
+            "output_head_location": self.output_head_location,
+            "output_head_idealizations": list(
+                self.output_head_idealizations
+            ),
             "whole_model_rankable": self.whole_model_rankable,
+            "rtl_valid": self.rtl_valid,
+            "recorded_issue_codes": list(self.recorded_issue_codes),
+            # Admission rests on the pricing model being validated;
+            # whether *this* point was also individually compiled
+            # and emulated is a separate, narrower claim and is stated here.
+            "individually_validated": self.individually_validated,
+            "individual_validation_coverage": (
+                dict(self.individual_validation_coverage)
+                if self.individual_validation_coverage is not None
+                else None
+            ),
+            "pricing_model": (
+                dict(self.pricing_model)
+                if self.pricing_model is not None
+                else None
+            ),
         }
+
+    @property
+    def rests_on_unimplemented_rtl_path(self) -> bool:
+        """True when the point is priced without validated RTL evidence.
+
+        Such a point is legitimately rankable -- the publication timing tiers
+        require compiler and emulator evidence only -- but every record and
+        figure built from it must disclose the gap rather than hide it.
+        """
+
+        return self.rtl_valid is not True or bool(self.recorded_issue_codes)
 
 
 @dataclass(frozen=True)
@@ -322,6 +470,61 @@ def epsilon_pareto_fronts(
 
 DUAL_ACCURACY_FRONTIERS_SCHEMA = "decode-dual-accuracy-frontiers"
 
+#: Budget names, in the order they are reported.  ``unconstrained`` carries no
+#: limit and admits every point.
+ACCURACY_BUDGET_NAMES = ("strict", "relaxed", "unconstrained")
+
+
+def relative_perplexity_from_mean_nll(
+    mean_nll: float,
+    reference_mean_nll: float,
+) -> float:
+    """Return relative perplexity as a ratio against the reference row.
+
+    Relative perplexity is ``exp(mean_nll - reference_mean_nll)``.  Figures
+    carry the same quantity expressed as a percentage increase, which is
+    ``100 * (ratio - 1)``; :func:`relative_perplexity_from_percent` is its
+    exact inverse, so both representations reduce to one comparison.
+    """
+
+    delta = float(mean_nll) - float(reference_mean_nll)
+    if delta > math.log(float.fromhex("0x1.fffffffffffffp+1023")):
+        return math.inf
+    return math.exp(delta)
+
+
+def relative_perplexity_from_percent(
+    relative_perplexity_percent: float,
+) -> float:
+    """Return relative perplexity as a ratio from its percentage increase."""
+
+    return 1.0 + float(relative_perplexity_percent) / 100.0
+
+
+def within_accuracy_budget(
+    relative_perplexity: float,
+    relative_perplexity_limit: float,
+) -> bool:
+    """Return whether a relative perplexity sits inside an accuracy budget.
+
+    This is the single definition of "inside a budget" in the package.  The
+    joint selection record and the hardware Pareto figure both reduce their
+    own row metric to a relative-perplexity ratio and call this, so the
+    figure's envelopes and the emitted frontiers cannot admit different point
+    sets.
+    """
+
+    return float(relative_perplexity) <= float(relative_perplexity_limit)
+
+
+def accuracy_budget_mean_nll_limit(
+    reference_mean_nll: float,
+    relative_perplexity_limit: float,
+) -> float:
+    """Return the mean-NLL ceiling a relative-perplexity budget implies."""
+
+    return float(reference_mean_nll) + math.log(float(relative_perplexity_limit))
+
 
 def dual_accuracy_frontiers(
     points: Iterable[ParetoPoint],
@@ -351,18 +554,35 @@ def dual_accuracy_frontiers(
         )
     ordered = tuple(sorted(points, key=_point_order))
     budgets: dict[str, Any] = {}
-    for name, limit in (
-        ("strict", float(strict_relative_perplexity)),
-        ("relaxed", float(relaxed_relative_perplexity)),
-        ("unconstrained", None),
+    for name, limit in zip(
+        ACCURACY_BUDGET_NAMES,
+        (
+            float(strict_relative_perplexity),
+            float(relaxed_relative_perplexity),
+            None,
+        ),
     ):
         if limit is None:
             mean_nll_limit = None
             admitted = ordered
         else:
-            mean_nll_limit = reference_mean_nll + math.log(limit)
+            # The mean-NLL ceiling stays in the record as a disclosure; the
+            # admission itself goes through the shared budget predicate so it
+            # is the same comparison the Pareto figure makes.
+            mean_nll_limit = accuracy_budget_mean_nll_limit(
+                reference_mean_nll,
+                limit,
+            )
             admitted = tuple(
-                point for point in ordered if point.mean_nll <= mean_nll_limit
+                point
+                for point in ordered
+                if within_accuracy_budget(
+                    relative_perplexity_from_mean_nll(
+                        point.mean_nll,
+                        reference_mean_nll,
+                    ),
+                    limit,
+                )
             )
         fronts = epsilon_pareto_fronts(admitted, epsilon) if admitted else ()
         front = fronts[0] if fronts else ()
@@ -1124,6 +1344,10 @@ class PublicationCandidate:
     cost_scope: str | None = None
     system_calibration_id: str | None = None
     head_service_calibration_id: str | None = None
+    #: Priced output-head placement and the scope limits it discloses.  See
+    #: ``ParetoPoint`` for the same contract at profile level.
+    output_head_location: str = EXTERNAL_BF16_HEAD
+    output_head_idealizations: tuple[str, ...] = ()
     whole_model_rankable: bool = False
     timing_mode: str = "rtl_serialized"
     timing_calibrated: bool = False
@@ -1160,12 +1384,22 @@ class PublicationCandidate:
             self.tpot_ms is not None
             or self.energy_per_token_j is not None
         )
+        object.__setattr__(
+            self,
+            "output_head_idealizations",
+            tuple(str(code) for code in self.output_head_idealizations),
+        )
+        head_boundary_bound = _bound_output_head_boundary(
+            self.output_head_location,
+            self.output_head_idealizations,
+            self.head_service_calibration_id,
+        )
         if has_serving_cost:
             if (
                 not self.whole_model_rankable
                 or self.cost_scope != "whole_model"
                 or not self.system_calibration_id
-                or not self.head_service_calibration_id
+                or not head_boundary_bound
             ):
                 raise ValueError(
                     "deployment costs require a calibrated whole-model boundary"
@@ -1234,25 +1468,118 @@ class PublicationCandidate:
         object.__setattr__(self, "ruler_scores", ruler)
 
     @property
-    def fully_hardware_valid(self) -> bool:
-        stack_fields = (
-            "software_valid",
-            "compiler_valid",
-            "emulator_valid",
-            "rtl_valid",
-        )
+    def priced_evidence_complete(self) -> bool:
+        """Whether the candidate carries every cost identity publication needs.
+
+        This is the eligibility test the final gate applies, and it
+        matches ``evaluate_publication_admission``: the candidate must be
+        priced by a validated, identified pricing model -- calibrated timing
+        bound to a timing-evidence identity, an identified energy tier, a
+        composed whole-model system identity and a bound output-head boundary.
+
+        Measured validity is required only where it is *not* geometry scoped.
+        The software stage either ran for the profile or did not, so it stays
+        required (``MODEL_REQUIRED_VALIDITY_FIELDS``).  Compiler and emulator
+        evidence is scoped by ``scope_stack_validity`` to the exact geometry it
+        was measured at, so a candidate away from that geometry carries
+        ``None``; that is disclosed coverage, not a defect, and is reported
+        through :attr:`individually_validated` and
+        :attr:`individual_validation_stages`.  A measured *failure* on those
+        stages is never tolerated.  RTL and DC validity remain recorded and
+        disclosed through :attr:`recorded_validity` and
+        :attr:`rests_on_unimplemented_rtl_path`, never required.
+
+        The one exception is the DC-calibrated energy tier: a candidate that
+        *claims* DC-calibrated energy must actually carry DC validity, because
+        there the tier itself is the claim.  A candidate whose DC evidence is
+        absent still qualifies at the analytic-anchored tier.
+        """
+
         return (
             self.timing_calibrated
+            and self.timing_evidence_id is not None
             and self.power_calibration_id is not None
             and self.energy_tier in ENERGY_TIERS
             and self.whole_model_rankable
             and self.cost_scope == "whole_model"
             and self.system_calibration_id is not None
-            and self.head_service_calibration_id is not None
-            and all(getattr(self.validity, field) is True for field in stack_fields)
+            and _bound_output_head_boundary(
+                self.output_head_location,
+                self.output_head_idealizations,
+                self.head_service_calibration_id,
+            )
+            and all(
+                getattr(self.validity, field) is True
+                for field in MODEL_REQUIRED_VALIDITY_FIELDS
+            )
+            and not any(
+                getattr(self.validity, field) is False
+                for field in INDIVIDUAL_VALIDATION_FIELDS
+            )
             and (
                 self.energy_tier != "dc_calibrated"
                 or self.validity.dc_calibrated is True
+            )
+        )
+
+    @property
+    def individually_validated(self) -> bool:
+        """True when this exact point was also compiled and emulated here.
+
+        Admission does not rest on this; it is the narrower
+        claim, kept separately selectable so both framings can be reported.
+        """
+
+        return all(
+            getattr(self.validity, field) is True
+            for field in INDIVIDUAL_VALIDATION_FIELDS
+        )
+
+    @property
+    def individual_validation_stages(self) -> tuple[tuple[str, bool | None], ...]:
+        """Per-stage individual-validation coverage, for disclosure."""
+
+        return tuple(
+            (stage, getattr(self.validity, _STAGE_VALIDITY_FIELD[stage]))
+            for stage in INDIVIDUAL_VALIDATION_STAGES
+        )
+
+    @property
+    def recorded_validity(self) -> tuple[tuple[str, bool | None], ...]:
+        """Recorded-but-never-required stage validity, for disclosure."""
+
+        return tuple(
+            (field, getattr(self.validity, field))
+            for field in RECORDED_VALIDITY_FIELDS
+        )
+
+    @property
+    def rests_on_unimplemented_rtl_path(self) -> bool:
+        """True when the candidate is priced without validated RTL evidence.
+
+        Such a candidate is legitimately publishable -- neither publication
+        timing tier claims RTL-simulated evidence -- but every record built
+        from it must disclose the gap rather than hide it.
+        """
+
+        return self.validity.rtl_valid is not True
+
+    @property
+    def all_stages_valid(self) -> bool:
+        """Strict, fail-closed record that every stage -- RTL included -- passed.
+
+        Recorded for disclosure and for the stricter deployment record; it is
+        deliberately not what admission rests on.  It subsumes
+        individual validation: every blocking stage as well as RTL and DC must
+        be measured true.
+        """
+
+        return (
+            self.priced_evidence_complete
+            and self.individually_validated
+            and all(
+                getattr(self.validity, field) is True
+                for field in RECORDED_VALIDITY_FIELDS
             )
         )
 
@@ -1295,6 +1622,24 @@ class PublicationCandidate:
             "head_service_calibration_id": (
                 self.head_service_calibration_id
             ),
+            "output_head_location": self.output_head_location,
+            "output_head_idealizations": list(
+                self.output_head_idealizations
+            ),
+            # Evidence that is recorded and disclosed but never required.
+            "recorded_validity": dict(self.recorded_validity),
+            "rests_on_unimplemented_rtl_path": (
+                self.rests_on_unimplemented_rtl_path
+            ),
+            # Eligibility rests on the pricing model being validated.  Whether
+            # this exact point was additionally compiled and emulated at its
+            # own geometry is stated here, never assumed either way.
+            "admission_basis": ADMISSION_BASIS,
+            "individually_validated": self.individually_validated,
+            "individual_validation_stages": dict(
+                self.individual_validation_stages
+            ),
+            "all_stages_valid": self.all_stages_valid,
             "whole_model_rankable": self.whole_model_rankable,
             "timing_mode": self.timing_mode,
             "timing_calibrated": self.timing_calibrated,
@@ -1328,6 +1673,7 @@ class FinalSelectionDecision:
     task_margin_points: float
     ruler_retention: float
     energy_tier: str | None = None
+    output_head_location: str = EXTERNAL_BF16_HEAD
     bf16_reference_scope: str = BF16_REFERENCE_SCOPE
     schema_version: str = SELECTION_REPORT_SCHEMA
 
@@ -1347,6 +1693,10 @@ class FinalSelectionDecision:
             ),
             "system_calibration_id": self.system_calibration_id,
             "energy_tier": self.energy_tier,
+            "output_head_location": self.output_head_location,
+            "output_head_idealizations": list(
+                OUTPUT_HEAD_IDEALIZATIONS[self.output_head_location]
+            ),
             "global_failures": list(self.global_failures),
             "candidate_failures": {
                 key: list(value) for key, value in self.candidate_failures
@@ -1367,14 +1717,24 @@ def select_final_deployment(
     calibration: CalibrationEvidence | None,
     timing_evidence: TimingCalibrationEvidence | None,
     head_service_evidence: HeadServiceEvidence | None = None,
+    output_head_location: str = EXTERNAL_BF16_HEAD,
     relative_ppl_limit: float = 0.01,
     task_margin_points: float = 2.0,
     ruler_retention: float = 0.98,
     required_tasks: Sequence[str] = DEFAULT_REQUIRED_TASKS,
     required_ruler_lengths: Sequence[int] = DEFAULT_RULER_LENGTHS,
 ) -> FinalSelectionDecision:
-    """Select the strongest available energy tier, then energy and TPOT."""
+    """Select the strongest available energy tier, then energy and TPOT.
 
+    ``output_head_location`` names the run's priced output-head boundary.  At
+    the external service the run must supply passing head-service evidence; at
+    the decode-local head there is no second endpoint, so head-service evidence
+    is neither supplied nor required and the candidates carry the local
+    boundary's declared idealizations instead.
+    """
+
+    if output_head_location not in OUTPUT_HEAD_LOCATIONS:
+        raise ValueError("output_head_location is unsupported")
     if relative_ppl_limit < 0 or not math.isfinite(relative_ppl_limit):
         raise ValueError("relative_ppl_limit must be finite and non-negative")
     if task_margin_points < 0 or not math.isfinite(task_margin_points):
@@ -1418,8 +1778,18 @@ def select_final_deployment(
             global_failures.append("timing_evidence_mode")
         if not timing_evidence.passed:
             global_failures.append("timing_evidence_gate")
+    local_head = output_head_location == DECODE_BF16_HEAD
     if head_service_evidence is None:
-        global_failures.append("head_service_evidence_missing")
+        # Only the external arm depends on a measured remote endpoint.  The
+        # decode-local head prices the projection inside the decode chip, so
+        # demanding head-service evidence there would require evidence the
+        # configuration does not claim.
+        if not local_head:
+            global_failures.append("head_service_evidence_missing")
+        head_service_calibration_id = None
+        head_service_provenance_id = None
+    elif local_head:
+        global_failures.append("head_service_evidence_unexpected")
         head_service_calibration_id = None
         head_service_provenance_id = None
     else:
@@ -1463,10 +1833,12 @@ def select_final_deployment(
     else:
         system_calibration_id = None
     def bound_system_identity(value: PublicationCandidate) -> bool:
-        if (
-            not value.power_calibration_id
-            or not head_service_calibration_id
-            or not head_service_provenance_id
+        if not value.power_calibration_id:
+            return False
+        if value.output_head_location != output_head_location:
+            return False
+        if not local_head and (
+            not head_service_calibration_id or not head_service_provenance_id
         ):
             return False
         try:
@@ -1474,10 +1846,14 @@ def select_final_deployment(
                 "candidate energy",
                 value.power_calibration_id,
             )
-            expected = composite_system_calibration_id(
-                power_id,
-                head_service_calibration_id,
-                head_service_provenance_id,
+            expected = (
+                local_head_system_calibration_id(power_id)
+                if local_head
+                else composite_system_calibration_id(
+                    power_id,
+                    head_service_calibration_id,
+                    head_service_provenance_id,
+                )
             )
         except ValueError:
             return False
@@ -1518,7 +1894,7 @@ def select_final_deployment(
         elif not any(
             value.evaluation_class == required_class
             and value.hardware_candidate
-            and value.fully_hardware_valid
+            and value.priced_evidence_complete
             and bound_system_identity(value)
             and value.head_service_calibration_id
             == head_service_calibration_id
@@ -1553,7 +1929,11 @@ def select_final_deployment(
         failures: list[str] = []
         if not value.hardware_candidate:
             failures.append("static_hardware_legality")
-        if not value.fully_hardware_valid:
+        # Eligibility rests on the blocking stages alone.  ``cross_stack_validity``
+        # keeps its meaning -- it now fires only when a stage the publication
+        # tiers actually claim is missing or failed, never for an unvalidated
+        # RTL path, which is disclosed on the candidate instead.
+        if not value.priced_evidence_complete:
             failures.append("cross_stack_validity")
         if value.energy_per_token_j is None or value.tpot_ms is None:
             failures.append("calibrated_cost_missing")
@@ -1633,6 +2013,7 @@ def select_final_deployment(
         task_margin_points=task_margin_points,
         ruler_retention=ruler_retention,
         energy_tier=(selected.energy_tier if selected is not None else None),
+        output_head_location=output_head_location,
     )
 
 
@@ -1682,8 +2063,37 @@ def write_selection_report(
     return destination
 
 
+def individually_validated_points(
+    points: Iterable[ParetoPoint],
+) -> tuple[ParetoPoint, ...]:
+    """Return the strict subset: points also compiled and emulated here.
+
+    The model-validated frontier and this strict frontier are two views of the
+    same admitted population, so both can be reported side by side without a
+    second admission policy.  A point built without a coverage record is *not*
+    promoted into the strict subset: unknown coverage is not evidence.
+    """
+
+    return tuple(
+        point for point in points if point.individually_validated is True
+    )
+
+
+def individually_validated_candidates(
+    values: Iterable[PublicationCandidate],
+) -> tuple[PublicationCandidate, ...]:
+    """Return the candidates that carry individual validation."""
+
+    return tuple(value for value in values if value.individually_validated)
+
+
 __all__ = [
+    "ACCURACY_BUDGET_NAMES",
     "BF16_REFERENCE_SCOPE",
+    "INDIVIDUAL_VALIDATION_FIELDS",
+    "MODEL_REQUIRED_VALIDITY_FIELDS",
+    "individually_validated_candidates",
+    "individually_validated_points",
     "BootstrapInterval",
     "DEFAULT_REQUIRED_TASKS",
     "DEFAULT_RULER_LENGTHS",
@@ -1698,13 +2108,18 @@ __all__ = [
     "PublicationCandidate",
     "REFINEMENT_SOURCE_ROLES",
     "RefinementSourceSelection",
+    "accuracy_budget_mean_nll_limit",
     "clustered_nll_bootstrap",
+    "dual_accuracy_frontiers",
     "epsilon_dominates",
     "epsilon_pareto_fronts",
     "evaluate_screening_fidelity",
     "paired_task_bootstrap",
     "promote_epsilon_pareto",
+    "relative_perplexity_from_mean_nll",
+    "relative_perplexity_from_percent",
     "select_refinement_sources",
     "select_final_deployment",
+    "within_accuracy_budget",
     "write_selection_report",
 ]

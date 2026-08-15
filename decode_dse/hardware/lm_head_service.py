@@ -18,6 +18,34 @@ from decode_dse.hardware.statistics import (
 
 HEAD_SERVICE_SCHEMA = "bf16-output-head-service"
 HEAD_SERVICE_MODE = "remote_bf16_head_dedicated"
+#: Service mode of the decode-local BF16 output head.  The head's weights and
+#: its per-decode-step HBM traffic are charged to the decode chip's physical
+#: ledger exactly like every other resident tensor; only the head's *compute*
+#: is idealized, in the sense that no measured instruction-level timing or
+#: energy signature is bound to it.  The idealization below travels with every
+#: row priced at this boundary so it can never be read as a modelled head.
+LOCAL_HEAD_MODE = "decode_local_bf16_head"
+LOCAL_HEAD_COMPUTE_IDEALIZATION = "local_bf16_head_compute_idealized"
+LOCAL_HEAD_IDEALIZATIONS: tuple[str, ...] = (
+    LOCAL_HEAD_COMPUTE_IDEALIZATION,
+)
+# Where the BF16 output head runs.  ``DECODE_BF16_HEAD`` charges the head's
+# weights and its per-decode-step traffic to the decode chip and idealizes only
+# the head's compute; ``EXTERNAL_BF16_HEAD`` stops the decode ledger after the
+# final RMSNorm and prices the head from a measured remote service.
+DECODE_BF16_HEAD = "decode_bf16_unmodeled"
+EXTERNAL_BF16_HEAD = "external_bf16_service"
+OUTPUT_HEAD_LOCATIONS = frozenset({DECODE_BF16_HEAD, EXTERNAL_BF16_HEAD})
+#: Service mode implied by each output-head location.
+OUTPUT_HEAD_SERVICE_MODES: Mapping[str, str] = {
+    DECODE_BF16_HEAD: LOCAL_HEAD_MODE,
+    EXTERNAL_BF16_HEAD: HEAD_SERVICE_MODE,
+}
+#: Scope idealizations disclosed by each output-head location.
+OUTPUT_HEAD_IDEALIZATIONS: Mapping[str, tuple[str, ...]] = {
+    DECODE_BF16_HEAD: LOCAL_HEAD_IDEALIZATIONS,
+    EXTERNAL_BF16_HEAD: (),
+}
 HEAD_LOGIT_MAX_ABS_ERROR = 0.25
 HEAD_LOGIT_MEAN_ABS_ERROR = 0.02
 HEAD_TOPK_MIN_AGREEMENT = 0.90
@@ -195,6 +223,49 @@ def composite_system_calibration_id(
             "service_mode": service_mode,
         }
     )
+
+
+def local_head_system_calibration_id(decoder_calibration_id: str) -> str:
+    """System identity for a decode chip that carries its own BF16 head.
+
+    There is no second endpoint to bind, so the system identity is the decoder
+    calibration plus the declared idealization.  Naming the idealization inside
+    the hash keeps a locally-headed system from ever colliding with a system
+    whose head was measured.
+    """
+
+    decoder_calibration_id = require_content_addressed_id(
+        "decoder calibration",
+        decoder_calibration_id,
+    )
+    return "decode-local-head-system-" + _content_hash(
+        {
+            "decoder_calibration_id": decoder_calibration_id,
+            "service_mode": LOCAL_HEAD_MODE,
+            "idealizations": list(LOCAL_HEAD_IDEALIZATIONS),
+        }
+    )
+
+
+def local_head_boundary_status() -> dict[str, Any]:
+    """Recorded boundary disclosure for the decode-local BF16 head.
+
+    The fields mirror the remote-service status so a reader can compare the two
+    placements field by field, but ``service_mode`` and ``idealizations`` state
+    plainly that this arm rests on an unmeasured head compute cost.
+    """
+
+    return {
+        "schema_version": HEAD_SERVICE_SCHEMA,
+        "artifact_sha256": None,
+        "passed": False,
+        "failures": [LOCAL_HEAD_COMPUTE_IDEALIZATION],
+        "calibration_id": None,
+        "provenance_id": None,
+        "service_mode": LOCAL_HEAD_MODE,
+        "service_location": "decode_chip",
+        "required_batches": [],
+    }
 
 
 def _positive_float(value: Any, name: str) -> float:
@@ -1465,8 +1536,18 @@ __all__ = [
     "HEAD_TOPK_MIN_AGREEMENT",
     "HEAD_VALIDATION_TOPK",
     "HeadServiceMeasurement",
+    "DECODE_BF16_HEAD",
+    "EXTERNAL_BF16_HEAD",
+    "LOCAL_HEAD_COMPUTE_IDEALIZATION",
+    "LOCAL_HEAD_IDEALIZATIONS",
+    "LOCAL_HEAD_MODE",
+    "OUTPUT_HEAD_IDEALIZATIONS",
+    "OUTPUT_HEAD_LOCATIONS",
+    "OUTPUT_HEAD_SERVICE_MODES",
     "composite_system_calibration_id",
     "head_service_status_valid",
+    "local_head_boundary_status",
+    "local_head_system_calibration_id",
     "load_bf16_head_service_artifact",
     "require_content_addressed_id",
 ]

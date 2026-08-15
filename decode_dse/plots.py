@@ -27,13 +27,20 @@ from matplotlib.lines import Line2D  # noqa: E402
 from decode_dse.hardware.evaluation import (  # noqa: E402
     load_terminal_numerical_rows,
 )
-from decode_dse.hardware.design_space import load_hardware_artifact  # noqa: E402
+from decode_dse.hardware.design_space import (  # noqa: E402
+    evaluate_publication_admission,
+    load_hardware_artifact,
+)
+from decode_dse.hardware.model_validation import (  # noqa: E402
+    pricing_model_validation,
+)
 from decode_dse.hardware.packedkv_claims import (  # noqa: E402
     PACKEDKV_MODES,
     PRECISION_ROLES,
     evaluate_packedkv_publication,
     load_packedkv_evidence,
 )
+from decode_dse.legality import ADMISSION_BASIS  # noqa: E402
 from decode_dse.manifest import load_manifest  # noqa: E402
 from decode_dse.profiles import (  # noqa: E402
     DECODE_FORMATS,
@@ -105,6 +112,17 @@ class HardwarePoint:
     unrankable_population_count: int | None = None
     sampled_unrankable_count: int | None = None
     source_artifact: str | None = None
+    #: Individual-validation coverage.  The point is on the figure because the
+    #: pricing model that priced it is validated; whether this exact geometry
+    #: was additionally compiled and emulated is disclosed here and in the
+    #: hardware data table, never assumed.
+    individually_validated: bool | None = None
+    individual_validation_stages: tuple[str, ...] = ()
+    #: Identities of the pricing models behind this point's numbers, so the
+    #: per-row table can be paired with the models' published error figures.
+    timing_evidence_id: str | None = None
+    bandwidth_calibration_id: str | None = None
+    area_source: str | None = None
 
     @property
     def tokens_per_j(self) -> float:
@@ -339,8 +357,9 @@ def _load_selected_publication_rows(
         if isinstance(whole_model, Mapping)
         else None
     )
+    selected_admission = evaluate_publication_admission(hardware_row)
     if (
-        hardware_row.get("deployment_valid") is not True
+        not selected_admission.admitted
         or hardware_row.get("profile_id") != alternative.profile_id
         or hardware_row.get("candidate_id") != alternative.candidate_id
         or not isinstance(metrics, Mapping)
@@ -395,6 +414,13 @@ def _load_selected_publication_rows(
         "accuracy_pass_configuration_ids": ";".join(passing_ids),
         **identities,
     }
+    # The deployment table states, on the selected row itself, whether the
+    # selected geometry was additionally compiled and emulated or was priced by
+    # the validated model alone.  The GPU row leaves the column empty: it is a
+    # measured baseline and the notion does not apply to it.
+    selected_coverage = (
+        "true" if selected_admission.individually_validated else "false"
+    )
     rows = (
         {
             "system_role": "selected_plena_deployment",
@@ -413,10 +439,18 @@ def _load_selected_publication_rows(
             "energy_status": "rankable",
             "accuracy_gate_passed": True,
             "selected_deployment": True,
+            "individually_validated": selected_coverage,
+            "timing_evidence_id": str(metrics.get("timing_evidence_id", "")),
+            "bandwidth_calibration_id": str(
+                metrics.get("bandwidth_calibration_id", "")
+            ),
             **common,
         },
         {
             "system_role": "measured_gpu_baseline",
+            "individually_validated": "",
+            "timing_evidence_id": "",
+            "bandwidth_calibration_id": "",
             "system_name": gpu_throughput.system_name,
             "configuration_role": "bf16",
             "configuration_id": "",
@@ -448,6 +482,11 @@ def _load_selected_publication_rows(
         "ratio_block_reason": "throughput_evidence_tiers_differ",
         "peak_roofline_ratio_permitted": False,
         "peak_roofline_status": "not_part_of_headline_comparison",
+        "admission_basis": ADMISSION_BASIS,
+        "selected_individually_validated": (
+            selected_admission.individually_validated
+        ),
+        "selected_admission": selected_admission.to_dict(),
         "sources": identities,
     }
 
@@ -1353,6 +1392,14 @@ def plot_vector_sensitivity(
 
 
 def _relative_perplexity_percent(delta_nll: float) -> float:
+    """Return relative perplexity as a percentage increase over the reference.
+
+    This is `100 * (exp(delta_nll) - 1)`, the exact inverse of
+    `selection.relative_perplexity_from_percent`, so a figure row and a
+    selection row describing the same profile reduce to the same
+    relative-perplexity ratio when an accuracy budget is applied.
+    """
+
     if delta_nll > math.log(float.fromhex("0x1.fffffffffffffp+1023")):
         return math.inf
     return math.expm1(delta_nll) * 100.0
@@ -1502,7 +1549,8 @@ def _load_hardware_points(
     )
     points = []
     for row in rows:
-        if row.get("deployment_valid") is not True:
+        admission = evaluate_publication_admission(row)
+        if not admission.admitted:
             continue
         profile_id = str(row["profile_id"])
         profile = profile_by_id.get(profile_id)
@@ -1510,14 +1558,19 @@ def _load_hardware_points(
             raise ValueError("hardware artifact references an unknown profile")
         metrics = row.get("metrics")
         if not isinstance(metrics, Mapping):
-            raise ValueError("deployment-valid row has no hardware metrics")
+            raise ValueError("admitted row has no hardware metrics")
         whole = metrics.get("whole_model")
         capacity = metrics.get("runtime_capacity_evidence")
         if not isinstance(whole, Mapping) or whole.get("rankable") is not True:
-            raise ValueError("deployment-valid row has no rankable system metrics")
+            # Admission asks whether the pricing model is validated; it does
+            # not assert that a row is *rankable*, which is a separate recorded
+            # outcome.  An unrankable admitted row is skipped, not an error.
+            continue
         energy = whole.get("calibrated_energy")
         if not isinstance(capacity, Mapping):
-            raise ValueError("deployment-valid row lacks energy or capacity")
+            raise ValueError("admitted row lacks energy or capacity")
+        if capacity.get("max_runtime_batch") is None:
+            raise ValueError("admitted row lacks a runtime batch capacity")
         if isinstance(energy, Mapping):
             energy_j = _finite(energy.get("total_j"), "energy.total_j")
             energy_tier_raw = energy.get("energy_tier", whole.get("energy_tier"))
@@ -1532,7 +1585,7 @@ def _load_hardware_points(
         )
         hardware = row.get("hardware")
         if not isinstance(hardware, Mapping):
-            raise ValueError("deployment-valid row has no hardware identity")
+            raise ValueError("admitted row has no hardware identity")
         resource_budget = metrics.get("resource_budget")
         area_budget = None
         if isinstance(resource_budget, Mapping):
@@ -1588,11 +1641,32 @@ def _load_hardware_points(
                 unrankable_population_count=unrankable_population,
                 sampled_unrankable_count=sampled_unrankable,
                 source_artifact=str(path),
+                individually_validated=admission.individually_validated,
+                individual_validation_stages=(
+                    tuple(admission.coverage.validated_stages)
+                    if admission.coverage is not None
+                    else ()
+                ),
+                timing_evidence_id=(
+                    admission.pricing_model.timing_evidence_id
+                    if admission.pricing_model is not None
+                    else None
+                ),
+                bandwidth_calibration_id=(
+                    admission.pricing_model.bandwidth_calibration_id
+                    if admission.pricing_model is not None
+                    else None
+                ),
+                area_source=(
+                    admission.pricing_model.area_source
+                    if admission.pricing_model is not None
+                    else None
+                ),
             )
         )
     if not points and require_points:
         raise ValueError(
-            "hardware figure requires at least one deployment-valid energy-ranked row"
+            "hardware figure requires at least one admitted energy-ranked row"
         )
     return tuple(points)
 
@@ -1624,6 +1698,218 @@ def _pareto_indices(
     return tuple(result)
 
 
+#: Provenance labels for the accuracy envelopes drawn on the hardware Pareto.
+FRONTIER_FROM_RECORD = "emitted dual_accuracy_frontiers record"
+FRONTIER_FROM_LOCAL_RECOMPUTE = "locally recomputed (no frontier record)"
+
+
+@dataclass(frozen=True)
+class AccuracyEnvelopes:
+    """The strict and relaxed accuracy envelopes and where they came from."""
+
+    strict: tuple[HardwarePoint, ...]
+    relaxed: tuple[HardwarePoint, ...]
+    strict_members: tuple[HardwarePoint, ...]
+    relaxed_members: tuple[HardwarePoint, ...]
+    strict_limit: float
+    relaxed_limit: float
+    source: str
+    unplottable_front_rows: int = 0
+
+    @property
+    def note(self) -> str:
+        detail = (
+            f" · {self.unplottable_front_rows} front row(s) carry no serving "
+            "cost and are not drawn"
+            if self.unplottable_front_rows
+            else ""
+        )
+        return f"accuracy frontier: {self.source}{detail}"
+
+
+def _budget_members(
+    points: Sequence[HardwarePoint],
+    limit: float,
+) -> tuple[HardwarePoint, ...]:
+    """Return the points inside one disclosed accuracy budget.
+
+    Membership goes through `selection.within_accuracy_budget`, the same
+    comparison `dual_accuracy_frontiers` makes, so the figure and the emitted
+    selection record cannot admit different point sets.  The figure carries
+    relative perplexity as a percentage increase and the selection record
+    carries mean NLL; both are reduced to a relative-perplexity ratio first.
+    """
+
+    from decode_dse.hardware.selection import (
+        relative_perplexity_from_percent,
+        within_accuracy_budget,
+    )
+
+    return tuple(
+        point
+        for point in points
+        if within_accuracy_budget(
+            relative_perplexity_from_percent(point.relative_perplexity_percent),
+            limit,
+        )
+    )
+
+
+def _latency_energy_envelope(
+    points: Sequence[HardwarePoint],
+) -> tuple[HardwarePoint, ...]:
+    """Return the lower-left latency-energy envelope, ordered by latency."""
+
+    return tuple(
+        sorted(
+            (points[index] for index in _pareto_indices(points, "tpot_ms", "energy_j")),
+            key=lambda point: point.tpot_ms,
+        )
+    )
+
+
+def _record_budget_limits(
+    frontier_record: Mapping[str, Any],
+) -> dict[str, float]:
+    from decode_dse.hardware.selection import DUAL_ACCURACY_FRONTIERS_SCHEMA
+
+    if frontier_record.get("schema_version") != DUAL_ACCURACY_FRONTIERS_SCHEMA:
+        raise ValueError(
+            "accuracy frontier record uses an unsupported schema: "
+            f"{frontier_record.get('schema_version')!r}"
+        )
+    budgets = frontier_record.get("budgets")
+    if not isinstance(budgets, Mapping):
+        raise ValueError("accuracy frontier record declares no budgets")
+    limits: dict[str, float] = {}
+    for name in ("strict", "relaxed"):
+        budget = budgets.get(name)
+        if not isinstance(budget, Mapping):
+            raise ValueError(f"accuracy frontier record has no {name} budget")
+        limit = budget.get("relative_perplexity_limit")
+        if limit is None:
+            raise ValueError(f"the {name} frontier declares no budget limit")
+        limits[name] = float(limit)
+    return limits
+
+
+def _record_envelope(
+    frontier_record: Mapping[str, Any],
+    budget_name: str,
+    *,
+    members: Sequence[HardwarePoint],
+    by_identity: Mapping[tuple[str, str], HardwarePoint],
+) -> tuple[tuple[HardwarePoint, ...], int]:
+    """Return one envelope taken from the emitted frontier record.
+
+    Every front row that carries a candidate identity must resolve to a
+    plotted row that the shared budget predicate also admits; anything else
+    means the record and the figure were built from populations that do not
+    agree, which fails closed instead of drawing a plausible-looking curve.
+    Rows without serving costs (profile-level points priced by accuracy only)
+    cannot be placed on a latency-energy axis and are counted, not dropped
+    silently.
+    """
+
+    member_ids = {(point.profile.profile_id, point.candidate_id) for point in members}
+    front = frontier_record["budgets"][budget_name].get("front") or []
+    selected: list[HardwarePoint] = []
+    unplottable = 0
+    for entry in front:
+        candidate_id = entry.get("candidate_id")
+        if (
+            candidate_id is None
+            or entry.get("tpot_ms") is None
+            or entry.get("energy_per_token_j") is None
+        ):
+            unplottable += 1
+            continue
+        identity = (str(entry.get("profile_id")), str(candidate_id))
+        point = by_identity.get(identity)
+        if point is None:
+            raise ValueError(
+                f"the {budget_name} accuracy frontier names row {identity} "
+                "that the hardware figure did not load"
+            )
+        if identity not in member_ids:
+            raise ValueError(
+                f"the {budget_name} accuracy frontier admits row {identity} "
+                "that the figure's budget filter rejects"
+            )
+        selected.append(point)
+    return (
+        tuple(sorted(selected, key=lambda point: point.tpot_ms)),
+        unplottable,
+    )
+
+
+def hardware_accuracy_envelopes(
+    points: Sequence[HardwarePoint],
+    *,
+    accuracy_budgets: Mapping[str, float],
+    frontier_record: Mapping[str, Any] | None = None,
+) -> AccuracyEnvelopes:
+    """Return the strict and relaxed envelopes for the hardware Pareto.
+
+    Budget membership always comes from the shared predicate.  The envelopes
+    themselves are taken from the emitted `dual_accuracy_frontiers` record
+    when one is supplied - the record and the figure then show the same
+    fronts by construction - and are recomputed locally otherwise, with the
+    fallback disclosed on the figure rather than left implicit.
+    """
+
+    strict_limit = float(accuracy_budgets["strict_relative_perplexity"])
+    relaxed_limit = float(accuracy_budgets["relaxed_relative_perplexity"])
+    if relaxed_limit < strict_limit:
+        raise ValueError(
+            "relaxed_relative_perplexity must not be tighter than the strict budget"
+        )
+    strict_members = _budget_members(points, strict_limit)
+    relaxed_members = _budget_members(points, relaxed_limit)
+    if frontier_record is None:
+        return AccuracyEnvelopes(
+            strict=_latency_energy_envelope(strict_members),
+            relaxed=_latency_energy_envelope(relaxed_members),
+            strict_members=strict_members,
+            relaxed_members=relaxed_members,
+            strict_limit=strict_limit,
+            relaxed_limit=relaxed_limit,
+            source=FRONTIER_FROM_LOCAL_RECOMPUTE,
+        )
+    limits = _record_budget_limits(frontier_record)
+    if limits != {"strict": strict_limit, "relaxed": relaxed_limit}:
+        raise ValueError(
+            "accuracy frontier record was built against different budgets: "
+            f"record {limits}, figure "
+            f"{{'strict': {strict_limit}, 'relaxed': {relaxed_limit}}}"
+        )
+    by_identity = {
+        (point.profile.profile_id, point.candidate_id): point for point in points
+    }
+    strict_front, strict_skipped = _record_envelope(
+        frontier_record,
+        "strict",
+        members=strict_members,
+        by_identity=by_identity,
+    )
+    relaxed_front, relaxed_skipped = _record_envelope(
+        frontier_record,
+        "relaxed",
+        members=relaxed_members,
+        by_identity=by_identity,
+    )
+    return AccuracyEnvelopes(
+        strict=strict_front,
+        relaxed=relaxed_front,
+        strict_members=strict_members,
+        relaxed_members=relaxed_members,
+        strict_limit=strict_limit,
+        relaxed_limit=relaxed_limit,
+        source=FRONTIER_FROM_RECORD,
+        unplottable_front_rows=strict_skipped + relaxed_skipped,
+    )
+
+
 def plot_hardware_pareto(
     points: Sequence[HardwarePoint],
     *,
@@ -1631,6 +1917,7 @@ def plot_hardware_pareto(
     output_dir: Path,
     formats: Sequence[str],
     accuracy_budgets: Mapping[str, float] | None = None,
+    frontier_record: Mapping[str, Any] | None = None,
 ) -> tuple[Path, ...]:
     finite = [
         point
@@ -1718,37 +2005,29 @@ def plot_hardware_pareto(
             rasterized=True,
         )
 
-    strict_limit = relaxed_limit = None
-    if accuracy_budgets is not None:
-        strict_limit = float(accuracy_budgets["strict_relative_perplexity"])
-        relaxed_limit = float(accuracy_budgets["relaxed_relative_perplexity"])
-
-    def _within_budget(candidates, limit):
-        threshold = (limit - 1.0) * 100.0
-        return [
-            point
-            for point in candidates
-            if point.relative_perplexity_percent <= threshold
-        ]
-
-    def _envelope(candidates):
-        return sorted(
-            (
-                candidates[index]
-                for index in _pareto_indices(candidates, "tpot_ms", "energy_j")
-            ),
-            key=lambda point: point.tpot_ms,
+    envelopes = (
+        hardware_accuracy_envelopes(
+            frontier_source,
+            accuracy_budgets=accuracy_budgets,
+            frontier_record=frontier_record,
         )
+        if frontier_source and accuracy_budgets is not None
+        else None
+    )
+    frontier_note = envelopes.note if envelopes is not None else None
 
-    front = []
-    if frontier_source and relaxed_limit is not None:
+    front: Sequence[HardwarePoint] = ()
+    if envelopes is not None:
         # Accuracy is a disclosed budget: the strict envelope reproduces the
         # deployment gate and the relaxed envelope shows what lower-precision
-        # weight formats buy at a labelled accuracy cost.
-        strict_points = _within_budget(frontier_source, strict_limit)
-        relaxed_points = _within_budget(frontier_source, relaxed_limit)
-        relaxed_front = _envelope(relaxed_points) if relaxed_points else []
-        front = _envelope(strict_points) if strict_points else []
+        # weight formats buy at a labelled accuracy cost.  Both envelopes and
+        # the budget membership below come from `hardware_accuracy_envelopes`,
+        # which shares its filter with the emitted selection record.
+        strict_limit = envelopes.strict_limit
+        relaxed_limit = envelopes.relaxed_limit
+        strict_points = envelopes.strict_members
+        relaxed_front = envelopes.relaxed
+        front = envelopes.strict
         if relaxed_front:
             latency_ax.plot(
                 [point.tpot_ms for point in relaxed_front],
@@ -1786,9 +2065,9 @@ def plot_hardware_pareto(
                     color=MUTED,
                     zorder=6,
                 )
-        frontier_source = strict_points or frontier_source
+        frontier_source = list(strict_points) or frontier_source
     elif frontier_source:
-        front = _envelope(frontier_source)
+        front = _latency_energy_envelope(frontier_source)
         latency_ax.plot(
             [point.tpot_ms for point in front],
             [point.energy_j for point in front],
@@ -1841,6 +2120,11 @@ def plot_hardware_pareto(
                 if unranked_total
                 else ""
             )
+            # Which of the two frontier paths produced the envelopes is a
+            # disclosure, not an implementation detail: a figure recomputed
+            # locally is not evidence that the emitted selection record says
+            # the same thing.
+            + (f" · {frontier_note}" if frontier_note else "")
         ),
     )
 
@@ -2864,6 +3148,21 @@ def _hardware_table(
                 if point.publication_timing_tier is not None
                 else ""
             ),
+            # Per-row disclosure: the row is on the figure because the pricing
+            # model that priced it is validated and named here; whether this
+            # exact geometry was also compiled and emulated is stated
+            # separately and is never inferred from presence on the figure.
+            "individually_validated": (
+                ""
+                if point.individually_validated is None
+                else ("true" if point.individually_validated else "false")
+            ),
+            "individually_validated_stages": ";".join(
+                point.individual_validation_stages
+            ),
+            "timing_evidence_id": point.timing_evidence_id or "",
+            "bandwidth_calibration_id": point.bandwidth_calibration_id or "",
+            "area_source": point.area_source or "",
             "unrankable_population_count": (
                 point.unrankable_population_count
                 if point.unrankable_population_count is not None
@@ -3121,7 +3420,7 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
                 "energy-ranked row across all partitions"
             )
         hardware_identities = tuple(
-            (point.profile_id, point.candidate_id) for point in hardware_points
+            (point.profile.profile_id, point.candidate_id) for point in hardware_points
         )
         if len(hardware_identities) != len(set(hardware_identities)):
             raise ValueError("hardware artifact partitions overlap")
@@ -3131,6 +3430,14 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
                 Path(args.config).read_text(encoding="utf-8")
             )
             accuracy_budgets = study_config.get("accuracy_budgets")
+        frontier_record = None
+        promotion_path = getattr(args, "refinement_promotion", None)
+        if promotion_path:
+            promotion_path = Path(promotion_path).resolve()
+            promotion = load_immutable_json(promotion_path)
+            frontier_record = promotion.get("dual_accuracy_frontiers")
+            if frontier_record is not None:
+                source_paths.append(promotion_path)
         outputs.extend(
             plot_hardware_pareto(
                 hardware_points,
@@ -3138,6 +3445,7 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
                 output_dir=output_dir,
                 formats=formats,
                 accuracy_budgets=accuracy_budgets,
+                frontier_record=frontier_record,
             )
         )
         hardware_rows = _hardware_table(hardware_points)
@@ -3410,6 +3718,33 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
         )
     )
     generator_path = Path(__file__).resolve()
+    # The figures rest on the pricing models, so their validation quality is
+    # read from the calibration artifacts themselves and travels with the
+    # receipt.  A component whose artifact cannot be read records why rather
+    # than being omitted, and a failure here never blocks rendering.
+    try:
+        pricing_validation: dict[str, Any] = pricing_model_validation(
+            timing_evidence_path=getattr(args, "timing_evidence", None),
+        )
+    except Exception as error:  # pragma: no cover - defensive disclosure path
+        pricing_validation = {"unavailable": f"{type(error).__name__}: {error}"}
+    individually_validated_points = sum(
+        1 for point in hardware_points if point.individually_validated
+    )
+    pricing_validation["hardware_point_coverage"] = {
+        "admitted_point_count": len(hardware_points),
+        "individually_validated_point_count": individually_validated_points,
+        "individually_validated_fraction": (
+            individually_validated_points / len(hardware_points)
+            if hardware_points
+            else None
+        ),
+        "coverage_note": (
+            "admitted points are priced by the validated pricing model; the "
+            "individually validated subset was additionally compiled and "
+            "emulated at its own geometry"
+        ),
+    }
     receipt = {
         "schema_version": FIGURE_SCHEMA,
         "manifest_hash": manifest.canonical_hash,
@@ -3435,8 +3770,19 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
                 "paired to the vector-BF16 control with identical W/A/KV"
             ),
             "hardware": (
-                "deployment_valid rows with rankable whole-model timing and "
-                "explicit analytic-anchored or DC-calibrated energy"
+                "rows priced by a validated, identified pricing model "
+                "(calibrated timing bound to a timing-evidence identity, a "
+                "bandwidth calibration identity, an identified energy tier and "
+                "area model, a priced output-head boundary, and demonstrated "
+                "capacity, runtime and resource-budget feasibility), with "
+                "rankable whole-model timing; individual compiler and emulator "
+                "validation of each geometry is disclosed per row in "
+                "hardware_points.csv, not required"
+            ),
+            "hardware_individual_validation": (
+                "reported per row as individually_validated; a false value "
+                "means the point was priced by the validated model and was not "
+                "separately compiled and emulated at its own geometry"
             ),
             "packedkv": "checksum-valid packedkv-publication-evidence/v4",
             "decode_analysis": ANALYSIS_SCHEMA,
@@ -3447,6 +3793,7 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
             "cross_tier_ratio": "forbidden",
             "peak_roofline": "separate from the headline comparison",
         },
+        "pricing_model_validation": pricing_validation,
         "terminal_counts": terminal_counts,
         "fidelity": fidelity,
         "publication_selection": publication_selection,
@@ -3531,6 +3878,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--publication-report")
     parser.add_argument("--final-selection")
     parser.add_argument("--refined-hardware-artifact")
+    parser.add_argument(
+        "--refinement-promotion",
+        help=(
+            "Refinement source-selection record; its dual_accuracy_frontiers "
+            "entry supplies the hardware Pareto envelopes so the figure and "
+            "the selection record cannot disagree. Without it the figure "
+            "recomputes the envelopes and says so."
+        ),
+    )
+    parser.add_argument(
+        "--timing-evidence",
+        help=(
+            "decode_timing_evidence.json for the run. Its analytical-versus-"
+            "emulator agreement is recorded in the figure receipt as the "
+            "validation quality of the timing model the figures are priced by."
+        ),
+    )
     parser.add_argument("--packedkv-evidence")
     parser.add_argument(
         "--decode-analysis",

@@ -20,8 +20,11 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
+from decode_dse.hardware.design_space import (
+    evaluate_publication_admission,
+)
 from decode_dse.hardware.statistics import percentile
-from decode_dse.legality import StackValidity
+from decode_dse.legality import ADMISSION_BASIS, StackValidity
 from decode_dse.profiles import DecodePrecisionProfile
 from decode_dse.software.refinement_schedule import DecodeRefinementProfile
 from decode_dse.software.sweep_plan import load_immutable_json, write_immutable_json
@@ -200,6 +203,11 @@ class PublicationHardwareAlternative:
     tpot_ms: float
     energy_per_token_j: float
     energy_tier: str
+    #: Whether this exact geometry was additionally compiled and emulated, on
+    #: top of being priced by the validated pricing model that admitted it.
+    #: Disclosure only: it is implied by ``record_hash`` and so is deliberately
+    #: outside ``alternative_id``, which already binds the row.
+    individually_validated: bool | None = None
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -249,6 +257,8 @@ class PublicationHardwareAlternative:
             "tpot_ms": self.tpot_ms,
             "energy_per_token_j": self.energy_per_token_j,
             "energy_tier": self.energy_tier,
+            "admission_basis": ADMISSION_BASIS,
+            "individually_validated": self.individually_validated,
         }
 
     @classmethod
@@ -256,6 +266,7 @@ class PublicationHardwareAlternative:
         cls,
         value: Mapping[str, Any],
     ) -> "PublicationHardwareAlternative":
+        coverage = value.get("individually_validated")
         item = cls(
             configuration_id=str(value["configuration_id"]),
             profile_id=str(value["profile_id"]),
@@ -266,6 +277,9 @@ class PublicationHardwareAlternative:
             tpot_ms=float(value["tpot_ms"]),
             energy_per_token_j=float(value["energy_per_token_j"]),
             energy_tier=str(value["energy_tier"]),
+            individually_validated=(
+                coverage if isinstance(coverage, bool) else None
+            ),
         )
         if value.get("alternative_id") != item.alternative_id:
             raise ValueError("publication hardware alternative identity mismatch")
@@ -770,7 +784,7 @@ class PublicationProtocol:
     greedy: bool
     temperature: float
     token_budgets: tuple[tuple[str, int], ...]
-    output_head_location: str = "external_bf16_service"
+    output_head_location: str = "decode_bf16_unmodeled"
     output_head_precision: str = "BF16"
 
     def __post_init__(self) -> None:
@@ -802,12 +816,15 @@ class PublicationProtocol:
             raise ValueError("token budgets contain duplicates")
         if any(value <= 0 for _, value in budgets):
             raise ValueError("token budgets must be positive")
+        # Either placement is publishable, and both keep the head at BF16 -
+        # the accuracy protocol is unchanged by where the projection runs.
         if (
-            self.output_head_location != "external_bf16_service"
+            self.output_head_location
+            not in {"decode_bf16_unmodeled", "external_bf16_service"}
             or self.output_head_precision != "BF16"
         ):
             raise ValueError(
-                "headline publication evaluation requires the remote BF16 head"
+                "headline publication evaluation requires a BF16 output head"
             )
         object.__setattr__(self, "token_budgets", tuple(sorted(budgets)))
 
@@ -1999,21 +2016,22 @@ def _hardware_alternatives_for_configuration(
                 if isinstance(whole, Mapping)
                 else None
             )
+            # Admission is the single policy: the row must be priced by a
+            # validated, identified pricing model.  Individual compiler and
+            # emulator coverage is *disclosed* on the alternative rather than
+            # demanded a second time here -- re-imposing it would restrict the
+            # contract to the one geometry the hardware-validation stage ran
+            # at.  RTL and DC evidence stays recorded, never demanded.
+            admission = evaluate_publication_admission(row)
             if (
-                row.get("deployment_valid") is not True
+                not admission.admitted
                 or not isinstance(validity, Mapping)
-                or any(
-                    validity.get(name) is not True
-                    for name in (
-                        "software_valid",
-                        "compiler_valid",
-                        "emulator_valid",
-                        "rtl_valid",
-                    )
-                )
                 or not isinstance(whole, Mapping)
                 or whole.get("rankable") is not True
                 or not isinstance(energy, Mapping)
+                or not isinstance(energy.get("energy_tier"), str)
+                or energy.get("total_j") is None
+                or whole.get("tpot_ms") is None
             ):
                 raise ValueError(
                     "retained refined hardware frontier row is not deployable"
@@ -2028,6 +2046,7 @@ def _hardware_alternatives_for_configuration(
                 tpot_ms=float(whole["tpot_ms"]),
                 energy_per_token_j=float(energy["total_j"]),
                 energy_tier=str(energy["energy_tier"]),
+                individually_validated=admission.individually_validated,
             )
             identity = alternative.configuration_id, alternative.candidate_id
             if identity in identities:

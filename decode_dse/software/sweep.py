@@ -25,7 +25,10 @@ import sys
 import time
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
-from decode_dse.legality import load_built_stack_validity
+from decode_dse.legality import (
+    ADMISSION_BASIS,
+    load_built_stack_validity,
+)
 from decode_dse.manifest import (
     SweepManifest,
     build_exhaustive_manifest,
@@ -2910,6 +2913,16 @@ def _partitioned_artifact(path: Path, index: int, count: int) -> Path:
     )
 
 
+def _config_output_head_location(config: Path) -> str:
+    """Read the priced output-head boundary declared by a study config."""
+
+    from decode_dse.hardware.evaluation import config_output_head_location
+
+    return config_output_head_location(
+        json.loads(Path(config).read_text(encoding="utf-8"))
+    )
+
+
 def _path_identity(path: Path) -> dict[str, Any]:
     if path.is_file():
         return {
@@ -3077,6 +3090,9 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
     )
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(tuple(argv) if argv is not None else None)
+    from decode_dse.hardware.design_space import (
+        evaluate_publication_admission,
+    )
     from decode_dse.software.benchmark_runner import (
         PUBLICATION_REPORT_SCHEMA,
         PublicationContract,
@@ -3193,10 +3209,19 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
             if source_profile is not None
             else configuration.profile.profile_id
         )
+        # The contract's own admission verdict is recomputed here, on the same
+        # policy the contract was built under, so the gate and the contract
+        # cannot disagree about what "eligible" means.
+        admission = evaluate_publication_admission(row)
         if (
             not isinstance(labels, list)
             or "profile_frontier" not in labels
-            or row.get("deployment_valid") is not True
+            or not admission.admitted
+            or (
+                alternative.individually_validated is not None
+                and alternative.individually_validated
+                != admission.individually_validated
+            )
             or row.get("profile_id") != alternative.profile_id
             or row.get("profile") != configuration.profile.to_dict()
             or row.get("candidate_id") != alternative.candidate_id
@@ -3220,7 +3245,9 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
         ):
             raise ValueError("publication alternative differs from exact hardware evidence")
         if alternative.configuration_id in passing_ids:
-            joined_alternatives.append((configuration, alternative, row, header))
+            joined_alternatives.append(
+                (configuration, alternative, row, header, admission)
+            )
     if frontier_only:
         result = {
             "schema_version": "decode-final-publication-selection",
@@ -3240,7 +3267,13 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
     if not joined_alternatives:
         raise ValueError("no hardware alternatives cover passing accuracy configurations")
 
-    selected_configuration, selected_alternative, selected_row, selected_header = min(
+    (
+        selected_configuration,
+        selected_alternative,
+        selected_row,
+        selected_header,
+        selected_admission,
+    ) = min(
         joined_alternatives,
         key=lambda item: (
             0 if item[1].energy_tier == "dc_calibrated" else 1,
@@ -3266,6 +3299,11 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
         "tpot_ms": selected_alternative.tpot_ms,
         "energy_per_token_j": selected_alternative.energy_per_token_j,
         "energy_tier": selected_alternative.energy_tier,
+        # What the selection claims, and what it does not.  The row is eligible
+        # because the pricing model that priced it is validated and named; the
+        # coverage record states whether this exact geometry was additionally
+        # compiled and emulated, and the pricing identities name the models.
+        "admission": selected_admission.to_dict(),
         "retention_labels": list(selected_row["retention_labels"]),
         "factor_evaluation_sha256": selected_header[
             "factor_evaluation_sha256"
@@ -3287,8 +3325,17 @@ def publication_gate_main(argv: Iterable[str] | None = None) -> int:
             "candidate_count": len(joined_alternatives),
             "alternative_ids": [
                 alternative.alternative_id
-                for _, alternative, _, _ in joined_alternatives
+                for _, alternative, _, _, _ in joined_alternatives
             ],
+            # Coverage of the joined population, so a reader can see how much
+            # of the candidate set carried individual validation rather than
+            # inferring it from the selected row alone.
+            "individually_validated_candidate_count": sum(
+                1
+                for _, _, _, _, admission in joined_alternatives
+                if admission.individually_validated
+            ),
+            "admission_basis": ADMISSION_BASIS,
             "selection_order": [
                 "energy_tier_dc_before_analytic",
                 "energy_per_token_j",
@@ -3692,8 +3739,13 @@ def build_pipeline(
             str(resources["stride"]),
             "--runtime-hbm-reserve-bytes",
             str(resources["runtime_hbm_reserve_bytes"]),
+            # The measured remote head stays available as the recorded
+            # comparison arm; the headline boundary is named explicitly so the
+            # launch never depends on which artifacts happen to be present.
             "--head-service-calibration",
             str(required_path("head_service_calibration")),
+            "--output-head-location",
+            str(_config_output_head_location(config)),
             "--admission-receipt",
             str(required_path("admission_receipt")),
             "--parallel-workers",
@@ -3909,8 +3961,13 @@ def build_pipeline(
             str(resources["stride"]),
             "--runtime-hbm-reserve-bytes",
             str(resources["runtime_hbm_reserve_bytes"]),
+            # The measured remote head stays available as the recorded
+            # comparison arm; the headline boundary is named explicitly so the
+            # launch never depends on which artifacts happen to be present.
             "--head-service-calibration",
             str(required_path("head_service_calibration")),
+            "--output-head-location",
+            str(_config_output_head_location(config)),
             "--admission-receipt",
             str(required_path("admission_receipt")),
             "--output",
@@ -4066,6 +4123,12 @@ def build_pipeline(
             str(baseline_report),
             "--gpu-baseline-receipt",
             str(baseline_receipt),
+            # The joint-selection stage always writes this record, and its
+            # `dual_accuracy_frontiers` entry is what the Pareto figure draws:
+            # passing it keeps the published envelopes and the emitted
+            # frontiers the same object rather than two computations of it.
+            "--refinement-promotion",
+            str(required_path("refinement_promotion")),
         )
     )
     if resources["publication_enabled"]:

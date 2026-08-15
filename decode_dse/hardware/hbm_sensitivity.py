@@ -12,13 +12,22 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 from decode_dse.hardware.admission_cost import (
     admission_correctness_status_valid,
 )
-from decode_dse.hardware.design_space import HardwareCandidate
+from decode_dse.hardware.design_space import (
+    HardwareCandidate,
+    evaluate_publication_admission,
+)
 from decode_dse.hardware.lm_head_service import (
+    DECODE_BF16_HEAD,
+    EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
+    OUTPUT_HEAD_IDEALIZATIONS,
+    OUTPUT_HEAD_SERVICE_MODES,
     composite_system_calibration_id,
     head_service_status_valid,
+    local_head_system_calibration_id,
     require_content_addressed_id,
 )
+from decode_dse.legality import ADMISSION_BASIS
 from decode_dse.profiles import (
     MX_BLOCK_SIZE,
     PROFILE_KIND_QUANTIZED,
@@ -36,7 +45,10 @@ HBM_SENSITIVITY_GENERATIONS = (
 )
 HBM_SENSITIVITY_SOURCE_COUNT = 4
 HBM_SENSITIVITY_BASELINE = "HBM2"
-HBM_SENSITIVITY_OUTPUT_HEAD = "external_bf16_service"
+# The sensitivity inherits whichever output-head boundary the source study
+# priced.  Both placements are supported; only the external one carries a
+# measured head-service identity.
+HBM_SENSITIVITY_OUTPUT_HEADS = (DECODE_BF16_HEAD, EXTERNAL_BF16_HEAD)
 
 
 def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
@@ -77,14 +89,20 @@ class HBMSensitivitySource:
     candidate: HardwareCandidate
     numerical_result_hash: str
     hardware_result_hash: str
-    head_service_artifact_sha256: str
-    head_service_calibration_id: str
-    head_service_provenance_id: str
+    output_head_location: str
+    head_service_artifact_sha256: str | None
+    head_service_calibration_id: str | None
+    head_service_provenance_id: str | None
     system_calibration_id: str
     timing_evidence_id: str
     baseline_bandwidth_calibration_id: str
     admission_correctness_evidence_id: str
     admission_validation_hash: str
+    #: Whether this exact source geometry was additionally compiled and
+    #: emulated, on top of being priced by the validated pricing model that
+    #: admitted it.  Sensitivity holds the geometry fixed across generations,
+    #: so the coverage is a property of the source and is recorded on it.
+    individually_validated: bool | None = None
 
     def __post_init__(self) -> None:
         if self.profile.kind != PROFILE_KIND_QUANTIZED:
@@ -95,24 +113,45 @@ class HBMSensitivitySource:
             raise ValueError("HBM sensitivity sources must use the HBM2 anchor")
         _require_sha256("numerical_result_hash", self.numerical_result_hash)
         _require_sha256("hardware_result_hash", self.hardware_result_hash)
-        _require_sha256(
-            "head_service_artifact_sha256",
-            self.head_service_artifact_sha256,
-        )
-        require_content_addressed_id(
-            "head_service_calibration_id",
-            self.head_service_calibration_id,
-            prefix="bf16-head-service-",
-        )
-        require_content_addressed_id(
-            "head_service_provenance_id",
-            self.head_service_provenance_id,
-            prefix="bf16-head-provenance-",
-        )
+        if self.output_head_location not in HBM_SENSITIVITY_OUTPUT_HEADS:
+            raise ValueError("output_head_location is unsupported")
+        local_head = self.output_head_location == DECODE_BF16_HEAD
+        if local_head:
+            # There is no remote endpoint to identify at the local boundary.
+            if any(
+                value is not None
+                for value in (
+                    self.head_service_artifact_sha256,
+                    self.head_service_calibration_id,
+                    self.head_service_provenance_id,
+                )
+            ):
+                raise ValueError(
+                    "the decode-local head carries no head-service identity"
+                )
+        else:
+            _require_sha256(
+                "head_service_artifact_sha256",
+                self.head_service_artifact_sha256,
+            )
+            require_content_addressed_id(
+                "head_service_calibration_id",
+                self.head_service_calibration_id,
+                prefix="bf16-head-service-",
+            )
+            require_content_addressed_id(
+                "head_service_provenance_id",
+                self.head_service_provenance_id,
+                prefix="bf16-head-provenance-",
+            )
         require_content_addressed_id(
             "system_calibration_id",
             self.system_calibration_id,
-            prefix="decode-head-system-",
+            prefix=(
+                "decode-local-head-system-"
+                if local_head
+                else "decode-head-system-"
+            ),
         )
         require_content_addressed_id(
             "timing_evidence_id",
@@ -142,7 +181,10 @@ class HBMSensitivitySource:
             "candidate": self.candidate.to_dict(),
             "numerical_result_hash": self.numerical_result_hash,
             "hardware_result_hash": self.hardware_result_hash,
-            "output_head_location": HBM_SENSITIVITY_OUTPUT_HEAD,
+            "output_head_location": self.output_head_location,
+            "output_head_idealizations": list(
+                OUTPUT_HEAD_IDEALIZATIONS[self.output_head_location]
+            ),
             "head_service_artifact_sha256": (
                 self.head_service_artifact_sha256
             ),
@@ -157,6 +199,8 @@ class HBMSensitivitySource:
                 self.admission_correctness_evidence_id
             ),
             "admission_validation_hash": self.admission_validation_hash,
+            "admission_basis": ADMISSION_BASIS,
+            "individually_validated": self.individually_validated,
         }
 
     @property
@@ -376,8 +420,15 @@ def hbm_sensitivity_sources_from_hardware_rows(
         _require_sha256("hardware result hash", record_hash)
         if _content_hash(row) != record_hash:
             raise ValueError("hardware result checksum mismatch")
-        if row.get("deployment_valid") is not True:
-            raise ValueError("HBM sensitivity requires deployment-valid sources")
+        # Sources must be priced by a validated, identified pricing model; an
+        # RTL-only or DC-only limitation, and the absence of individual
+        # compiler and emulator evidence at this geometry, are recorded on the
+        # source instead of excluding it.
+        row_admission = evaluate_publication_admission(row)
+        if not row_admission.admitted:
+            raise ValueError(
+                "HBM sensitivity requires admitted sources"
+            )
         profile = DecodePrecisionProfile.from_dict(row["profile"])
         if row.get("profile_id") != profile.profile_id:
             raise ValueError("hardware row profile identity mismatch")
@@ -422,37 +473,63 @@ def hbm_sensitivity_sources_from_hardware_rows(
             else None
         )
         whole_energy = whole_model.get("calibrated_energy")
+        head_location = str(
+            output_head.get("location", EXTERNAL_BF16_HEAD)
+        )
+        if head_location not in HBM_SENSITIVITY_OUTPUT_HEADS:
+            raise ValueError("hardware row output-head location is unsupported")
+        local_head = head_location == DECODE_BF16_HEAD
         if (
             whole_model.get("rankable") is not True
             or output_head.get("service_mode")
-            != HEAD_SERVICE_MODE
-            or not isinstance(status, Mapping)
-            or not isinstance(estimate, Mapping)
-            or not head_service_status_valid(status)
-            or status.get("service_location") != "prefill_chip"
-            or estimate.get("service_mode") != HEAD_SERVICE_MODE
-            or estimate.get("service_location") != "prefill_chip"
+            != OUTPUT_HEAD_SERVICE_MODES[head_location]
+            or tuple(output_head.get("scope_idealizations", ()))
+            != OUTPUT_HEAD_IDEALIZATIONS[head_location]
             or not isinstance(decoder_energy, Mapping)
             or not isinstance(whole_energy, Mapping)
         ):
             raise ValueError(
-                "HBM sensitivity requires the calibrated remote BF16 head"
+                "HBM sensitivity requires a rankable output-head boundary"
             )
-        head_calibration_id = str(status.get("calibration_id", ""))
-        head_provenance_id = str(status.get("provenance_id", ""))
-        if (
-            estimate.get("calibration_id") != head_calibration_id
-            or estimate.get("provenance_id") != head_provenance_id
-        ):
-            raise ValueError("remote-head estimate identity mismatch")
         decoder_calibration_id = str(
             decoder_energy.get("calibration_id", "")
         )
-        system_calibration_id = composite_system_calibration_id(
-            decoder_calibration_id,
-            head_calibration_id,
-            head_provenance_id,
-        )
+        head_artifact_sha256: str | None = None
+        head_calibration_id: str | None = None
+        head_provenance_id: str | None = None
+        if local_head:
+            if estimate is not None:
+                raise ValueError(
+                    "the decode-local head prices no remote estimate"
+                )
+            system_calibration_id = local_head_system_calibration_id(
+                decoder_calibration_id
+            )
+        else:
+            if (
+                not isinstance(status, Mapping)
+                or not isinstance(estimate, Mapping)
+                or not head_service_status_valid(status)
+                or status.get("service_location") != "prefill_chip"
+                or estimate.get("service_mode") != HEAD_SERVICE_MODE
+                or estimate.get("service_location") != "prefill_chip"
+            ):
+                raise ValueError(
+                    "HBM sensitivity requires the calibrated remote BF16 head"
+                )
+            head_calibration_id = str(status.get("calibration_id", ""))
+            head_provenance_id = str(status.get("provenance_id", ""))
+            head_artifact_sha256 = str(status.get("artifact_sha256", ""))
+            if (
+                estimate.get("calibration_id") != head_calibration_id
+                or estimate.get("provenance_id") != head_provenance_id
+            ):
+                raise ValueError("remote-head estimate identity mismatch")
+            system_calibration_id = composite_system_calibration_id(
+                decoder_calibration_id,
+                head_calibration_id,
+                head_provenance_id,
+            )
         if (
             whole_model.get("system_calibration_id")
             != system_calibration_id
@@ -492,9 +569,8 @@ def hbm_sensitivity_sources_from_hardware_rows(
                 candidate=candidate,
                 numerical_result_hash=str(row["numerical_result_hash"]),
                 hardware_result_hash=record_hash,
-                head_service_artifact_sha256=str(
-                    status.get("artifact_sha256", "")
-                ),
+                output_head_location=head_location,
+                head_service_artifact_sha256=head_artifact_sha256,
                 head_service_calibration_id=head_calibration_id,
                 head_service_provenance_id=head_provenance_id,
                 system_calibration_id=system_calibration_id,
@@ -508,6 +584,7 @@ def hbm_sensitivity_sources_from_hardware_rows(
                 admission_validation_hash=str(
                     admission["numerical_validation_hash"]
                 ),
+                individually_validated=row_admission.individually_validated,
             )
         )
     return tuple(
@@ -533,7 +610,7 @@ __all__ = [
     "HBMSensitivitySource",
     "HBM_SENSITIVITY_BASELINE",
     "HBM_SENSITIVITY_GENERATIONS",
-    "HBM_SENSITIVITY_OUTPUT_HEAD",
+    "HBM_SENSITIVITY_OUTPUT_HEADS",
     "HBM_SENSITIVITY_SCHEMA",
     "HBM_SENSITIVITY_SOURCE_COUNT",
     "build_hbm_sensitivity_schedule",

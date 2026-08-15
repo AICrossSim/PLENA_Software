@@ -775,3 +775,225 @@ def test_energy_efficiency_figure_and_context_semantics(tmp_path: Path) -> None:
     assert all(path.is_file() and path.stat().st_size > 0 for path in rendered)
     table = _hardware_table((point,))
     assert table[0]["average_system_power_w"] == pytest.approx(20.0)
+
+
+def _accuracy_budget_rows(
+    reference_mean_nll: float,
+) -> tuple[tuple[HardwarePoint, ...], tuple[object, ...]]:
+    """Return matched figure and selection rows for one synthetic study.
+
+    Each profile appears once on each side with identical identities and
+    identical accuracy, expressed the way each side stores it: the figure
+    carries a percentage perplexity increase, the selection record carries
+    mean NLL.
+    """
+
+    import math
+
+    from decode_dse.hardware.selection import ParetoPoint
+    from decode_dse.plots import _relative_perplexity_percent
+
+    rows = (
+        ("MXINT8", 1.002, 4.0, 0.20),
+        ("E4M3", 1.008, 2.0, 0.12),
+        ("MXINT4", 1.020, 1.5, 0.07),
+        ("E2M1", 1.040, 1.0, 0.05),
+        ("MXINT2", 1.300, 0.8, 0.03),
+    )
+    hardware: list[HardwarePoint] = []
+    selection: list[object] = []
+    for weight_format, relative_perplexity, tpot, energy in rows:
+        profile = DecodePrecisionProfile.quantized(
+            weight_format, "MXINT8", "MXINT8", "FP_E5M6"
+        )
+        delta_nll = math.log(relative_perplexity)
+        candidate_id = f"cand-{weight_format}"
+        hardware.append(
+            HardwarePoint(
+                profile=profile,
+                candidate_id=candidate_id,
+                delta_nll=delta_nll,
+                relative_perplexity_percent=_relative_perplexity_percent(delta_nll),
+                tpot_ms=tpot,
+                tps=1000.0 / tpot,
+                energy_j=energy,
+                area_mm2=180.0,
+                max_runtime_batch=64,
+                chip_count=4,
+                energy_tier="analytic_anchored",
+                publication_timing_tier="stage_calibrated_analytic",
+            )
+        )
+        selection.append(
+            ParetoPoint(
+                profile=profile,
+                mean_nll=reference_mean_nll + delta_nll,
+                tpot_ms=tpot,
+                tps=1000.0 / tpot,
+                energy_per_token_j=energy,
+                area_mm2=180.0,
+                candidate_id=candidate_id,
+                power_calibration_id="synthetic-power",
+                cost_scope="whole_model",
+                system_calibration_id="synthetic-system",
+                head_service_calibration_id="synthetic-head",
+                whole_model_rankable=True,
+                energy_tier="analytic_anchored",
+                publication_timing_tier="stage_calibrated_analytic",
+            )
+        )
+    return tuple(hardware), tuple(selection)
+
+
+def test_pareto_figure_and_selection_record_share_one_accuracy_budget(
+    tmp_path: Path,
+) -> None:
+    # The figure stores accuracy as a percentage perplexity increase and the
+    # selection record stores it as mean NLL against a reference. Before these
+    # were reduced to one comparison the two could admit different point sets
+    # while both looking correct, so the emitted frontier and the published
+    # figure could disagree silently.
+    from decode_dse.hardware.selection import (
+        dual_accuracy_frontiers,
+        relative_perplexity_from_mean_nll,
+        relative_perplexity_from_percent,
+    )
+    from decode_dse.plots import (
+        FRONTIER_FROM_LOCAL_RECOMPUTE,
+        FRONTIER_FROM_RECORD,
+        hardware_accuracy_envelopes,
+    )
+
+    reference = 2.52709
+    hardware, selection = _accuracy_budget_rows(reference)
+    budgets = {
+        "strict_relative_perplexity": 1.01,
+        "relaxed_relative_perplexity": 1.05,
+    }
+    record = dual_accuracy_frontiers(
+        selection,
+        reference_mean_nll=reference,
+        strict_relative_perplexity=budgets["strict_relative_perplexity"],
+        relaxed_relative_perplexity=budgets["relaxed_relative_perplexity"],
+    )
+
+    # Both sides reduce their own accuracy column to the same ratio.
+    for figure_row, selection_row in zip(hardware, selection):
+        assert relative_perplexity_from_percent(
+            figure_row.relative_perplexity_percent
+        ) == pytest.approx(
+            relative_perplexity_from_mean_nll(selection_row.mean_nll, reference)
+        )
+
+    local = hardware_accuracy_envelopes(hardware, accuracy_budgets=budgets)
+    assert local.source == FRONTIER_FROM_LOCAL_RECOMPUTE
+    assert local.note.startswith("accuracy frontier: ")
+    # Budget membership is the shared decision, and it agrees exactly.
+    assert len(local.strict_members) == record["budgets"]["strict"]["admitted_points"]
+    assert len(local.relaxed_members) == record["budgets"]["relaxed"]["admitted_points"]
+    assert {point.candidate_id for point in local.strict_members} == {
+        "cand-MXINT8",
+        "cand-E4M3",
+    }
+
+    joined = hardware_accuracy_envelopes(
+        hardware,
+        accuracy_budgets=budgets,
+        frontier_record=record,
+    )
+    assert joined.source == FRONTIER_FROM_RECORD
+    assert joined.strict_members == local.strict_members
+    assert joined.relaxed_members == local.relaxed_members
+    # The record-driven envelope is exactly the emitted front, which keeps
+    # accuracy as a dominance objective and so may be wider than the figure's
+    # own two-objective envelope. That difference is now disclosed on the
+    # figure instead of being invisible.
+    for name, envelope in (("strict", joined.strict), ("relaxed", joined.relaxed)):
+        emitted = {
+            entry["candidate_id"] for entry in record["budgets"][name]["front"]
+        }
+        assert {point.candidate_id for point in envelope} == emitted
+    assert set(local.strict).issubset(set(joined.strict))
+
+    with_record = tmp_path / "with-record"
+    with_record.mkdir()
+    rendered = plot_hardware_pareto(
+        hardware,
+        model_name="Synthetic decode model",
+        output_dir=with_record,
+        formats=("svg",),
+        accuracy_budgets=budgets,
+        frontier_record=record,
+    )
+    _assert_rendered(rendered)
+    # The figure must still render with no frontier record at all.
+    without_record = tmp_path / "without-record"
+    without_record.mkdir()
+    fallback = plot_hardware_pareto(
+        hardware,
+        model_name="Synthetic decode model",
+        output_dir=without_record,
+        formats=("svg",),
+        accuracy_budgets=budgets,
+    )
+    _assert_rendered(fallback)
+
+
+def test_pareto_figure_fails_closed_on_a_disagreeing_frontier_record(
+    tmp_path: Path,
+) -> None:
+    from decode_dse.hardware.selection import dual_accuracy_frontiers
+    from decode_dse.plots import hardware_accuracy_envelopes
+
+    reference = 2.52709
+    hardware, selection = _accuracy_budget_rows(reference)
+    budgets = {
+        "strict_relative_perplexity": 1.01,
+        "relaxed_relative_perplexity": 1.05,
+    }
+    record = dual_accuracy_frontiers(
+        selection,
+        reference_mean_nll=reference,
+        strict_relative_perplexity=budgets["strict_relative_perplexity"],
+        relaxed_relative_perplexity=budgets["relaxed_relative_perplexity"],
+    )
+
+    other_budgets = dict(budgets, strict_relative_perplexity=1.02)
+    with pytest.raises(ValueError, match="different budgets"):
+        hardware_accuracy_envelopes(
+            hardware,
+            accuracy_budgets=other_budgets,
+            frontier_record=record,
+        )
+
+    unknown_schema = json.loads(json.dumps(record))
+    unknown_schema["schema_version"] = "decode-some-other-record"
+    with pytest.raises(ValueError, match="unsupported schema"):
+        hardware_accuracy_envelopes(
+            hardware,
+            accuracy_budgets=budgets,
+            frontier_record=unknown_schema,
+        )
+
+    foreign_row = json.loads(json.dumps(record))
+    foreign_row["budgets"]["strict"]["front"][0]["candidate_id"] = "cand-elsewhere"
+    with pytest.raises(ValueError, match="did not load"):
+        hardware_accuracy_envelopes(
+            hardware,
+            accuracy_budgets=budgets,
+            frontier_record=foreign_row,
+        )
+
+    # A record whose front names a row the figure's budget filter rejects is
+    # exactly the silent divergence this path exists to prevent.
+    outside_budget = json.loads(json.dumps(record))
+    outside_budget["budgets"]["strict"]["front"] = [
+        entry
+        for entry in outside_budget["budgets"]["relaxed"]["front"]
+    ]
+    with pytest.raises(ValueError, match="budget filter rejects"):
+        hardware_accuracy_envelopes(
+            hardware,
+            accuracy_budgets=budgets,
+            frontier_record=outside_budget,
+        )

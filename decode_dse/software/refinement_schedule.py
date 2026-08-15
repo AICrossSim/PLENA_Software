@@ -13,6 +13,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from decode_dse.hardware.design_space import (
     HARDWARE_STORAGE_REVISION,
     LEGACY_COMPACT_STORAGE_REVISION,
+    evaluate_publication_admission,
     load_hardware_artifact,
 )
 from decode_dse.hardware.evaluation import load_terminal_numerical_rows
@@ -1199,15 +1200,42 @@ def validate_complete_numerical_rows(
     return result
 
 
+def _is_finite_positive(value: Any) -> bool:
+    """True when a promotion metric is present, finite and strictly positive."""
+
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
 def _finite_positive(value: Any) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+    if not _is_finite_positive(value):
         raise ValueError("hardware promotion metric must be finite and positive")
     return float(value)
+
+
+def _point_area_mm2(metrics: Mapping[str, Any]) -> Any:
+    """Return the promotion area, preferring the per-chip figure it always used.
+
+    ``area_mm2`` remains the promotion objective, unchanged.  The aggregate
+    fields are consulted only when it is absent, so a row that carries the
+    system aggregate alone is skipped for lack of a comparable number rather
+    than raising during point construction.
+    """
+
+    area = metrics.get("area_mm2")
+    if area is not None:
+        return area
+    resource_budget = metrics.get("resource_budget")
+    aggregate = (
+        resource_budget.get("aggregate_area_mm2")
+        if isinstance(resource_budget, Mapping)
+        else None
+    )
+    return metrics.get("system_area_mm2", aggregate)
 
 
 def _hardware_point(
@@ -1221,10 +1249,21 @@ def _hardware_point(
         return None
     whole = metrics.get("whole_model")
     energy = whole.get("calibrated_energy") if isinstance(whole, Mapping) else None
-    output_head = metrics.get("output_head_boundary")
-    head_estimate = (
-        output_head.get("estimate") if isinstance(output_head, Mapping) else None
+    output_head = (
+        metrics.get("output_head_boundary")
+        if isinstance(metrics.get("output_head_boundary"), Mapping)
+        else {}
     )
+    head_estimate = output_head.get("estimate")
+    # The decode-local head prices the projection inside the decode chip, so a
+    # measured remote estimate exists only at the external boundary.
+    head_location = str(
+        output_head.get("location", "external_bf16_service")
+    )
+    head_idealizations = tuple(
+        str(code) for code in output_head.get("scope_idealizations", ())
+    )
+    local_head = head_location == "decode_bf16_unmodeled"
     capacity = metrics.get("capacity")
     energy_tier = energy.get("energy_tier") if isinstance(energy, Mapping) else None
     energy_identity = (
@@ -1233,8 +1272,21 @@ def _hardware_point(
         else None
     )
     timing_tier = whole.get("publication_timing_tier") if isinstance(whole, Mapping) else None
+    # Admission rests on the pricing model being validated and identified; an
+    # RTL-only or DC-only limitation, and the absence of individual compiler
+    # and emulator evidence at this exact geometry, are both recorded on the
+    # point and disclosed downstream rather than withholding the row.
+    admission = evaluate_publication_admission(row)
+    system_calibration_id = (
+        whole.get("system_calibration_id") if isinstance(whole, Mapping) else None
+    )
+    head_calibration_id = (
+        head_estimate.get("calibration_id")
+        if isinstance(head_estimate, Mapping)
+        else None
+    )
     if (
-        row.get("deployment_valid") is not True
+        not admission.admitted
         or not isinstance(whole, Mapping)
         or whole.get("rankable") is not True
         or timing_tier
@@ -1250,25 +1302,51 @@ def _hardware_point(
         or metrics.get("runtime_feasible") is not True
         or not isinstance(capacity, Mapping)
         or capacity.get("feasible") is not True
-        or row.get("packedkv_selector_valid") is not True
-        or not isinstance(head_estimate, Mapping)
+        # Every value the point is built from is checked here so an
+        # under-specified row is skipped rather than raising mid-construction.
+        or not isinstance(system_calibration_id, str)
+        or not system_calibration_id
+        or not (
+            local_head
+            or (isinstance(head_calibration_id, str) and head_calibration_id)
+        )
+        or not _is_finite_positive(whole.get("tpot_ms"))
+        or not _is_finite_positive(whole.get("tps"))
+        or not _is_finite_positive(energy.get("total_j"))
+        or not _is_finite_positive(_point_area_mm2(metrics))
     ):
         return None
+    coverage = (
+        admission.coverage.to_dict() if admission.coverage is not None else None
+    )
     return ParetoPoint(
         profile=profile,
         mean_nll=mean_nll,
         tpot_ms=_finite_positive(whole.get("tpot_ms")),
         tps=_finite_positive(whole.get("tps")),
         energy_per_token_j=_finite_positive(energy.get("total_j")),
-        area_mm2=_finite_positive(metrics.get("area_mm2")),
-        candidate_id=str(row["candidate_id"]),
+        area_mm2=_finite_positive(_point_area_mm2(metrics)),
+        candidate_id=str(row.get("candidate_id", "")) or None,
         power_calibration_id=energy_identity,
         cost_scope="whole_model",
-        system_calibration_id=str(whole["system_calibration_id"]),
-        head_service_calibration_id=str(head_estimate["calibration_id"]),
+        system_calibration_id=str(system_calibration_id),
+        head_service_calibration_id=(
+            None if local_head else str(head_calibration_id)
+        ),
+        output_head_location=head_location,
+        output_head_idealizations=head_idealizations,
         whole_model_rankable=True,
         energy_tier=energy_tier,
         publication_timing_tier=str(timing_tier),
+        rtl_valid=admission.rtl_valid,
+        recorded_issue_codes=admission.recorded_issue_codes,
+        individually_validated=admission.individually_validated,
+        individual_validation_coverage=coverage,
+        pricing_model=(
+            admission.pricing_model.to_dict()
+            if admission.pricing_model is not None
+            else None
+        ),
     )
 
 

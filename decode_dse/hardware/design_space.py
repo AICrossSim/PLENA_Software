@@ -15,6 +15,11 @@ from typing import Any, ClassVar, Iterable, Iterator, Mapping, Protocol, Sequenc
 
 from decode_dse.legality import (
     DEFAULT_PACKED_KV_TARGET,
+    INDIVIDUAL_VALIDATION_STAGES,
+    MODEL_REQUIRED_VALIDITY_STAGES,
+    PRICING_BLOCKING_STAGES,
+    PRICING_RECORDED_STAGES,
+    ADMISSION_BASIS,
     PackedKVRuntimeTarget,
     evaluate_stack_capability,
     scope_stack_validity,
@@ -24,7 +29,12 @@ from decode_dse.hardware.admission_cost import (
 )
 from decode_dse.hardware.lm_head_service import (
     BF16HeadServiceEstimate,
+    DECODE_BF16_HEAD,
+    EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
+    OUTPUT_HEAD_IDEALIZATIONS,
+    OUTPUT_HEAD_LOCATIONS,
+    OUTPUT_HEAD_SERVICE_MODES,
     head_service_status_valid,
 )
 from decode_dse.legality import StackValidity
@@ -77,6 +87,21 @@ _VALIDITY_FIELDS = (
     "emulator_valid",
     "rtl_valid",
     "dc_calibrated",
+)
+# StackValidity names the DC stage "dc_calibrated" rather than "dc_valid", so
+# the stage-to-field mapping is spelled out instead of derived by suffix.
+_STAGE_VALIDITY_FIELD: Mapping[str, str] = {
+    "software": "software_valid",
+    "compiler": "compiler_valid",
+    "emulator": "emulator_valid",
+    "rtl": "rtl_valid",
+    "dc": "dc_calibrated",
+}
+BLOCKING_VALIDITY_FIELDS = tuple(
+    _STAGE_VALIDITY_FIELD[stage] for stage in PRICING_BLOCKING_STAGES
+)
+RECORDED_VALIDITY_FIELDS = tuple(
+    _STAGE_VALIDITY_FIELD[stage] for stage in PRICING_RECORDED_STAGES
 )
 STEP_COMPOSITION = "max_compute_memory"
 COMPILER_TRACE_EXECUTION_MODE = "compiler_trace"
@@ -1341,8 +1366,17 @@ class HardwareMetrics:
         default_factory=dict
     )
     service_mode: str = "unmodeled"
+    output_head_location: str = DECODE_BF16_HEAD
+    #: Named scope idealizations disclosed by the priced output-head boundary.
+    #: Empty for the measured remote service; for the decode-local head it
+    #: names the head compute that carries no measured cost evidence.
+    output_head_idealizations: tuple[str, ...] = ()
     output_head_status: Mapping[str, Any] = field(default_factory=dict)
     output_head_service: BF16HeadServiceEstimate | None = None
+    #: Remote head-service estimate recorded for side-by-side comparison when
+    #: the priced boundary is the decode-local head.  It never enters the
+    #: headline cost; it exists so both placements can be reported together.
+    output_head_comparison: BF16HeadServiceEstimate | None = None
     whole_model_tpot_ms: float | None = None
     whole_model_tps: float | None = None
     whole_model_energy: CalibratedEnergy | None = None
@@ -1776,7 +1810,51 @@ class HardwareMetrics:
             self.whole_model_tpot_ms,
             self.whole_model_tps,
         )
+        if self.output_head_location not in OUTPUT_HEAD_LOCATIONS:
+            raise ValueError("output_head_location is unsupported")
+        # The disclosure is fully determined by the priced boundary, so it is
+        # derived rather than supplied: a row can never be written without it.
+        expected_idealizations = OUTPUT_HEAD_IDEALIZATIONS[
+            self.output_head_location
+        ]
+        supplied_idealizations = tuple(
+            str(code) for code in self.output_head_idealizations
+        )
+        if (
+            supplied_idealizations
+            and supplied_idealizations != expected_idealizations
+        ):
+            raise ValueError(
+                "output-head idealizations must match the priced boundary"
+            )
+        object.__setattr__(
+            self,
+            "output_head_idealizations",
+            expected_idealizations,
+        )
+        if self.output_head_comparison is not None:
+            # A recorded comparison arm never prices anything, so it is only
+            # meaningful beside a locally-headed row.
+            if self.output_head_location != DECODE_BF16_HEAD:
+                raise ValueError(
+                    "the head-service comparison belongs to the local boundary"
+                )
+            if self.output_head_service is not None:
+                raise ValueError(
+                    "a priced head-service estimate cannot also be a comparison"
+                )
+            if (
+                self.output_head_comparison.batch
+                != self.generated_tokens_per_step
+            ):
+                raise ValueError(
+                    "head-service comparison and decoder batch sizes differ"
+                )
         if self.output_head_service is not None:
+            if self.output_head_location != EXTERNAL_BF16_HEAD:
+                raise ValueError(
+                    "head-service costs require the external head boundary"
+                )
             if self.service_mode != HEAD_SERVICE_MODE:
                 raise ValueError(
                     "head-service costs require the remote service mode"
@@ -1811,11 +1889,16 @@ class HardwareMetrics:
                     "head-service and decoder batch sizes differ"
                 )
         if self.whole_model_rankable:
-            if self.service_mode != HEAD_SERVICE_MODE:
+            if self.service_mode != OUTPUT_HEAD_SERVICE_MODES[
+                self.output_head_location
+            ]:
                 raise ValueError(
-                    "rankable whole-model metrics require the remote service"
+                    "service mode and output-head location disagree"
                 )
-            if self.output_head_service is None:
+            if (
+                self.output_head_location == EXTERNAL_BF16_HEAD
+                and self.output_head_service is None
+            ):
                 raise ValueError(
                     "rankable whole-model metrics require head-service costs"
                 )
@@ -1823,9 +1906,13 @@ class HardwareMetrics:
                 raise ValueError(
                     "rankable whole-model timing must be complete"
                 )
-            expected_tpot = (
-                self.tpot_ms
-                + self.output_head_service.total_latency_s * 1000.0
+            # The decode-local head runs inside the decode step that `tpot_ms`
+            # already prices, so the whole model adds no serialized latency;
+            # the remote service is a second, serialized endpoint.
+            expected_tpot = self.tpot_ms + (
+                self.output_head_service.total_latency_s * 1000.0
+                if self.output_head_service is not None
+                else 0.0
             )
             if abs(float(self.whole_model_tpot_ms) - expected_tpot) > max(
                 1e-9,
@@ -2217,11 +2304,22 @@ class HardwareMetrics:
                 "area_scope": "decode_chip_only",
             },
             "output_head_boundary": {
+                "location": self.output_head_location,
                 "service_mode": self.service_mode,
+                # Named, machine-readable scope limits of the priced boundary.
+                # A locally-headed row always carries
+                # ``local_bf16_head_compute_idealized`` so no reader can take
+                # it for a head whose compute cost was measured.
+                "scope_idealizations": list(self.output_head_idealizations),
                 "status": dict(self.output_head_status),
                 "estimate": (
                     self.output_head_service.to_dict()
                     if self.output_head_service is not None
+                    else None
+                ),
+                "comparison_estimate": (
+                    self.output_head_comparison.to_dict()
+                    if self.output_head_comparison is not None
                     else None
                 ),
             },
@@ -2897,6 +2995,584 @@ def _compact_energy_tier_rank(value: Any) -> int:
     return 2
 
 
+#: Energy tiers a priced row may carry.  Both are identified coefficient sets
+#: or fitted models; neither is a bare estimate.
+RANKABLE_ENERGY_TIERS = frozenset({"analytic_anchored", "dc_calibrated"})
+
+#: ``area_source`` values that name a DC-calibrated area model.  Those, and
+#: only those, must additionally carry an area calibration identity.
+DC_AREA_SOURCES = frozenset({"dc_calibrated", "dc_calibrated_model"})
+
+#: ``INDIVIDUAL_VALIDATION_STAGES`` (compiler, emulator) and
+#: ``MODEL_REQUIRED_VALIDITY_STAGES`` (software) are imported from
+#: ``decode_dse.legality``, which defines and checks the split; see the comment
+#: beside their definition for why a successful observation on the first pair
+#: describes one design point while the second is unscoped.
+
+
+@dataclass(frozen=True)
+class IndividualValidationCoverage:
+    """Which stages were individually measured for one row, and where.
+
+    Admission rests on the pricing model being validated, so
+    this record exists to keep the *other* question answerable per row: was
+    this exact design point additionally compiled and emulated?
+
+    ``scope_stack_validity`` demotes a successful compiler/emulator observation
+    to ``None`` on every geometry other than the one it was measured at, and
+    leaves an observed failure ``False`` everywhere.  The three states are
+    therefore distinct evidence and are reported separately:
+
+    ``validated_stages``
+        measured ``True`` at this row's own runtime geometry.
+    ``unmeasured_stages``
+        never measured here -- the row is priced by the validated model alone.
+    ``failed_stages``
+        measured and *failed*; such a row is refused outright, because a
+        measured failure is evidence about the point itself.
+
+    Because a ``True`` survives scoping only on an exact geometry match,
+    ``evidence_target`` is the row's own runtime target whenever the row is
+    individually validated, and ``None`` otherwise.
+    """
+
+    individually_validated: bool
+    validated_stages: tuple[str, ...]
+    unmeasured_stages: tuple[str, ...]
+    failed_stages: tuple[str, ...]
+    runtime_target: Mapping[str, Any] | None
+    evidence_target: Mapping[str, Any] | None
+    #: Measured validity of the blocking stages that are not geometry scoped
+    #: (today: ``software``).  These stay required, so they are reported for
+    #: completeness rather than as coverage.
+    required_stage_validity: Mapping[str, bool | None] = field(
+        default_factory=dict
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "individually_validated": self.individually_validated,
+            "individually_validated_stages": list(self.validated_stages),
+            "individual_validation_stages": list(INDIVIDUAL_VALIDATION_STAGES),
+            "unmeasured_stages": list(self.unmeasured_stages),
+            "failed_stages": list(self.failed_stages),
+            "required_stage_validity": dict(self.required_stage_validity),
+            "runtime_target": (
+                dict(self.runtime_target)
+                if self.runtime_target is not None
+                else None
+            ),
+            "evidence_target": (
+                dict(self.evidence_target)
+                if self.evidence_target is not None
+                else None
+            ),
+            "coverage_scope": (
+                "compiler and emulator evidence is scoped to the exact "
+                "geometry it was measured at; an unmeasured stage means this "
+                "point was priced by the validated model, not that it failed"
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class PricingModelIdentity:
+    """The identity of every pricing model one row's numbers rest on.
+
+    These are the identities the admission test requires.  They name *which*
+    validated model produced each cost, so a reader can pair the row with the
+    model's published error figures (see ``hardware/model_validation.py``).
+    """
+
+    timing_evidence_id: str | None = None
+    timing_tier: str | None = None
+    timing_mode: str | None = None
+    bandwidth_calibration_id: str | None = None
+    energy_tier: str | None = None
+    energy_id: str | None = None
+    area_source: str | None = None
+    area_calibration_id: str | None = None
+    area_scope: str | None = None
+    layout_id: str | None = None
+    system_calibration_id: str | None = None
+    head_service_calibration_id: str | None = None
+    output_head_location: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "timing_evidence_id": self.timing_evidence_id,
+            "timing_tier": self.timing_tier,
+            "timing_mode": self.timing_mode,
+            "bandwidth_calibration_id": self.bandwidth_calibration_id,
+            "energy_tier": self.energy_tier,
+            "energy_id": self.energy_id,
+            "area_source": self.area_source,
+            "area_calibration_id": self.area_calibration_id,
+            "area_scope": self.area_scope,
+            "layout_id": self.layout_id,
+            "system_calibration_id": self.system_calibration_id,
+            "head_service_calibration_id": self.head_service_calibration_id,
+            "output_head_location": self.output_head_location,
+        }
+
+
+@dataclass(frozen=True)
+class PublicationAdmission:
+    """Verdict on whether a joined row may enter the published frontier.
+
+    Admission asks whether the row was **priced by a validated, identified
+    pricing model** -- calibrated timing bound to a timing-evidence identity,
+    a bandwidth calibration identity, an identified energy tier, an identified
+    area model, a priced output-head boundary, and demonstrated capacity,
+    runtime and resource-budget feasibility -- and whether the numerical run
+    for its profile succeeded.  This matches the standard practice of
+    validating a model against a reference implementation and then exploring
+    the design space with the validated model.
+
+    It does **not** ask whether this individual point was separately compiled
+    and emulated.  That is a different and narrower claim, so it is reported
+    rather than required: :attr:`coverage` carries it on every verdict,
+    admitted or not, and ``require_individual_validation=True`` selects the
+    strict subset for which it holds.
+
+    A limitation confined to the RTL implementation or the DC flow remains
+    *recorded* on the row rather than used to withhold it, mirroring the
+    pricing split applied in ``hardware/evaluation.py`` via
+    ``PRICING_BLOCKING_STAGES``.  A *measured failure* on any stage is never
+    tolerated: it is evidence about the point itself and refuses the row.
+    """
+
+    admitted: bool
+    reason: str | None = None
+    blocking_issue_codes: tuple[str, ...] = ()
+    recorded_issue_codes: tuple[str, ...] = ()
+    rtl_valid: bool | None = None
+    dc_calibrated: bool | None = None
+    selector_valid: bool | None = None
+    coverage: IndividualValidationCoverage | None = None
+    pricing_model: PricingModelIdentity | None = None
+
+    @property
+    def individually_validated(self) -> bool:
+        """True when this exact point was also compiled and emulated here."""
+
+        return (
+            self.coverage is not None and self.coverage.individually_validated
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Disclosure record: the verdict, its basis, and its coverage."""
+
+        return {
+            "admitted": self.admitted,
+            "reason": self.reason,
+            "admission_basis": ADMISSION_BASIS,
+            "blocking_issue_codes": list(self.blocking_issue_codes),
+            "recorded_issue_codes": list(self.recorded_issue_codes),
+            "rtl_valid": self.rtl_valid,
+            "dc_calibrated": self.dc_calibrated,
+            "packedkv_selector_valid": self.selector_valid,
+            "individually_validated": self.individually_validated,
+            "individual_validation_coverage": (
+                self.coverage.to_dict() if self.coverage is not None else None
+            ),
+            "pricing_model": (
+                self.pricing_model.to_dict()
+                if self.pricing_model is not None
+                else None
+            ),
+        }
+
+
+def _issue_stage_codes(
+    capability: Mapping[str, Any] | None,
+    stages: Sequence[str],
+) -> tuple[str, ...]:
+    """Collect capability issue codes that touch any of ``stages``."""
+
+    wanted = set(stages)
+    issues = (capability or {}).get("issues") or ()
+    if not isinstance(issues, Sequence):
+        return ()
+    codes = set()
+    for issue in issues:
+        if not isinstance(issue, Mapping):
+            continue
+        issue_stages = issue.get("stages")
+        if not isinstance(issue_stages, Sequence) or isinstance(issue_stages, str):
+            # An issue with no declared stage scope is treated as blocking.
+            codes.add(str(issue.get("code", "")))
+            continue
+        if wanted & {str(stage) for stage in issue_stages}:
+            codes.add(str(issue.get("code", "")))
+    return tuple(sorted(code for code in codes if code))
+
+
+def _row_energy(metrics: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """Return the whole-model calibrated energy record, if it is present."""
+
+    whole = metrics.get("whole_model")
+    if not isinstance(whole, Mapping):
+        return None
+    energy = whole.get("calibrated_energy")
+    return energy if isinstance(energy, Mapping) else None
+
+
+def _head_boundary_priced(metrics: Mapping[str, Any]) -> bool:
+    """True when the output-head boundary carries the evidence its location needs.
+
+    The decode-local head has no second endpoint to price, so a measured
+    head-service estimate is required only at the external boundary.  This is
+    the same test ``_promotion_retention_key`` applies, kept in one place so
+    admission and promotion cannot disagree about what a priced head means.
+    """
+
+    output_head = metrics.get("output_head_boundary")
+    if not isinstance(output_head, Mapping):
+        return False
+    estimate = output_head.get("estimate")
+    if (
+        isinstance(estimate, Mapping)
+        and isinstance(estimate.get("calibration_id"), str)
+        and bool(estimate.get("calibration_id"))
+    ):
+        return True
+    return (
+        output_head.get("location") == DECODE_BF16_HEAD and estimate is None
+    )
+
+
+def _pricing_model_identity(
+    metrics: Mapping[str, Any] | None,
+) -> PricingModelIdentity:
+    """Collect the identity of every pricing model one row rests on."""
+
+    if not isinstance(metrics, Mapping):
+        return PricingModelIdentity()
+
+    def text(value: Any) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    whole = metrics.get("whole_model")
+    whole = whole if isinstance(whole, Mapping) else {}
+    energy = _row_energy(metrics) or {}
+    output_head = metrics.get("output_head_boundary")
+    output_head = output_head if isinstance(output_head, Mapping) else {}
+    estimate = output_head.get("estimate")
+    estimate = estimate if isinstance(estimate, Mapping) else {}
+    return PricingModelIdentity(
+        timing_evidence_id=text(metrics.get("timing_evidence_id")),
+        timing_tier=text(whole.get("publication_timing_tier")),
+        timing_mode=text(metrics.get("timing_mode")),
+        bandwidth_calibration_id=text(metrics.get("bandwidth_calibration_id")),
+        energy_tier=text(energy.get("energy_tier", whole.get("energy_tier"))),
+        energy_id=text(energy.get("energy_id") or energy.get("calibration_id")),
+        area_source=text(metrics.get("area_source")),
+        area_calibration_id=text(metrics.get("area_calibration_id")),
+        area_scope=text(metrics.get("area_scope")),
+        layout_id=text(metrics.get("layout_id")),
+        system_calibration_id=text(whole.get("system_calibration_id")),
+        head_service_calibration_id=text(estimate.get("calibration_id")),
+        output_head_location=text(output_head.get("location")),
+    )
+
+
+def individual_validation_coverage(
+    row: Mapping[str, Any],
+) -> IndividualValidationCoverage:
+    """Report which stages were individually measured for one row, and where.
+
+    This is pure disclosure: it never decides admission on its own.  It splits
+    the three distinct states ``StackValidity`` records -- measured true,
+    unmeasured, measured false -- so that "not compiled here" is never
+    presented as "compiled and passed", nor as "compiled and failed".
+    """
+
+    validity = row.get("validity")
+    validity = validity if isinstance(validity, Mapping) else {}
+    capability = row.get("capability")
+    target = (
+        capability.get("target") if isinstance(capability, Mapping) else None
+    )
+    runtime_target = dict(target) if isinstance(target, Mapping) else None
+    validated: list[str] = []
+    unmeasured: list[str] = []
+    failed: list[str] = []
+    for stage in INDIVIDUAL_VALIDATION_STAGES:
+        observation = validity.get(_STAGE_VALIDITY_FIELD[stage])
+        if observation is True:
+            validated.append(stage)
+        elif observation is False:
+            failed.append(stage)
+        else:
+            unmeasured.append(stage)
+    individually_validated = not unmeasured and not failed
+    required = {
+        stage: (
+            observed
+            if isinstance(
+                observed := validity.get(_STAGE_VALIDITY_FIELD[stage]), bool
+            )
+            else None
+        )
+        for stage in MODEL_REQUIRED_VALIDITY_STAGES
+    }
+    return IndividualValidationCoverage(
+        individually_validated=individually_validated,
+        validated_stages=tuple(validated),
+        unmeasured_stages=tuple(unmeasured),
+        failed_stages=tuple(failed),
+        required_stage_validity=required,
+        runtime_target=runtime_target,
+        # A measured ``True`` survives ``scope_stack_validity`` only on an
+        # exact geometry match, so an individually validated row *is* sitting
+        # at the geometry the evidence was measured at.
+        evidence_target=runtime_target if individually_validated else None,
+    )
+
+
+def evaluate_publication_admission(
+    row: Mapping[str, Any],
+    *,
+    require_individual_validation: bool = False,
+) -> PublicationAdmission:
+    """Decide frontier admission for one joined row on pricing-model evidence.
+
+    A row is admitted when the pricing model that produced its
+    numbers is validated and identified, and when nothing measured about the
+    point itself contradicts the price.  Concretely the row must carry:
+
+    * a succeeded numerical run and static hardware legality;
+    * measured validity for every blocking stage that is not geometry scoped
+      (``MODEL_REQUIRED_VALIDITY_STAGES``: the software implementation);
+    * no measured *failure* on the compiler or emulator stages, and no
+      structural capability limitation on any blocking stage;
+    * calibrated timing bound to a timing-evidence identity, at a declared
+      publication timing tier;
+    * calibrated memory timing bound to a bandwidth calibration identity;
+    * an energy tier drawn from ``RANKABLE_ENERGY_TIERS`` together with the
+      identity of the coefficient set or fit that produced it;
+    * an identified area model (and, when that model is DC calibrated, its
+      calibration identity);
+    * a priced output-head boundary, a layout identity and a composed
+      whole-model system identity;
+    * demonstrated capacity, runtime and resource-budget feasibility.
+
+    What it deliberately does *not* require is that this individual design
+    point was separately compiled and emulated.  Measured compiler and
+    emulator evidence is scoped to one geometry by ``scope_stack_validity``,
+    so requiring it would restrict the study to the single validation
+    geometry and suppress the result the validated model was built to produce.
+    That coverage is reported instead: every verdict carries
+    :attr:`PublicationAdmission.coverage`, and passing
+    ``require_individual_validation=True`` returns the strict subset for which
+    the individual evidence exists -- the framing both ways, from one function.
+
+    ``deployment_valid`` remains the strict, fail-closed record that every
+    stage including RTL was validated, and it stays on the artifact unchanged.
+    """
+
+    validity = row.get("validity")
+    capability = row.get("capability")
+    metrics = row.get("metrics")
+    numerical = row.get("numerical_summary")
+    legality = row.get("legality")
+    capability = capability if isinstance(capability, Mapping) else None
+    blocking_codes = set(_issue_stage_codes(capability, PRICING_BLOCKING_STAGES))
+    recorded_codes = tuple(
+        sorted(
+            set(_issue_stage_codes(capability, PRICING_RECORDED_STAGES))
+            - blocking_codes
+        )
+    )
+    rtl_valid = (
+        validity.get("rtl_valid") if isinstance(validity, Mapping) else None
+    )
+    dc_calibrated = (
+        validity.get("dc_calibrated") if isinstance(validity, Mapping) else None
+    )
+    selector_valid = row.get("packedkv_selector_valid")
+    coverage = individual_validation_coverage(row)
+    pricing_model = _pricing_model_identity(
+        metrics if isinstance(metrics, Mapping) else None
+    )
+
+    def verdict(admitted: bool, reason: str | None) -> PublicationAdmission:
+        return PublicationAdmission(
+            admitted=admitted,
+            reason=reason,
+            blocking_issue_codes=(
+                () if admitted else tuple(sorted(blocking_codes))
+            ),
+            recorded_issue_codes=recorded_codes,
+            rtl_valid=rtl_valid if isinstance(rtl_valid, bool) else None,
+            dc_calibrated=(
+                dc_calibrated if isinstance(dc_calibrated, bool) else None
+            ),
+            selector_valid=(
+                selector_valid if isinstance(selector_valid, bool) else None
+            ),
+            coverage=coverage,
+            pricing_model=pricing_model,
+        )
+
+    def refuse(reason: str) -> PublicationAdmission:
+        return verdict(False, reason)
+
+    def strict(admission: PublicationAdmission) -> PublicationAdmission:
+        # The strict view is applied last so that a row refused on the model
+        # evidence reports *that* reason rather than being masked by missing
+        # individual coverage.
+        if require_individual_validation and not coverage.individually_validated:
+            return refuse("individual_validation")
+        return admission
+
+    if row.get("error_code") is not None:
+        return refuse("error_code")
+    if row.get("deployment_valid") is True:
+        # The strict, full-stack deployment record already passed.  It demands
+        # every stage including RTL plus every pricing identity checked below,
+        # so it is strictly stronger than this test and needs no re-checking.
+        return strict(verdict(True, None))
+    if not isinstance(numerical, Mapping) or numerical.get("state") != "succeeded":
+        return refuse("numerical_state")
+    if not isinstance(legality, Mapping) or legality.get("hardware_candidate") is not True:
+        return refuse("static_hardware_legality")
+    if not isinstance(validity, Mapping):
+        return refuse("validity_missing")
+    if any(
+        validity.get(_STAGE_VALIDITY_FIELD[stage]) is not True
+        for stage in MODEL_REQUIRED_VALIDITY_STAGES
+    ):
+        # The software implementation is not geometry scoped: it either ran for
+        # this profile or it did not, so its measured validity stays required.
+        return refuse("blocking_stage_validity")
+    if coverage.failed_stages:
+        # A measured failure is evidence about this point, not a coverage gap.
+        return refuse("blocking_stage_validity")
+    if blocking_codes:
+        return refuse("blocking_stage_capability")
+    if capability is not None:
+        support = capability.get("stage_support")
+        if not isinstance(support, Mapping) or any(
+            support.get(stage) is not True for stage in PRICING_BLOCKING_STAGES
+        ):
+            return refuse("blocking_stage_support")
+    if not isinstance(metrics, Mapping):
+        return refuse("metrics_missing")
+    resource_budget = metrics.get("resource_budget")
+    if (
+        not isinstance(resource_budget, Mapping)
+        or resource_budget.get("feasible") is not True
+    ):
+        return refuse("resource_budget")
+    if not isinstance(metrics.get("runtime_capacity_evidence"), Mapping):
+        return refuse("capacity_evidence")
+    capacity = metrics.get("capacity")
+    if not isinstance(capacity, Mapping) or capacity.get("feasible") is not True:
+        return refuse("capacity_feasibility")
+    if metrics.get("runtime_feasible") is not True:
+        return refuse("runtime_feasibility")
+    if not metrics.get("layout_id"):
+        return refuse("layout_identity")
+    if metrics.get("memory_timing_calibrated") is not True:
+        return refuse("memory_timing_calibration")
+    if metrics.get("timing_calibrated") is not True:
+        return refuse("timing_calibration")
+    if not pricing_model.timing_evidence_id:
+        return refuse("timing_evidence_identity")
+    if pricing_model.timing_tier not in PUBLICATION_TIMING_TIERS:
+        return refuse("publication_timing_tier")
+    if not pricing_model.bandwidth_calibration_id:
+        return refuse("bandwidth_calibration_identity")
+    if pricing_model.energy_tier not in RANKABLE_ENERGY_TIERS:
+        return refuse("energy_tier")
+    if not pricing_model.energy_id:
+        return refuse("energy_identity")
+    if not pricing_model.area_source:
+        return refuse("area_model_identity")
+    if (
+        pricing_model.area_source in DC_AREA_SOURCES
+        and not pricing_model.area_calibration_id
+    ):
+        return refuse("area_calibration_identity")
+    if not _head_boundary_priced(metrics):
+        return refuse("output_head_boundary")
+    if not pricing_model.system_calibration_id:
+        return refuse("system_calibration_identity")
+    if not _selector_admits(row, blocking_codes):
+        return refuse("packedkv_selector")
+    return strict(verdict(True, None))
+
+
+def select_admitted_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    require_individual_validation: bool = False,
+) -> tuple[Mapping[str, Any], ...]:
+    """Return the admitted rows, optionally restricted to the strict subset.
+
+    ``require_individual_validation=True`` is the strict view: only rows that
+    were additionally compiled and emulated at their own geometry.  Both views
+    are derived from the same predicate, so a strict frontier can be reported
+    beside the model-validated one without a second policy.
+    """
+
+    return tuple(
+        row
+        for row in rows
+        if evaluate_publication_admission(
+            row,
+            require_individual_validation=require_individual_validation,
+        ).admitted
+    )
+
+
+SELECTOR_REASON_BF16_REFERENCE = (
+    "bf16_reference_is_not_a_packedkv_hardware_profile"
+)
+SELECTOR_REASON_MXINT_PATH_ONLY = (
+    "selector_is_wired_only_to_the_mxint_matrix_path"
+)
+
+
+def _selector_admits(
+    row: Mapping[str, Any],
+    blocking_codes: set[str],
+) -> bool:
+    """Scope the PackedKV selector verdict to the blocking stages.
+
+    ``packedkv_selector_valid`` is the conservative static-capability record:
+    it goes false whenever *any* capability issue exists, including RTL-only
+    ones, and it is never true without candidate-scoped RTL evidence.  Ranking
+    reads the recorded evidence instead of the flag, and stays fail-closed on
+    anything the capability layer has not scoped to a recorded stage.
+    """
+
+    if blocking_codes:
+        return False
+    if row.get("packedkv_selector_valid") is True:
+        return True
+    evidence = row.get("packedkv_selector_evidence")
+    if not isinstance(evidence, Mapping):
+        return False
+    kind = evidence.get("kind")
+    if kind in {"unmeasured", "capability_or_measured_failure"}:
+        # Both kinds arise only from missing or failed RTL evidence, which the
+        # publication timing tiers never claimed.
+        return True
+    if kind == "static_capability":
+        reason = evidence.get("reason")
+        if reason == SELECTOR_REASON_BF16_REFERENCE:
+            # The accuracy reference is not a hardware profile at all.
+            return False
+        # The selector exists only on the MXINT matrix datapath.  The
+        # capability layer scopes that absence to the RTL stage
+        # ("rtl_batched_mxfp_unsupported"), so it is disclosed, not excluding.
+        return reason == SELECTOR_REASON_MXINT_PATH_ONLY
+    return False
+
+
 def _promotion_retention_key(
     row: Mapping[str, Any],
 ) -> tuple[Any, ...] | None:
@@ -2907,10 +3583,7 @@ def _promotion_retention_key(
         return None
     whole = metrics.get("whole_model")
     energy = whole.get("calibrated_energy") if isinstance(whole, Mapping) else None
-    output_head = metrics.get("output_head_boundary")
-    head_estimate = (
-        output_head.get("estimate") if isinstance(output_head, Mapping) else None
-    )
+    head_boundary_priced = _head_boundary_priced(metrics)
     capacity = metrics.get("capacity")
     energy_tier = energy.get("energy_tier") if isinstance(energy, Mapping) else None
     energy_identity = (
@@ -2936,7 +3609,7 @@ def _promotion_retention_key(
     )
     area_mm2 = _positive_compact_metric(metrics.get("area_mm2"))
     if (
-        row.get("deployment_valid") is not True
+        not evaluate_publication_admission(row).admitted
         or not isinstance(whole, Mapping)
         or whole.get("rankable") is not True
         or not isinstance(energy, Mapping)
@@ -2949,10 +3622,7 @@ def _promotion_retention_key(
         or metrics.get("runtime_feasible") is not True
         or not isinstance(capacity, Mapping)
         or capacity.get("feasible") is not True
-        or row.get("packedkv_selector_valid") is not True
-        or not isinstance(head_estimate, Mapping)
-        or not isinstance(head_estimate.get("calibration_id"), str)
-        or not head_estimate.get("calibration_id")
+        or not head_boundary_priced
         or None in (mean_nll, tpot_ms, tps, energy_j, area_mm2)
     ):
         return None
@@ -2971,7 +3641,7 @@ def _promotion_retention_key(
 def _plot_retention_values(
     row: Mapping[str, Any],
 ) -> Mapping[str, Any] | None:
-    if row.get("deployment_valid") is not True:
+    if not evaluate_publication_admission(row).admitted:
         return None
     metrics = row.get("metrics")
     whole = metrics.get("whole_model") if isinstance(metrics, Mapping) else None
@@ -5278,7 +5948,9 @@ def _expand_and_validate_factorized_hardware_artifact(
         local_extrema = aggregate.get("local_extrema")
         if (
             total != expected_total
-            or not 0 <= valid <= deployment_valid <= total
+            # deployment validity additionally demands compiler, emulator and RTL
+            # evidence, so it is a subset of the rankable rows.
+            or not 0 <= deployment_valid <= valid <= total
             or not 0 <= errors <= total
             or not isinstance(error_counts, Mapping)
             or sum(int(value) for value in error_counts.values()) != errors
@@ -5476,7 +6148,9 @@ def _validate_compact_hardware_artifact(
         local_extrema = aggregate.get("local_extrema")
         if (
             total <= 0
-            or not 0 <= valid <= deployment_valid <= total
+            # deployment validity additionally demands compiler, emulator and RTL
+            # evidence, so it is a subset of the rankable rows.
+            or not 0 <= deployment_valid <= valid <= total
             or not 0 <= errors <= total
             or not isinstance(error_counts, Mapping)
             or sum(int(value) for value in error_counts.values()) != errors
@@ -5595,11 +6269,24 @@ __all__ = [
     "JoinedHardwareResult",
     "LEGACY_COMPACT_STORAGE_REVISION",
     "LEGACY_AGGREGATE_BANDWIDTH_MODE",
+    "BLOCKING_VALIDITY_FIELDS",
+    "RECORDED_VALIDITY_FIELDS",
     "PhysicalTraffic",
+    "DC_AREA_SOURCES",
+    "INDIVIDUAL_VALIDATION_STAGES",
+    "MODEL_REQUIRED_VALIDITY_STAGES",
+    "IndividualValidationCoverage",
+    "ADMISSION_BASIS",
+    "RANKABLE_ENERGY_TIERS",
+    "PricingModelIdentity",
+    "PublicationAdmission",
+    "individual_validation_coverage",
+    "select_admitted_rows",
     "ResourceBudget",
     "ResourceBudgetStatus",
     "SRAM_POLICIES",
     "StudyProvenance",
+    "evaluate_publication_admission",
     "load_hardware_artifact",
     "merge_validity",
     "physical_cost_signature",
