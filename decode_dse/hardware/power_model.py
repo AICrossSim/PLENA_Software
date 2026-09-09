@@ -891,8 +891,13 @@ def calibrated_energy_from_simulator(
             raise ValueError(f"unsupported simulator event {signature!r}")
     if len(geometries) != 1:
         raise ValueError("simulator events must use one geometry")
-    if any(len(values) != 1 for values in operation_signatures.values()):
-        raise ValueError("simulator events need one LINEAR, QK, and PV signature")
+    if not operation_signatures["LINEAR"]:
+        raise ValueError("simulator events need at least one LINEAR signature")
+    if any(
+        len(operation_signatures[operation]) != 1
+        for operation in ("QK", "PV")
+    ):
+        raise ValueError("simulator events need exactly one QK and PV signature")
     if vector_events <= 0:
         raise ValueError("simulator events are missing the selected vector format")
     selector_enabled = estimate.get("selector_enabled")

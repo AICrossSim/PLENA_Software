@@ -30,12 +30,23 @@ from decode_dse.hardware.admission_cost import (
 from decode_dse.hardware.lm_head_service import (
     BF16HeadServiceEstimate,
     DECODE_BF16_HEAD,
+    DECODE_MX_HEAD,
     EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
     OUTPUT_HEAD_IDEALIZATIONS,
     OUTPUT_HEAD_LOCATIONS,
     OUTPUT_HEAD_SERVICE_MODES,
     head_service_status_valid,
+    local_mx_head_breakdown_valid,
+    local_mx_head_status_valid,
+)
+from decode_dse.hardware.head_service_resources import (
+    head_endpoint_resource_status_valid,
+)
+from decode_dse.hardware.moe_power_events import (
+    validate_moe_power_event_input_binding,
+    validate_moe_power_event_ledger,
+    validate_moe_power_event_receipt_for_engine,
 )
 from decode_dse.legality import StackValidity
 from decode_dse.manifest import SweepManifest, SweepManifestEntry
@@ -143,6 +154,12 @@ SRAM_POLICIES = (
     "kv_resident_75",
     "kv_resident_100",
 )
+EXPERT_TENSOR_PARALLEL = "tensor_parallel"
+EXPERT_ID_PARALLEL = "expert_id_parallel"
+EXPERT_PARALLEL_MODES = (
+    EXPERT_TENSOR_PARALLEL,
+    EXPERT_ID_PARALLEL,
+)
 DEFAULT_REFERENCE_CHIP_COUNT = 4
 DEFAULT_REFERENCE_DIE_AREA_MM2 = 826.0
 DEFAULT_REFERENCE_HBM_CAPACITY_BYTES = 80_000_000_000
@@ -151,6 +168,97 @@ DEFAULT_AREA_MARGIN = 1.10
 DEFAULT_FP_SRAM_DEPTH = 512
 SOFTMAX_CONSTANT_SLOTS = 6
 SOFTMAX_STATE_VALUES_PER_ROW = 3
+KV_HEAD_REUSE_NOOP_REASON = (
+    "rank_local_single_kv_head_reuse_is_structural_no_op"
+)
+
+
+def kv_head_reuse_candidate_status(
+    *,
+    enabled: bool,
+    mlen: int,
+    blen: int,
+    hlen: int,
+    local_kv_heads: int | None,
+    fp_sram_depth: int = DEFAULT_FP_SRAM_DEPTH,
+) -> dict[str, object]:
+    """Return the structural search legality of one rank-local reuse choice."""
+
+    if not isinstance(enabled, bool):
+        raise TypeError("enabled must be boolean")
+    for name, value in (
+        ("mlen", mlen),
+        ("blen", blen),
+        ("hlen", hlen),
+        ("fp_sram_depth", fp_sram_depth),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be positive")
+    if mlen % hlen:
+        raise ValueError("HLEN must divide MLEN")
+    if local_kv_heads is not None and (
+        isinstance(local_kv_heads, bool)
+        or not isinstance(local_kv_heads, int)
+        or local_kv_heads <= 0
+    ):
+        raise ValueError("local_kv_heads must be positive when bound")
+    if not enabled:
+        return {
+            "enabled": False,
+            "legal": True,
+            "structural_no_op": False,
+            "legality_reason": "reuse_disabled_per_head_schedule",
+            "local_kv_heads": local_kv_heads,
+            "required_fp_sram_slots": 0,
+            "available_fp_sram_slots": fp_sram_depth,
+        }
+    if local_kv_heads is None:
+        return {
+            "enabled": True,
+            "legal": False,
+            "structural_no_op": False,
+            "legality_reason": "rank_local_kv_head_count_unbound",
+            "local_kv_heads": None,
+            "required_fp_sram_slots": 0,
+            "available_fp_sram_slots": fp_sram_depth,
+        }
+    if local_kv_heads == 1:
+        return {
+            "enabled": True,
+            "legal": False,
+            "structural_no_op": True,
+            "legality_reason": KV_HEAD_REUSE_NOOP_REASON,
+            "local_kv_heads": 1,
+            "required_fp_sram_slots": 0,
+            "available_fp_sram_slots": fp_sram_depth,
+        }
+    broadcast_heads = mlen // hlen
+    required_slots = (
+        SOFTMAX_CONSTANT_SLOTS
+        + SOFTMAX_STATE_VALUES_PER_ROW
+        * blen
+        * broadcast_heads
+        * local_kv_heads
+    )
+    if local_kv_heads > broadcast_heads:
+        reason = "rank_local_kv_heads_exceed_broadcast_slots"
+        legal = False
+    elif required_slots > fp_sram_depth:
+        reason = "rank_local_reuse_exceeds_fp_sram_slots"
+        legal = False
+    else:
+        reason = "legal_rank_local_multi_kv_head_reuse"
+        legal = True
+    return {
+        "enabled": True,
+        "legal": legal,
+        "structural_no_op": False,
+        "legality_reason": reason,
+        "local_kv_heads": local_kv_heads,
+        "required_fp_sram_slots": required_slots,
+        "available_fp_sram_slots": fp_sram_depth,
+    }
+
 
 def _canonical_bytes(value: Any, *, newline: bool = False) -> bytes:
     suffix = "\n" if newline else ""
@@ -491,6 +599,9 @@ class HardwareCandidate:
         "KV_HEAD_REUSE",
         "DRAIN_OVERLAPPED",
     )
+    E3_FIELDS: ClassVar[tuple[str, ...]] = E2_FIELDS + (
+        "EXPERT_PARALLEL_MODE",
+    )
 
     mlen: int
     blen: int
@@ -506,7 +617,13 @@ class HardwareCandidate:
     sram_policy: str = "streaming"
     kv_head_reuse: bool | None = None
     drain_overlapped: bool | None = None
+    expert_parallel_mode: str | None = None
     _architecture_knobs_explicit: bool = field(
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _expert_parallel_mode_explicit: bool = field(
         init=False,
         repr=False,
         compare=False,
@@ -569,6 +686,7 @@ class HardwareCandidate:
         knobs_explicit = (
             self.kv_head_reuse is not None
             or self.drain_overlapped is not None
+            or self.expert_parallel_mode is not None
         )
         for name in ("kv_head_reuse", "drain_overlapped"):
             value = getattr(self, name)
@@ -582,6 +700,16 @@ class HardwareCandidate:
             "_architecture_knobs_explicit",
             knobs_explicit,
         )
+        expert_mode_explicit = self.expert_parallel_mode is not None
+        expert_mode = self.expert_parallel_mode or EXPERT_TENSOR_PARALLEL
+        if expert_mode not in EXPERT_PARALLEL_MODES:
+            raise ValueError("unsupported expert parallel mode")
+        object.__setattr__(self, "expert_parallel_mode", expert_mode)
+        object.__setattr__(
+            self,
+            "_expert_parallel_mode_explicit",
+            expert_mode_explicit,
+        )
         if self.vlen != self.mlen:
             raise ValueError("the decode search requires VLEN == MLEN")
         if not self.hbm_generation:
@@ -590,6 +718,10 @@ class HardwareCandidate:
     @property
     def architecture_knobs_explicit(self) -> bool:
         return self._architecture_knobs_explicit
+
+    @property
+    def expert_parallel_mode_explicit(self) -> bool:
+        return self._expert_parallel_mode_explicit
 
     def to_pre_e2_dict(self) -> dict[str, Any]:
         """Return the topology-aware representation before E2 knobs."""
@@ -618,6 +750,8 @@ class HardwareCandidate:
                     "DRAIN_OVERLAPPED": self.drain_overlapped,
                 }
             )
+        if self.expert_parallel_mode_explicit:
+            value["EXPERT_PARALLEL_MODE"] = self.expert_parallel_mode
         return value
 
     def to_legacy_dict(self) -> dict[str, Any]:
@@ -650,7 +784,8 @@ class HardwareCandidate:
         legacy = keys == set(cls.LEGACY_FIELDS)
         pre_e2 = keys == set(cls.PRE_E2_FIELDS)
         canonical = keys == set(cls.E2_FIELDS)
-        if not any((legacy, pre_e2, canonical)):
+        e3 = keys == set(cls.E3_FIELDS)
+        if not any((legacy, pre_e2, canonical, e3)):
             raise ValueError("hardware candidate fields differ from the schema")
         if legacy and not allow_legacy_single_chip:
             raise ValueError("hardware candidate is missing explicit topology")
@@ -658,7 +793,7 @@ class HardwareCandidate:
             raise ValueError(
                 "legacy multi-chip evidence cannot be assigned explicit semantics"
             )
-        if canonical and any(
+        if (canonical or e3) and any(
             not isinstance(raw[name], bool)
             for name in ("KV_HEAD_REUSE", "DRAIN_OVERLAPPED")
         ):
@@ -679,10 +814,15 @@ class HardwareCandidate:
                 "streaming" if legacy else str(raw["SRAM_POLICY"])
             ),
             kv_head_reuse=(
-                raw["KV_HEAD_REUSE"] if canonical else None
+                raw["KV_HEAD_REUSE"] if (canonical or e3) else None
             ),
             drain_overlapped=(
-                raw["DRAIN_OVERLAPPED"] if canonical else None
+                raw["DRAIN_OVERLAPPED"] if (canonical or e3) else None
+            ),
+            expert_parallel_mode=(
+                str(raw["EXPERT_PARALLEL_MODE"])
+                if e3
+                else None
             ),
         )
         expected = candidate.to_legacy_dict() if legacy else candidate.to_dict()
@@ -712,6 +852,8 @@ class ExactHardwareSpace:
     sram_policy: tuple[str, ...] = SRAM_POLICIES
     kv_head_reuse: tuple[bool, ...] = (False, True)
     drain_overlapped: tuple[bool, ...] = (False, True)
+    expert_parallel_mode: tuple[str, ...] = ()
+    allow_rank_local_mlen_padding: bool = False
     resource_budget: ResourceBudget = ResourceBudget()
     attention_heads: int | None = None
     kv_heads: int | None = None
@@ -755,6 +897,14 @@ class ExactHardwareSpace:
                 name,
                 _boolean_sequence(getattr(self, name), name),
             )
+        modes = tuple(str(value) for value in self.expert_parallel_mode)
+        if len(modes) != len(set(modes)) or any(
+            value not in EXPERT_PARALLEL_MODES for value in modes
+        ):
+            raise ValueError("expert_parallel_mode contains unsupported values")
+        object.__setattr__(self, "expert_parallel_mode", modes)
+        if not isinstance(self.allow_rank_local_mlen_padding, bool):
+            raise TypeError("allow_rank_local_mlen_padding must be boolean")
         if not isinstance(self.resource_budget, ResourceBudget):
             raise TypeError("resource_budget must be ResourceBudget")
         if (self.attention_heads is None) != (self.kv_heads is None):
@@ -799,6 +949,16 @@ class ExactHardwareSpace:
             "DRAIN_OVERLAPPED",
             data.get("drain_overlapped", (False, True)),
         )
+        expert_mode_raw = data.get(
+            "EXPERT_PARALLEL_MODE",
+            data.get("expert_parallel_mode", ()),
+        )
+        allow_padding_raw = data.get(
+            "ALLOW_RANK_LOCAL_MLEN_PADDING",
+            data.get("allow_rank_local_mlen_padding", False),
+        )
+        if not isinstance(allow_padding_raw, bool):
+            raise TypeError("ALLOW_RANK_LOCAL_MLEN_PADDING must be boolean")
         return cls(
             mlen=tuple(data.get("MLEN", data.get("mlen", cls.mlen))),
             blen=tuple(data.get("BLEN", data.get("blen", cls.blen))),
@@ -833,6 +993,12 @@ class ExactHardwareSpace:
                 drain_raw,
                 "drain_overlapped",
             ),
+            expert_parallel_mode=(
+                (str(expert_mode_raw),)
+                if isinstance(expert_mode_raw, str)
+                else tuple(str(value) for value in expert_mode_raw)
+            ),
+            allow_rank_local_mlen_padding=allow_padding_raw,
             resource_budget=ResourceBudget.from_dict(
                 data.get("RESOURCE_BUDGET", data.get("resource_budget"))
             ),
@@ -917,7 +1083,7 @@ class ExactHardwareSpace:
         return cls.from_dict(raw)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "MLEN": list(self.mlen),
             "BLEN": list(self.blen),
             "HLEN": list(self.hlen),
@@ -936,6 +1102,11 @@ class ExactHardwareSpace:
             "KV_HEADS": self.kv_heads,
             "FP_SRAM_DEPTH": self.fp_sram_depth,
         }
+        if self.expert_parallel_mode:
+            value["EXPERT_PARALLEL_MODE"] = list(self.expert_parallel_mode)
+        if self.allow_rank_local_mlen_padding:
+            value["ALLOW_RANK_LOCAL_MLEN_PADDING"] = True
+        return value
 
     def _local_kv_heads(self, tp: int) -> int | None:
         """Return the exact KV-head count owned by one tensor-parallel rank."""
@@ -959,24 +1130,28 @@ class ExactHardwareSpace:
 
         legal: list[bool] = []
         for reuse in self.kv_head_reuse:
-            if reuse:
-                if local_kv_heads is None:
-                    continue
-                broadcast_heads = mlen // hlen
-                required_slots = (
-                    SOFTMAX_CONSTANT_SLOTS
-                    + SOFTMAX_STATE_VALUES_PER_ROW
-                    * blen
-                    * broadcast_heads
-                    * local_kv_heads
-                )
-                if (
-                    local_kv_heads > broadcast_heads
-                    or required_slots > self.fp_sram_depth
-                ):
-                    continue
-            legal.append(reuse)
+            status = kv_head_reuse_candidate_status(
+                enabled=reuse,
+                mlen=mlen,
+                blen=blen,
+                hlen=hlen,
+                local_kv_heads=local_kv_heads,
+                fp_sram_depth=self.fp_sram_depth,
+            )
+            if status["legal"] is True:
+                legal.append(reuse)
         return tuple(legal)
+
+    def _expert_modes_for_tp(self, tp: int) -> tuple[str | None, ...]:
+        """Return non-duplicate expert mappings for one TP degree."""
+
+        if not self.expert_parallel_mode:
+            return (None,)
+        return tuple(
+            mode
+            for mode in self.expert_parallel_mode
+            if not (tp == 1 and mode == EXPERT_ID_PARALLEL)
+        )
 
     def iter_candidates(self, hidden_size: int) -> Iterator[HardwareCandidate]:
         """Yield every structural candidate without sampling."""
@@ -994,7 +1169,7 @@ class ExactHardwareSpace:
                 continue
             if not blen <= hlen <= mlen:
                 continue
-            if hidden_size % mlen:
+            if hidden_size % mlen and not self.allow_rank_local_mlen_padding:
                 continue
             for chip_count in self.chip_count:
                 for tp in range(1, chip_count + 1):
@@ -1027,11 +1202,13 @@ class ExactHardwareSpace:
                             for value in self.link_ports
                             if value >= minimum_ports
                         )
-                    for ports, policy, reuse, drain in itertools.product(
+                    expert_modes = self._expert_modes_for_tp(tp)
+                    for ports, policy, reuse, drain, expert_mode in itertools.product(
                         port_values,
                         self.sram_policy,
                         reuse_values,
                         self.drain_overlapped,
+                        expert_modes,
                     ):
                         yield HardwareCandidate(
                             mlen=mlen,
@@ -1048,6 +1225,7 @@ class ExactHardwareSpace:
                             sram_policy=policy,
                             kv_head_reuse=reuse,
                             drain_overlapped=drain,
+                            expert_parallel_mode=expert_mode,
                         )
 
     def candidate_count(self, hidden_size: int) -> int:
@@ -1065,7 +1243,7 @@ class ExactHardwareSpace:
         ):
             if mlen % blen or mlen % hlen or not blen <= hlen <= mlen:
                 continue
-            if hidden_size % mlen:
+            if hidden_size % mlen and not self.allow_rank_local_mlen_padding:
                 continue
             for chip_count in self.chip_count:
                 for tp in range(1, chip_count + 1):
@@ -1089,6 +1267,9 @@ class ExactHardwareSpace:
                     )
                     if not reuse_values:
                         continue
+                    expert_mode_count = len(self._expert_modes_for_tp(tp))
+                    if not expert_mode_count:
+                        continue
                     if chip_count == 1:
                         port_count = 1
                     else:
@@ -1102,6 +1283,7 @@ class ExactHardwareSpace:
                         * len(self.sram_policy)
                         * len(reuse_values)
                         * len(self.drain_overlapped)
+                        * expert_mode_count
                     )
         return total
 
@@ -1170,6 +1352,8 @@ class CapacityBreakdown:
     kv_cache_bytes: int
     runtime_bytes: int
     available_bytes: int
+    slowest_rank_required_bytes: int | None = None
+    per_chip_available_bytes: int | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -1180,6 +1364,23 @@ class CapacityBreakdown:
         ):
             value = getattr(self, name)
             if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                raise ValueError(f"{name} must be non-negative")
+        if (self.slowest_rank_required_bytes is None) != (
+            self.per_chip_available_bytes is None
+        ):
+            raise ValueError(
+                "slowest-rank use and per-chip capacity must be paired"
+            )
+        for name in (
+            "slowest_rank_required_bytes",
+            "per_chip_available_bytes",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
                 isinstance(value, bool)
                 or not isinstance(value, int)
                 or value < 0
@@ -1196,10 +1397,26 @@ class CapacityBreakdown:
 
     @property
     def feasible(self) -> bool:
+        return self.system_feasible and self.slowest_rank_feasible
+
+    @property
+    def system_feasible(self) -> bool:
         return self.headroom_bytes >= 0
 
+    @property
+    def slowest_rank_headroom_bytes(self) -> int | None:
+        if self.slowest_rank_required_bytes is None:
+            return None
+        assert self.per_chip_available_bytes is not None
+        return self.per_chip_available_bytes - self.slowest_rank_required_bytes
+
+    @property
+    def slowest_rank_feasible(self) -> bool:
+        headroom = self.slowest_rank_headroom_bytes
+        return True if headroom is None else headroom >= 0
+
     def to_dict(self) -> dict[str, Any]:
-        return {
+        value = {
             "unit": "bytes",
             "weight_bytes": self.weight_bytes,
             "kv_cache_bytes": self.kv_cache_bytes,
@@ -1209,6 +1426,21 @@ class CapacityBreakdown:
             "headroom_bytes": self.headroom_bytes,
             "feasible": self.feasible,
         }
+        if self.slowest_rank_required_bytes is not None:
+            value.update(
+                {
+                    "system_feasible": self.system_feasible,
+                    "slowest_rank_required_bytes": (
+                        self.slowest_rank_required_bytes
+                    ),
+                    "per_chip_available_bytes": self.per_chip_available_bytes,
+                    "slowest_rank_headroom_bytes": (
+                        self.slowest_rank_headroom_bytes
+                    ),
+                    "slowest_rank_feasible": self.slowest_rank_feasible,
+                }
+            )
+        return value
 
 
 @dataclass(frozen=True)
@@ -1366,12 +1598,18 @@ class HardwareMetrics:
         default_factory=dict
     )
     service_mode: str = "unmodeled"
-    output_head_location: str = DECODE_BF16_HEAD
+    output_head_location: str = DECODE_MX_HEAD
     #: Named scope idealizations disclosed by the priced output-head boundary.
     #: Empty for the measured remote service; for the decode-local head it
     #: names the head compute that carries no measured cost evidence.
     output_head_idealizations: tuple[str, ...] = ()
     output_head_status: Mapping[str, Any] = field(default_factory=dict)
+    output_head_resource_status: Mapping[str, Any] = field(
+        default_factory=dict
+    )
+    output_head_cost_breakdown: Mapping[str, Any] = field(
+        default_factory=dict
+    )
     output_head_service: BF16HeadServiceEstimate | None = None
     #: Remote head-service estimate recorded for side-by-side comparison when
     #: the priced boundary is the decode-local head.  It never enters the
@@ -1397,6 +1635,11 @@ class HardwareMetrics:
     architecture_options: Mapping[str, Any] = field(default_factory=dict)
     capacity_throughput_chain: Mapping[str, Any] = field(default_factory=dict)
     handoff_analysis: Mapping[str, Any] | None = None
+    moe_workload: Mapping[str, Any] | None = None
+    body_physical_layout: Mapping[str, Any] | None = None
+    moe_power_event_ledger: Mapping[str, Any] | None = None
+    moe_power_event_input_binding: Mapping[str, Any] | None = None
+    moe_power_event_receipt: Mapping[str, Any] | None = None
 
     @property
     def capacity_evidence_complete(self) -> bool:
@@ -1428,6 +1671,28 @@ class HardwareMetrics:
         return admission_correctness_status_valid(
             self.admission_correctness_status
         )
+
+    @property
+    def moe_power_event_source_binding(self) -> Mapping[str, str] | None:
+        """Return the Results v1 row binding when an exact receipt exists."""
+
+        receipt = self.moe_power_event_receipt
+        inputs = self.moe_power_event_input_binding
+        if receipt is None:
+            return None
+        if not isinstance(receipt, Mapping) or not isinstance(inputs, Mapping):
+            raise ValueError("MoE power receipt omitted its source inputs")
+        calibration = receipt.get("power_calibration")
+        if not isinstance(calibration, Mapping):
+            raise ValueError("MoE power receipt omitted its calibration binding")
+        return {
+            "config_sha256": str(inputs["config_sha256"]),
+            "workload_sha256": str(inputs["workload_sha256"]),
+            "artifact_provenance_sha256": str(
+                receipt["artifact_provenance_sha256"]
+            ),
+            "power_calibration_sha256": str(calibration["sha256"]),
+        }
 
     @property
     def memory_timing_calibrated(self) -> bool:
@@ -1806,12 +2071,37 @@ class HardwareMetrics:
             "output_head_status",
             canonical_head_status,
         )
+        canonical_head_resources = json.loads(
+            _canonical_bytes(dict(self.output_head_resource_status))
+        )
+        object.__setattr__(
+            self,
+            "output_head_resource_status",
+            canonical_head_resources,
+        )
+        canonical_head_cost = json.loads(
+            _canonical_bytes(dict(self.output_head_cost_breakdown))
+        )
+        object.__setattr__(
+            self,
+            "output_head_cost_breakdown",
+            canonical_head_cost,
+        )
         whole_timing = (
             self.whole_model_tpot_ms,
             self.whole_model_tps,
         )
         if self.output_head_location not in OUTPUT_HEAD_LOCATIONS:
             raise ValueError("output_head_location is unsupported")
+        if (
+            self.whole_model_rankable
+            and self.output_head_location
+            not in {DECODE_MX_HEAD, EXTERNAL_BF16_HEAD}
+        ):
+            raise ValueError(
+                "rankable whole-model metrics require a fully priced "
+                "output-head boundary"
+            )
         # The disclosure is fully determined by the priced boundary, so it is
         # derived rather than supplied: a row can never be written without it.
         expected_idealizations = OUTPUT_HEAD_IDEALIZATIONS[
@@ -1835,7 +2125,10 @@ class HardwareMetrics:
         if self.output_head_comparison is not None:
             # A recorded comparison arm never prices anything, so it is only
             # meaningful beside a locally-headed row.
-            if self.output_head_location != DECODE_BF16_HEAD:
+            if self.output_head_location not in {
+                DECODE_BF16_HEAD,
+                DECODE_MX_HEAD,
+            }:
                 raise ValueError(
                     "the head-service comparison belongs to the local boundary"
                 )
@@ -1888,6 +2181,31 @@ class HardwareMetrics:
                 raise ValueError(
                     "head-service and decoder batch sizes differ"
                 )
+        if self.output_head_location == DECODE_MX_HEAD:
+            if self.output_head_service is not None:
+                raise ValueError(
+                    "decode-local MX head cannot carry remote service costs"
+                )
+            if not local_mx_head_breakdown_valid(
+                canonical_head_cost,
+                require_passed=self.whole_model_rankable,
+            ):
+                raise ValueError(
+                    "decode-local MX head cost breakdown is invalid"
+                )
+            if not local_mx_head_status_valid(
+                canonical_head_status,
+                profile_id=canonical_head_cost["profile_id"],
+                weight_format=canonical_head_cost["weight_format"],
+                activation_format=canonical_head_cost["activation_format"],
+                vector_format=canonical_head_cost["matrix_numeric_format"],
+                matrix_mlen=canonical_head_cost["numerical_matrix_mlen"],
+            ):
+                raise ValueError("decode-local MX head status is invalid")
+        elif canonical_head_cost:
+            raise ValueError(
+                "local output-head costs require decode_local_mx_head"
+            )
         if self.whole_model_rankable:
             if self.service_mode != OUTPUT_HEAD_SERVICE_MODES[
                 self.output_head_location
@@ -1902,6 +2220,31 @@ class HardwareMetrics:
                 raise ValueError(
                     "rankable whole-model metrics require head-service costs"
                 )
+            if self.output_head_location == EXTERNAL_BF16_HEAD:
+                if not head_endpoint_resource_status_valid(
+                    canonical_head_resources
+                ):
+                    raise ValueError(
+                        "rankable remote-head metrics require a passing "
+                        "endpoint resource receipt"
+                    )
+                if (
+                    canonical_head_resources.get(
+                        "head_service_artifact_sha256"
+                    )
+                    != canonical_head_status.get("artifact_sha256")
+                    or canonical_head_resources.get(
+                        "head_service_calibration_id"
+                    )
+                    != canonical_head_status.get("calibration_id")
+                    or canonical_head_resources.get(
+                        "head_service_provenance_id"
+                    )
+                    != canonical_head_status.get("provenance_id")
+                ):
+                    raise ValueError(
+                        "endpoint resources and head-service evidence differ"
+                    )
             if any(value is None for value in whole_timing):
                 raise ValueError(
                     "rankable whole-model timing must be complete"
@@ -2029,6 +2372,7 @@ class HardwareMetrics:
                 "schema",
                 "explicit",
                 "attention_partition",
+                "expert_parallel_mode",
                 "kv_head_reuse",
                 "drain_overlapped",
                 "area",
@@ -2043,6 +2387,11 @@ class HardwareMetrics:
                 raise TypeError(
                     "architecture-option attention partition must be an object"
                 )
+            if self.architecture_options["expert_parallel_mode"] not in {
+                EXPERT_TENSOR_PARALLEL,
+                EXPERT_ID_PARALLEL,
+            }:
+                raise ValueError("architecture-option expert mode is invalid")
         if self.capacity_throughput_chain:
             chain = self.capacity_throughput_chain
             if int(chain.get("evaluated_batch", -1)) != self.generated_tokens_per_step:
@@ -2071,6 +2420,132 @@ class HardwareMetrics:
                 abs_tol=1e-12,
             ):
                 raise ValueError("capacity-throughput TPS disagrees")
+        if self.moe_workload is not None:
+            if not isinstance(self.moe_workload, Mapping):
+                raise TypeError("moe_workload must be an object")
+            moe = json.loads(_canonical_bytes(dict(self.moe_workload)))
+            if moe.get("schema") != "plena-routed-moe-decode-workload/v1":
+                raise ValueError("unsupported routed-MoE workload schema")
+            provenance = moe.get("provenance")
+            if not isinstance(provenance, Mapping) or not isinstance(
+                provenance.get("publication_rankable"), bool
+            ):
+                raise ValueError("routed-MoE workload lacks rankability provenance")
+            if self.whole_model_rankable and not provenance["publication_rankable"]:
+                raise ValueError(
+                    "whole-model rankability contradicts routed-MoE provenance"
+                )
+            object.__setattr__(self, "moe_workload", moe)
+        if self.body_physical_layout is not None:
+            if not isinstance(self.body_physical_layout, Mapping):
+                raise TypeError("body_physical_layout must be an object")
+            body_layout = json.loads(
+                _canonical_bytes(dict(self.body_physical_layout))
+            )
+            provenance = body_layout.get("provenance")
+            if (
+                body_layout.get("schema_version")
+                != "plena-body-weight-physical-layout/v1"
+                or not isinstance(provenance, Mapping)
+                or provenance.get("analytic_layout_valid") is not True
+                or provenance.get("analytic_timing_valid") is not True
+                or provenance.get("publication_rankable") is not False
+                or provenance.get("selection_eligible") is not False
+            ):
+                raise ValueError("body physical-layout evidence is invalid")
+            if self.whole_model_rankable:
+                raise ValueError(
+                    "unverified body layout cannot be publication-rankable"
+                )
+            object.__setattr__(
+                self,
+                "body_physical_layout",
+                body_layout,
+            )
+        if self.moe_workload is None:
+            if any(
+                value is not None
+                for value in (
+                    self.moe_power_event_ledger,
+                    self.moe_power_event_input_binding,
+                    self.moe_power_event_receipt,
+                )
+            ):
+                raise ValueError(
+                    "routed-MoE power evidence requires a routed-MoE workload"
+                )
+        else:
+            if self.body_physical_layout is None:
+                raise ValueError(
+                    "routed-MoE power evidence requires the physical body layout"
+                )
+            ledger = self.moe_power_event_ledger
+            if (
+                not isinstance(ledger, Mapping)
+                or not validate_moe_power_event_ledger(ledger)
+                or ledger.get("provenance", {}).get("body_layout_sha256")
+                != _content_hash(self.body_physical_layout)
+                or ledger.get("provenance", {}).get("moe_workload_sha256")
+                != _content_hash(self.moe_workload)
+            ):
+                raise ValueError("routed-MoE power-event ledger is invalid")
+            binding = self.moe_power_event_input_binding
+            if binding is not None and (
+                not isinstance(binding, Mapping)
+                or not validate_moe_power_event_input_binding(binding)
+            ):
+                raise ValueError("routed-MoE power input binding is invalid")
+            receipt = self.moe_power_event_receipt
+            if receipt is not None:
+                calibration = (
+                    receipt.get("power_calibration")
+                    if isinstance(receipt, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(binding, Mapping)
+                    or not isinstance(calibration, Mapping)
+                    or ledger.get("power_engine_eligible") is not True
+                    or not validate_moe_power_event_receipt_for_engine(
+                        receipt,
+                        ledger=ledger,
+                        input_binding=binding,
+                        calibration_id=str(
+                            calibration.get("calibration_id", "")
+                        ),
+                        calibration_sha256=str(calibration.get("sha256", "")),
+                    )
+                ):
+                    raise ValueError(
+                        "routed-MoE power-event receipt is invalid"
+                    )
+            elif self.energy is not None or self.area_calibration_id is not None:
+                raise ValueError(
+                    "routed-MoE calibrated energy requires an exact power-event receipt"
+                )
+            object.__setattr__(
+                self,
+                "moe_power_event_ledger",
+                json.loads(_canonical_bytes(dict(ledger))),
+            )
+            object.__setattr__(
+                self,
+                "moe_power_event_input_binding",
+                (
+                    json.loads(_canonical_bytes(dict(binding)))
+                    if binding is not None
+                    else None
+                ),
+            )
+            object.__setattr__(
+                self,
+                "moe_power_event_receipt",
+                (
+                    json.loads(_canonical_bytes(dict(receipt)))
+                    if receipt is not None
+                    else None
+                ),
+            )
         if self.handoff_analysis is not None:
             if not isinstance(self.handoff_analysis, Mapping):
                 raise TypeError("handoff_analysis must be an object")
@@ -2232,6 +2707,13 @@ class HardwareMetrics:
                 self.capacity_throughput_chain
             ),
             "handoff_analysis": self.handoff_analysis,
+            "moe_workload": self.moe_workload,
+            "body_physical_layout": self.body_physical_layout,
+            "moe_power_event_ledger": self.moe_power_event_ledger,
+            "moe_power_event_input_binding": (
+                self.moe_power_event_input_binding
+            ),
+            "moe_power_event_receipt": self.moe_power_event_receipt,
             "dc_anchor_id": self.dc_anchor_id,
             "dc_anchor_status": dict(self.dc_anchor_status),
             "cycles": self.cycles,
@@ -2272,7 +2754,11 @@ class HardwareMetrics:
                 else None
             ),
             "decoder_stack": {
-                "scope": "decode_chip_through_final_rmsnorm",
+                "scope": (
+                    "decode_chip_including_local_mx_output_head"
+                    if self.output_head_location == DECODE_MX_HEAD
+                    else "decode_chip_through_final_rmsnorm"
+                ),
                 "tpot_ms": self.tpot_ms,
                 "tps": self.tps,
                 "calibrated_energy": (
@@ -2307,9 +2793,8 @@ class HardwareMetrics:
                 "location": self.output_head_location,
                 "service_mode": self.service_mode,
                 # Named, machine-readable scope limits of the priced boundary.
-                # A locally-headed row always carries
-                # ``local_bf16_head_compute_idealized`` so no reader can take
-                # it for a head whose compute cost was measured.
+                # Canonical MX-local rows have no head idealization; the
+                # legacy BF16-local bound remains explicitly idealized.
                 "scope_idealizations": list(self.output_head_idealizations),
                 "status": dict(self.output_head_status),
                 "estimate": (
@@ -2322,9 +2807,64 @@ class HardwareMetrics:
                     if self.output_head_comparison is not None
                     else None
                 ),
+                "resource_status": dict(
+                    self.output_head_resource_status
+                ),
+                "local_cost_breakdown": dict(
+                    self.output_head_cost_breakdown
+                ),
             },
             "whole_model": {
                 "rankable": self.whole_model_rankable,
+                "strict_system_resource_boundary_valid": (
+                    self.whole_model_rankable
+                    and self.resource_budget is not None
+                    and self.resource_budget.feasible
+                    and (
+                        (
+                            self.output_head_location == DECODE_MX_HEAD
+                            and local_mx_head_status_valid(
+                                self.output_head_status,
+                                profile_id=self.output_head_cost_breakdown.get(
+                                    "profile_id"
+                                ),
+                                weight_format=self.output_head_cost_breakdown.get(
+                                    "weight_format"
+                                ),
+                                activation_format=self.output_head_cost_breakdown.get(
+                                    "activation_format"
+                                ),
+                                vector_format=self.output_head_cost_breakdown.get(
+                                    "matrix_numeric_format"
+                                ),
+                                matrix_mlen=self.output_head_cost_breakdown.get(
+                                    "numerical_matrix_mlen"
+                                ),
+                            )
+                            and local_mx_head_breakdown_valid(
+                                self.output_head_cost_breakdown
+                            )
+                        )
+                        or (
+                            self.output_head_location
+                            == EXTERNAL_BF16_HEAD
+                            and head_endpoint_resource_status_valid(
+                                self.output_head_resource_status
+                            )
+                        )
+                    )
+                ),
+                "resource_scope": (
+                    "decoder_subsystem_including_local_mx_head"
+                    if self.output_head_location == DECODE_MX_HEAD
+                    else (
+                        "decoder_plus_prefill_endpoint"
+                        if head_endpoint_resource_status_valid(
+                            self.output_head_resource_status
+                        )
+                        else "decoder_only_external_endpoint_unaccounted"
+                    )
+                ),
                 "publication_timing_tier": self.publication_timing_tier,
                 "tpot_ms": self.whole_model_tpot_ms,
                 "tps": self.whole_model_tps,
@@ -2884,6 +3424,18 @@ class JoinedHardwareResult:
             **validity,
             "deployment_valid": self.deployment_valid,
             "metrics": self.metrics.to_dict() if self.metrics else None,
+            **(
+                {
+                    "moe_power_event_source_binding": (
+                        self.metrics.moe_power_event_source_binding
+                    )
+                }
+                if (
+                    self.metrics is not None
+                    and self.metrics.moe_power_event_source_binding is not None
+                )
+                else {}
+            ),
             "error_code": self.error_code,
             "error_message": self.error_message,
         }
@@ -3221,24 +3773,78 @@ def _row_energy(metrics: Mapping[str, Any]) -> Mapping[str, Any] | None:
 def _head_boundary_priced(metrics: Mapping[str, Any]) -> bool:
     """True when the output-head boundary carries the evidence its location needs.
 
-    The decode-local head has no second endpoint to price, so a measured
-    head-service estimate is required only at the external boundary.  This is
-    the same test ``_promotion_retention_key`` applies, kept in one place so
-    admission and promotion cannot disagree about what a priced head means.
+    The local MX headline must carry its exact profile-bound cost breakdown;
+    the optional external arm must carry both matching service and resource
+    receipts. The serialized identities are checked again here so a stale or
+    edited row cannot borrow evidence from the other placement.
     """
 
     output_head = metrics.get("output_head_boundary")
     if not isinstance(output_head, Mapping):
         return False
+    whole = metrics.get("whole_model")
+    resource_budget = metrics.get("resource_budget")
+    if (
+        not isinstance(whole, Mapping)
+        or whole.get("rankable") is not True
+        or whole.get("strict_system_resource_boundary_valid") is not True
+        or not isinstance(resource_budget, Mapping)
+        or resource_budget.get("feasible") is not True
+    ):
+        return False
+    location = output_head.get("location")
+    status = output_head.get("status")
+    if location == DECODE_MX_HEAD:
+        cost = output_head.get("local_cost_breakdown")
+        return (
+            output_head.get("service_mode")
+            == OUTPUT_HEAD_SERVICE_MODES[DECODE_MX_HEAD]
+            and output_head.get("scope_idealizations") == []
+            and isinstance(status, Mapping)
+            and isinstance(cost, Mapping)
+            and local_mx_head_breakdown_valid(cost)
+            and local_mx_head_status_valid(
+                status,
+                profile_id=cost.get("profile_id"),
+                weight_format=cost.get("weight_format"),
+                activation_format=cost.get("activation_format"),
+                vector_format=cost.get("matrix_numeric_format"),
+                matrix_mlen=cost.get("numerical_matrix_mlen"),
+            )
+            and output_head.get("estimate") is None
+        )
+    if (
+        location != EXTERNAL_BF16_HEAD
+        or output_head.get("service_mode") != HEAD_SERVICE_MODE
+        or output_head.get("scope_idealizations") != []
+    ):
+        return False
+    resource_status = output_head.get("resource_status")
     estimate = output_head.get("estimate")
     if (
-        isinstance(estimate, Mapping)
-        and isinstance(estimate.get("calibration_id"), str)
-        and bool(estimate.get("calibration_id"))
+        not isinstance(status, Mapping)
+        or not head_service_status_valid(status)
+        or not isinstance(resource_status, Mapping)
+        or not head_endpoint_resource_status_valid(resource_status)
+        or not isinstance(estimate, Mapping)
     ):
-        return True
+        return False
+    batch = estimate.get("batch")
     return (
-        output_head.get("location") == DECODE_BF16_HEAD and estimate is None
+        estimate.get("calibration_id") == status.get("calibration_id")
+        and estimate.get("provenance_id") == status.get("provenance_id")
+        and estimate.get("service_mode") == status.get("service_mode")
+        and estimate.get("service_location") == status.get("service_location")
+        and isinstance(batch, int)
+        and not isinstance(batch, bool)
+        and batch == metrics.get("generated_tokens_per_step")
+        and batch in status.get("required_batches", [])
+        and resource_status.get("head_service_artifact_sha256")
+        == status.get("artifact_sha256")
+        and resource_status.get("head_service_calibration_id")
+        == status.get("calibration_id")
+        and resource_status.get("head_service_provenance_id")
+        == status.get("provenance_id")
     )
 
 
@@ -3431,8 +4037,12 @@ def evaluate_publication_admission(
         return refuse("error_code")
     if row.get("deployment_valid") is True:
         # The strict, full-stack deployment record already passed.  It demands
-        # every stage including RTL plus every pricing identity checked below,
-        # so it is strictly stronger than this test and needs no re-checking.
+        # every stage including RTL. Re-check the location-specific head
+        # evidence because admission also operates on serialized rows: a stale
+        # or edited ``deployment_valid`` bit must never promote an incomplete
+        # boundary.
+        if not isinstance(metrics, Mapping) or not _head_boundary_priced(metrics):
+            return refuse("output_head_boundary")
         return strict(verdict(True, None))
     if not isinstance(numerical, Mapping) or numerical.get("state") != "succeeded":
         return refuse("numerical_state")
@@ -4463,6 +5073,15 @@ class _FactorizedHardwareReducer:
                 ],
                 "validity": joined["validity"],
                 "deployment_valid": joined["deployment_valid"],
+                **(
+                    {
+                        "moe_power_event_source_binding": joined[
+                            "moe_power_event_source_binding"
+                        ]
+                    }
+                    if joined.get("moe_power_event_source_binding") is not None
+                    else {}
+                ),
                 "joined_record_hash": joined["record_hash"],
             }
             body = {
@@ -5793,15 +6412,26 @@ def _expand_and_validate_factorized_hardware_artifact(
                 for label in labels
             )
             or not isinstance(join, Mapping)
-            or set(join)
-            != {
-                "capability",
-                "packedkv_selector_valid",
-                "packedkv_selector_evidence",
-                "validity",
-                "deployment_valid",
-                "joined_record_hash",
-            }
+                or set(join)
+                not in (
+                    {
+                        "capability",
+                        "packedkv_selector_valid",
+                        "packedkv_selector_evidence",
+                        "validity",
+                        "deployment_valid",
+                        "joined_record_hash",
+                    },
+                    {
+                    "capability",
+                    "packedkv_selector_valid",
+                    "packedkv_selector_evidence",
+                    "validity",
+                    "deployment_valid",
+                    "moe_power_event_source_binding",
+                    "joined_record_hash",
+                    },
+                )
             or not isinstance(join.get("validity"), Mapping)
             or not isinstance(join.get("packedkv_selector_evidence"), Mapping)
             or not isinstance(join.get("deployment_valid"), bool)
@@ -5829,9 +6459,18 @@ def _expand_and_validate_factorized_hardware_artifact(
             ],
             "validity": validity,
             **validity,
-            "deployment_valid": join["deployment_valid"],
-            "metrics": factor["metrics"],
-            "error_code": factor["error_code"],
+                "deployment_valid": join["deployment_valid"],
+                "metrics": factor["metrics"],
+                **(
+                    {
+                        "moe_power_event_source_binding": join[
+                            "moe_power_event_source_binding"
+                        ]
+                    }
+                    if join.get("moe_power_event_source_binding") is not None
+                    else {}
+                ),
+                "error_code": factor["error_code"],
             "error_message": factor["error_message"],
         }
         record_hash = str(join.get("joined_record_hash", ""))

@@ -38,6 +38,7 @@ from decode_dse.hardware.design_space import (
     COMPILER_TRACE_TIMING_SET_SCHEMA,
     FULL_MODEL_DECODE_SCOPE,
     LEGACY_AGGREGATE_BANDWIDTH_MODE,
+    KV_HEAD_REUSE_NOOP_REASON,
     PHYSICAL_TRAFFIC_KEYS,
     STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
     TIMING_TIER_REQUIRED_VALIDITY,
@@ -56,6 +57,7 @@ from decode_dse.hardware.design_space import (
     _content_hash,
     _factor_join_class_id,
     evaluate_publication_admission,
+    kv_head_reuse_candidate_status,
     load_hardware_artifact,
     select_admitted_rows,
 )
@@ -68,10 +70,16 @@ from decode_dse.hardware.lm_head_service import (
     composite_system_calibration_id,
     load_bf16_head_service_artifact,
     local_head_boundary_status,
+    local_mx_head_breakdown_valid,
     local_head_system_calibration_id,
 )
 from decode_dse.hardware.packedkv_claims import AttentionTopology
 from decode_dse.hardware.power_bridge import analytic_energy_from_simulator
+from decode_dse.hardware.moe_power_events import (
+    BF16_ROUTER_CALIBRATION_BLOCKER,
+    generic_calibration_event_counts,
+    validate_moe_power_event_ledger,
+)
 from decode_dse.hardware.selection import (
     PublicationCandidate,
     individually_validated_candidates,
@@ -90,7 +98,11 @@ from decode_dse.legality import (
     evaluate_stack_capability,
     scope_stack_validity,
 )
-from decode_dse.hardware.workload_events import DecodeEvent
+from decode_dse.hardware.workload_events import (
+    DecodeEvent,
+    DenseDecoderShape,
+    count_decode_events,
+)
 from decode_dse.manifest import (
     QuantizerProvenance,
     QuantizerSource,
@@ -106,6 +118,155 @@ from decode_dse.software.refinement_schedule import _hardware_point
 from decode_dse.simulator_bridge import DecodeSimulator
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _serialized_measured_head_boundary(batch: int = 1) -> dict[str, object]:
+    """Minimal serialized form of a valid measured-head test fixture."""
+
+    calibration_id = "bf16-head-service-" + "c" * 64
+    provenance_id = "bf16-head-provenance-" + "d" * 64
+    status = {
+        "schema_version": "bf16-output-head-service",
+        "artifact_sha256": "a" * 64,
+        "head_weight_sha256": "b" * 64,
+        "cost_scope": {
+            "dynamic_energy": "endpoint_only",
+            "leakage": "endpoint_only",
+            "link_dynamic_energy": "endpoint_receive_transmit_incremental_only",
+            "measurement_link_timing": "instrumentation_driver_to_endpoint_not_deployment",
+            "measurement_driver_dynamic_included": False,
+            "measurement_driver_leakage_included": False,
+        },
+        "passed": True,
+        "failures": [],
+        "calibration_id": calibration_id,
+        "provenance_id": provenance_id,
+        "service_mode": HEAD_SERVICE_MODE,
+        "service_location": "prefill_chip",
+        "required_batches": [1, 4, 8],
+        "numerical_policy": {
+            "mac_input_dtype": "BF16",
+            "accumulator_dtype": "FP32",
+            "logit_dtype": "BF16",
+            "selection_policy": "argmax_lowest_token_id_on_tie",
+            "validation_topk": 10,
+            "logit_max_abs_error_limit": 0.25,
+            "logit_mean_abs_error_limit": 0.02,
+            "topk_set_agreement_min": 0.9,
+        },
+        "numerical_validation": {
+            "measurement_count": 12,
+            "numerical_sample_count": 12,
+            "holdout_count": 3,
+            "selected_token_exact_match_count": 12,
+            "sampled_logit_max_abs_error": 0.0,
+            "sampled_logit_mean_abs_error_max": 0.0,
+            "sampled_topk_set_agreement_min": 1.0,
+        },
+    }
+    resource_status = {
+        "schema_version": "bf16-output-head-endpoint-resources/v1",
+        "artifact_sha256": "e" * 64,
+        "content_hash": "f" * 64,
+        "receipt_id": "bf16-head-endpoint-resources-" + "1" * 64,
+        "passed": True,
+        "failures": [],
+        "head_service_artifact_sha256": "a" * 64,
+        "head_service_calibration_id": calibration_id,
+        "head_service_provenance_id": provenance_id,
+        "service_mode": HEAD_SERVICE_MODE,
+        "service_location": "prefill_chip",
+        "deployment_scope": (
+            "prefill_endpoint_with_bf16_head_service_fully_accounted"
+        ),
+        "service_instances": 1,
+        "endpoint_instances": 1,
+        "endpoint_resources_included_once": True,
+        "endpoint_shared_with_decoder": False,
+        "endpoint_shared_with_prefill": True,
+        "decoder_resources_included": False,
+        "prefill_resources_included": True,
+        "measurement_driver_role": "instrumentation_only_not_deployed",
+        "measurement_driver_resources_included": False,
+        "endpoint": {
+            "device_name": "Synthetic Accelerator",
+            "device_uuid": "GPU-SYNTHETIC",
+            "aggregate_compute_silicon_area_mm2": 100.0,
+            "compute_die_count": 2,
+            "hbm_capacity_bytes": 1_000_000,
+            "hbm_bandwidth_bytes_per_s": 1_000_000_000.0,
+            "prefill_resident_bytes": 100_000,
+            "head_resident_bytes": 100_000,
+            "runtime_reserve_bytes": 100_000,
+            "resident_total_bytes": 300_000,
+            "area_comparison_basis": (
+                "aggregate_physical_compute_silicon_area_mm2_unscaled_excludes_hbm"
+            ),
+            "hbm_capacity_basis": "installed_endpoint_capacity_bytes",
+            "hbm_bandwidth_basis": (
+                "vendor_peak_theoretical_bytes_per_s"
+            ),
+        },
+        "composed_link_energy": {
+            "decoder_interface_energy_j_per_byte": 1e-12,
+            "decoder_interface_energy_scope": (
+                "decoder_request_response_interface_only_excludes_endpoint"
+            ),
+            "endpoint_interface_energy_scope": (
+                "endpoint_receive_transmit_incremental_only"
+            ),
+            "measurement_driver_dynamic_included": False,
+            "complete": True,
+        },
+        "deployment_link_timing": {
+            "request_bandwidth_bytes_s": 1e9,
+            "response_bandwidth_bytes_s": 1e9,
+            "link_peak_bandwidth_bytes_s": 1e9,
+            "request_fixed_latency_s": 1e-6,
+            "response_fixed_latency_s": 1e-6,
+            "scope": "plena_decoder_to_prefill_endpoint_bound_interface",
+            "measurement_driver_timing_used": False,
+            "complete": True,
+        },
+        "model_residency": {
+            "precision": "BF16",
+            "prefill_model_excluding_lm_head_bytes": 100_000,
+            "lm_head_bytes": 100_000,
+            "untied_lm_head_counted_once": True,
+        },
+        "evidence": {
+            "input_artifact_sha256": "2" * 64,
+            "specification_artifact_sha256": "3" * 64,
+            "source": {
+                "publisher": "Synthetic vendor",
+                "title": "Synthetic specification",
+                "revision": "1",
+                "locator": "retained://synthetic",
+                "retrieved_at_utc": "2026-08-20T00:00:00Z",
+                "area_basis_statement": (
+                    "two compute dies, aggregate compute silicon, HBM excluded"
+                ),
+                "deployment_link_basis_statement": (
+                    "bound decoder-to-endpoint interface timing and energy"
+                ),
+            },
+        },
+    }
+    return {
+        "location": EXTERNAL_BF16_HEAD,
+        "service_mode": HEAD_SERVICE_MODE,
+        "scope_idealizations": [],
+        "status": status,
+        "estimate": {
+            "calibration_id": calibration_id,
+            "provenance_id": provenance_id,
+            "service_mode": HEAD_SERVICE_MODE,
+            "service_location": "prefill_chip",
+            "batch": batch,
+        },
+        "comparison_estimate": None,
+        "resource_status": resource_status,
+    }
 
 
 def test_hardware_launch_requires_mode_appropriate_timing_artifacts() -> None:
@@ -246,6 +407,8 @@ def test_hardware_metrics_seal_full_model_compiler_trace_evidence() -> None:
         timing_reason="compiler_trace_timing_validated",
         execution_mode=COMPILER_TRACE_EXECUTION_MODE,
         compiler_trace_timing=evidence,
+        output_head_location=DECODE_BF16_HEAD,
+        output_head_status=local_head_boundary_status(),
     )
     serialized = metrics.to_dict()
     assert serialized["execution_mode"] == COMPILER_TRACE_EXECUTION_MODE
@@ -522,6 +685,43 @@ def test_multichip_space_emits_only_legal_factorizations() -> None:
     assert all(32 % point.tp == 0 and 8 % point.tp == 0 for point in candidates)
 
 
+def test_rank_local_padding_keeps_mlen_larger_than_hidden_in_exact_grid() -> None:
+    space = ExactHardwareSpace(
+        mlen=(1024, 2048, 4096),
+        blen=(8,),
+        hlen=(128,),
+        batch=(1,),
+        hbm_channels=(8,),
+        chip_count=(1, 4, 8),
+        tp=(1, 2, 4, 8),
+        kvp=(1, 2, 4),
+        link_ports=(1, 2),
+        sram_policy=("streaming",),
+        kv_head_reuse=(False,),
+        drain_overlapped=(False,),
+        expert_parallel_mode=("tensor_parallel", "expert_id_parallel"),
+        allow_rank_local_mlen_padding=True,
+        attention_heads=32,
+        kv_heads=4,
+    )
+    candidates = space.candidates(2048)
+
+    assert space.candidate_count(2048) == len(candidates)
+    assert {candidate.mlen for candidate in candidates} == {1024, 2048, 4096}
+    assert {candidate.tp for candidate in candidates} <= {1, 2, 4}
+    assert all(candidate.tp != 8 for candidate in candidates)
+    assert all(
+        candidate.expert_parallel_mode == "tensor_parallel"
+        for candidate in candidates
+        if candidate.tp == 1
+    )
+    assert {
+        candidate.expert_parallel_mode
+        for candidate in candidates
+        if candidate.tp > 1
+    } == {"tensor_parallel", "expert_id_parallel"}
+
+
 def test_resource_budget_enforces_all_aggregate_limits() -> None:
     budget = ResourceBudget(
         aggregate_area_limit_mm2=100.0,
@@ -641,6 +841,31 @@ def test_pre_e2_candidate_identity_is_stable_and_explicit_false_is_distinct() ->
         HardwareCandidate.from_dict(invalid)
 
 
+def test_explicit_expert_mode_uses_roundtrippable_e3_candidate_schema() -> None:
+    candidate = HardwareCandidate(
+        mlen=4096,
+        blen=8,
+        vlen=4096,
+        hlen=128,
+        batch=1,
+        hbm_channels=8,
+        hbm_generation="HBM3E",
+        chip_count=4,
+        tp=4,
+        kvp=1,
+        link_ports=1,
+        sram_policy="streaming",
+        expert_parallel_mode="expert_id_parallel",
+    )
+    raw = candidate.to_dict()
+
+    assert set(raw) == set(HardwareCandidate.E3_FIELDS)
+    assert raw["KV_HEAD_REUSE"] is False
+    assert raw["DRAIN_OVERLAPPED"] is False
+    assert raw["EXPERT_PARALLEL_MODE"] == "expert_id_parallel"
+    assert HardwareCandidate.from_dict(raw).to_dict() == raw
+
+
 def test_reuse_search_enumerates_only_fp_sram_legal_geometries() -> None:
     space = ExactHardwareSpace(
         mlen=(1024,),
@@ -690,8 +915,9 @@ def test_reuse_legality_is_rank_local_and_count_matches_iterator() -> None:
     assert not any(candidate.kv_head_reuse for candidate in by_tp[1])
     assert all(
         {candidate.kv_head_reuse for candidate in by_tp[tp]} == {False, True}
-        for tp in (2, 4, 8)
+        for tp in (2, 4)
     )
+    assert not any(candidate.kv_head_reuse for candidate in by_tp[8])
     for candidate in candidates:
         local_kv_heads = 8 // candidate.tp
         if candidate.kv_head_reuse:
@@ -704,6 +930,51 @@ def test_reuse_legality_is_rank_local_and_count_matches_iterator() -> None:
                 * local_kv_heads
                 <= space.fp_sram_depth
             )
+
+
+def test_qwen3_target_prunes_tp4_single_local_kv_head_reuse_noop() -> None:
+    space = ExactHardwareSpace(
+        mlen=(1024,),
+        blen=(2,),
+        hlen=(128,),
+        batch=(4,),
+        hbm_channels=(8,),
+        chip_count=(1, 2, 4),
+        tp=(1, 2, 4),
+        kvp=(1,),
+        link_ports=(1,),
+        sram_policy=("streaming",),
+        kv_head_reuse=(False, True),
+        drain_overlapped=(False,),
+        attention_heads=32,
+        kv_heads=4,
+    )
+    candidates = space.candidates(2048)
+    by_tp = {
+        tp: tuple(candidate for candidate in candidates if candidate.tp == tp)
+        for tp in (1, 2, 4)
+    }
+
+    assert all(by_tp.values())
+    assert {candidate.kv_head_reuse for candidate in by_tp[1]} == {False, True}
+    assert {candidate.kv_head_reuse for candidate in by_tp[2]} == {False, True}
+    assert {candidate.kv_head_reuse for candidate in by_tp[4]} == {False}
+    no_op = kv_head_reuse_candidate_status(
+        enabled=True,
+        mlen=1024,
+        blen=2,
+        hlen=128,
+        local_kv_heads=1,
+    )
+    assert no_op == {
+        "enabled": True,
+        "legal": False,
+        "structural_no_op": True,
+        "legality_reason": KV_HEAD_REUSE_NOOP_REASON,
+        "local_kv_heads": 1,
+        "required_fp_sram_slots": 0,
+        "available_fp_sram_slots": 512,
+    }
 
 
 def test_rank_local_heads_bind_selector_capability_and_reuse_area() -> None:
@@ -728,7 +999,7 @@ def test_rank_local_heads_bind_selector_capability_and_reuse_area() -> None:
         "MXINT8", "MXINT8", "MXINT8", "FP_E3M2"
     )
     areas = {}
-    for tp in (1, 2, 4, 8):
+    for tp in (1, 2, 4):
         candidate = HardwareCandidate(
             mlen=1024,
             blen=4,
@@ -768,7 +1039,23 @@ def test_rank_local_heads_bind_selector_capability_and_reuse_area() -> None:
             drain_overlapped=False,
         )["area_mm2_per_chip"]
     assert areas[1] > areas[2] > areas[4]
-    assert areas[4] == areas[8]
+    no_op = kv_head_reuse_status(
+        enabled=True,
+        mlen=1024,
+        hlen=128,
+        blen=4,
+        kv_heads=1,
+    )
+    assert no_op["supported"] is False
+    assert no_op["legality_reason"] == KV_HEAD_REUSE_NOOP_REASON
+    with pytest.raises(ValueError, match="structural_no_op"):
+        architecture_option_area_mm2(
+            mlen=1024,
+            hlen=128,
+            kv_heads=1,
+            kv_head_reuse=True,
+            drain_overlapped=False,
+        )
 
 
 def test_exact_search_knob_choice_respects_area_and_capacity_tradeoffs() -> None:
@@ -909,6 +1196,256 @@ def _synthetic_manifest():
         provenance,
         "c" * 40,
     )
+
+
+def _qwen_moe_backend(tmp_path: Path):
+    study_config = json.loads(
+        (
+            Path(__file__).resolve().parents[1]
+            / "configs"
+            / "qwen3_30b_a3b_thinking_2507.json"
+        ).read_text(encoding="utf-8")
+    )
+    model_path = tmp_path / "qwen3_moe.json"
+    model_path.write_text(
+        json.dumps(study_config["model_architecture"]),
+        encoding="utf-8",
+    )
+    backend = object.__new__(evaluation.DecodeSimulatorBackend)
+    backend.sim = DecodeSimulator(str(model_path))
+    backend.output_head_location = evaluation.DECODE_MX_HEAD
+    backend.calibrated_bandwidth = False
+    backend._provenance = {"backend": "synthetic-qwen-moe-test"}
+    backend.capacity_model_id = "test-rank-local-capacity"
+    backend.traffic_ledger_id = "test-rank-local-traffic"
+    backend._resource_ledger_cache = {}
+    backend._resource_area_cache = {}
+    return backend
+
+
+def test_qwen_moe_backend_binds_local_head_in_preflight_and_evaluate(
+    tmp_path: Path,
+) -> None:
+    manifest = _synthetic_manifest()
+    entry = next(
+        item
+        for item in manifest.entries
+        if (
+            item.profile.kind == PROFILE_KIND_QUANTIZED
+            and item.legality.hardware_candidate
+            and item.profile.local_head_contract[
+                "operand_family_deployment_supported"
+            ]
+        )
+    )
+    candidate = HardwareCandidate(
+        mlen=1024,
+        blen=8,
+        vlen=1024,
+        hlen=128,
+        batch=1,
+        hbm_channels=24,
+        hbm_generation="HBM3",
+        chip_count=4,
+        tp=4,
+        kvp=1,
+        link_ports=1,
+        sram_policy="streaming",
+        kv_head_reuse=False,
+        drain_overlapped=False,
+        expert_parallel_mode="tensor_parallel",
+    )
+    workload = evaluation.HardwareWorkload(
+        input_seq=16,
+        output_seq=1,
+        stride=1,
+        runtime_hbm_reserve_bytes=0,
+    )
+    backend = _qwen_moe_backend(tmp_path)
+    area_preflight_evaluator = evaluation.ProductionHardwareEvaluator(
+        backend,
+        workload,
+        publication_timing_tier=STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
+    )
+    with pytest.raises(ValueError, match="exact power-event receipt"):
+        area_preflight_evaluator._area_events(entry.profile, candidate)
+
+    preflight = backend.resource_preflight(entry, candidate, workload)
+    observation = backend.evaluate(entry, candidate, workload)
+
+    assert preflight.capacity.slowest_rank_required_bytes is not None
+    assert observation.body_physical_layout is not None
+    assert observation.local_output_head is not None
+    assert observation.local_output_head["passed"] is True
+    assert observation.local_output_head["failures"] == []
+    assert observation.local_output_head["compiler_lowering_receipt"] is None
+    assert observation.local_output_head["compiler_lowering_blocker"] == (
+        "tensor_parallel_local_head_compiler_lowering_unavailable"
+    )
+    power_ledger = observation.moe_power_event_ledger
+    assert power_ledger is not None
+    assert validate_moe_power_event_ledger(power_ledger)
+    assert power_ledger["dense_ffn_fallback_used"] is False
+    assert BF16_ROUTER_CALIBRATION_BLOCKER in power_ledger["blockers"]
+    assert observation.moe_power_event_receipt is None
+    conservation = power_ledger["assignment_conservation"]
+    assert conservation["expected_logical_assignments"] == 1 * 8 * 48 * 1
+    assert conservation["expected_physical_executed_assignments"] == 384
+    operations = power_ledger["event_counts"]["per_operation"]
+    assert operations["moe_hidden_dispatch"]["aggregate_system"] == 0
+    assert operations["moe_expert_output_collective"]["aggregate_system"] > 0
+
+    shape = DenseDecoderShape.from_mapping(backend.sim.dims)
+    common = dict(
+        input_seq=workload.input_seq,
+        output_seq=workload.output_seq,
+        batch=candidate.batch,
+        mlen=candidate.mlen,
+        blen=candidate.blen,
+        vlen=candidate.vlen,
+        hlen=candidate.hlen,
+        linear_signature=(
+            f"LINEAR:{evaluation._simulator_token(entry.profile.weight_format)}"
+            f"x{evaluation._simulator_token(entry.profile.activation_format)}"
+        ),
+        qk_signature=(
+            f"QK:{evaluation._simulator_token(entry.profile.key_format)}"
+            f"x{evaluation._simulator_token(entry.profile.activation_format)}"
+        ),
+        pv_signature=(
+            f"PV:{evaluation._simulator_token(entry.profile.value_format)}"
+            f"x{evaluation._simulator_token(entry.profile.activation_format)}"
+        ),
+        vector_signature=f"VECTOR:{entry.profile.vector_format}",
+        include_local_output_head_padding=True,
+        tp=candidate.tp,
+        kvp=candidate.kvp,
+        lm_head_signature=(
+            f"LINEAR:{evaluation._simulator_token(entry.profile.weight_format)}"
+            f"x{evaluation._simulator_token(entry.profile.activation_format)}"
+        ),
+    )
+    dense_proxy = dict(
+        (event.signature, event.count)
+        for event in count_decode_events(shape, **common)
+    )
+    native_base = dict(
+        (event.signature, event.count)
+        for event in count_decode_events(
+            shape,
+            include_dense_ffn=False,
+            **common,
+        )
+    )
+    observed = {event.signature: event.count for event in observation.events}
+    native_additions = dict(generic_calibration_event_counts(power_ledger))
+    linear = common["linear_signature"]
+    assert observed[linear] == native_base[linear] + native_additions[linear]
+    assert observed[linear] != dense_proxy[linear] + native_additions[linear]
+    power_engine = object.__new__(evaluation.SimulatorPowerEngine)
+    power_engine.status = SimpleNamespace(
+        calibration_id="sim-power-test",
+        source_sha256="4" * 64,
+    )
+    with pytest.raises(ValueError, match=BF16_ROUTER_CALIBRATION_BLOCKER):
+        power_engine.evaluate(entry.profile, candidate, observation)
+    with pytest.raises(ValueError, match=BF16_ROUTER_CALIBRATION_BLOCKER):
+        power_engine.anchor_prediction(entry.profile, candidate, observation)
+    with pytest.raises(ValueError, match=BF16_ROUTER_CALIBRATION_BLOCKER):
+        power_engine.hbm_energy_per_token(observation)
+    with pytest.raises(ValueError, match=BF16_ROUTER_CALIBRATION_BLOCKER):
+        power_engine.area_mm2(
+            entry.profile,
+            candidate,
+            observation.events,
+            moe_power_event_ledger=power_ledger,
+        )
+    assert local_mx_head_breakdown_valid(observation.local_output_head)
+    padding = observation.local_output_head["padding_preparation"]
+    assert len(padding["padded_vocab_mask_by_tp_rank"]) == 4
+    assert padding["padded_vocab_mask_vector_events_system"] == sum(
+        item["vector_events"]
+        for item in padding["padded_vocab_mask_by_tp_rank"]
+    )
+    invalid = json.loads(json.dumps(observation.local_output_head))
+    invalid["padding_preparation"]["padded_vocab_mask_by_tp_rank"][0][
+        "vector_events"
+    ] -= 1
+    assert not local_mx_head_breakdown_valid(invalid)
+    undercounted = json.loads(json.dumps(observation.local_output_head))
+    undercounted["cycles_per_batch_step"]["serving_slowest_rank"] = 1.0
+    assert not local_mx_head_breakdown_valid(undercounted)
+
+    priced_timing = replace(
+        observation,
+        timing_calibrated=True,
+        timing_evidence_id="timing-moe-power-contract",
+        timing_reason="timing_calibrated_emulator_tier",
+        bandwidth_calibration_id="bandwidth-moe-power-contract",
+        realized_bottleneck=(
+            "memory"
+            if observation.realized_bottleneck == "unavailable"
+            else observation.realized_bottleneck
+        ),
+    )
+
+    class StubBackend:
+        output_head_location = evaluation.DECODE_MX_HEAD
+        provenance = {
+            "backend": "native-moe-power-contract",
+            "output_head_location": evaluation.DECODE_MX_HEAD,
+        }
+
+        @staticmethod
+        def evaluate(*_args, **_kwargs):
+            return priced_timing
+
+    evaluator = evaluation.ProductionHardwareEvaluator(
+        StubBackend(),
+        workload,
+        publication_timing_tier=STAGE_CALIBRATED_ANALYTIC_TIMING_TIER,
+    )
+    outcome = evaluator(
+        entry,
+        candidate,
+        {
+            "state": "succeeded",
+            "result": {"mean_nll": 1.0, "token_count": 64},
+        },
+    )
+    assert outcome.error_code == "moe_power_event_unrankable"
+    assert outcome.metrics is not None
+    emitted = outcome.metrics.to_dict()
+    assert emitted["moe_power_event_ledger"]["dense_ffn_fallback_used"] is False
+    assert emitted["moe_power_event_receipt"] is None
+    assert emitted["calibrated_energy"] is None
+    assert emitted["energy_per_token_j"] is None
+
+
+def test_bf16_reference_is_explicitly_a_non_plena_control(
+    tmp_path: Path,
+) -> None:
+    entry = next(
+        item
+        for item in _synthetic_manifest().entries
+        if item.profile.kind == PROFILE_KIND_BF16_REFERENCE
+    )
+    candidate = HardwareCandidate(
+        mlen=1024,
+        blen=8,
+        vlen=1024,
+        hlen=128,
+        batch=1,
+        hbm_channels=8,
+        hbm_generation="HBM2",
+    )
+    workload = evaluation.HardwareWorkload(16, 1, 1, 0)
+    backend = _qwen_moe_backend(tmp_path)
+
+    with pytest.raises(ValueError, match="numerical/B200 control"):
+        backend.resource_preflight(entry, candidate, workload)
+    with pytest.raises(ValueError, match="numerical/B200 control"):
+        backend.evaluate(entry, candidate, workload)
 
 
 def _numerical_row(entry, mean_nll: float) -> dict[str, object]:
@@ -1429,6 +1966,7 @@ def _compact_hardware_row(
         "metrics": {
             "whole_model": {
                 "rankable": True,
+                "strict_system_resource_boundary_valid": True,
                 "publication_timing_tier": "stage_calibrated_analytic",
                 "tpot_ms": tpot_ms,
                 "tps": 1000.0 / tpot_ms,
@@ -1439,9 +1977,8 @@ def _compact_hardware_row(
                     "energy_id": "power-calibration",
                 },
             },
-            "output_head_boundary": {
-                "estimate": {"calibration_id": "head-calibration"}
-            },
+            "output_head_boundary": _serialized_measured_head_boundary(),
+            "generated_tokens_per_step": 1,
             "capacity": {"feasible": True},
             "runtime_capacity_evidence": {"max_runtime_batch": 256},
             "timing_calibrated": True,
@@ -1451,6 +1988,7 @@ def _compact_hardware_row(
             "resource_budget": {
                 "aggregate_area_mm2": area_mm2,
                 "aggregate_area_limit_mm2": 1000.0,
+                "feasible": True,
             },
         },
         "error_code": None,
@@ -1976,6 +2514,7 @@ def test_selection_accepts_analytic_energy_and_prefers_dc() -> None:
             cost_scope="whole_model",
             system_calibration_id=system_id,
             head_service_calibration_id=head_id,
+            output_head_location=EXTERNAL_BF16_HEAD,
             whole_model_rankable=True,
             timing_calibrated=True,
             timing_evidence_id=timing.evidence_id,
@@ -2008,6 +2547,7 @@ def test_selection_accepts_analytic_energy_and_prefers_dc() -> None:
         calibration=_PowerCalibration(dc_id),
         timing_evidence=timing,
         head_service_evidence=head,
+        output_head_location=EXTERNAL_BF16_HEAD,
     )
     assert decision.selected is values[-1]
     assert decision.energy_tier == "dc_calibrated"
@@ -2023,6 +2563,7 @@ def test_selection_accepts_analytic_energy_and_prefers_dc() -> None:
         calibration=None,
         timing_evidence=timing,
         head_service_evidence=head,
+        output_head_location=EXTERNAL_BF16_HEAD,
     )
     assert analytic_decision.selected is analytic_values[-1]
     assert analytic_decision.energy_tier == "analytic_anchored"
@@ -2186,7 +2727,7 @@ def _assembled_synthetic_head_artifact(tmp_path: Path) -> tuple[Path, dict]:
         "toolchain": {"torch": "2.7.0", "cuda": "12.8"},
         "environment_sha256": "d" * 64,
         "link_id": "driver->endpoint",
-        "head_service_id": "endpoint",
+        "head_service_id": "Synthetic Accelerator:GPU-SYNTHETIC",
         "process_corner": "measured_silicon",
         "measured_at_utc": "2026-08-03T12:00:00Z",
         "measurement_resolution": {
@@ -2196,7 +2737,17 @@ def _assembled_synthetic_head_artifact(tmp_path: Path) -> tuple[Path, dict]:
             },
             "power_plausibility_ceiling_w": 2400.0,
             "min_counter_delta_j": 0.1,
-            "idle_power_w": 270.0,
+            "idle_power_w": {
+                "driver": 100.0,
+                "endpoint": service["leakage_power_w"],
+                "total": 100.0 + service["leakage_power_w"],
+            },
+            "service_leakage_power_w": service["leakage_power_w"],
+            "service_leakage_scope": "endpoint_only",
+            "measurement_driver_idle_role": (
+                "instrumentation_only_not_deployed"
+            ),
+            "measurement_driver_leakage_included": False,
             "phase_windows": {},
         },
     }
@@ -2534,6 +3085,7 @@ def test_dual_accuracy_frontiers_label_instead_of_filtering() -> None:
             cost_scope="whole_model",
             system_calibration_id="synthetic-system",
             head_service_calibration_id="synthetic-head",
+            output_head_location=EXTERNAL_BF16_HEAD,
             whole_model_rankable=True,
             energy_tier="analytic_anchored",
             publication_timing_tier="stage_calibrated_analytic",
@@ -3020,6 +3572,25 @@ def test_blocking_stage_selector_limits_still_fail_closed() -> None:
     )
 
 
+def test_legacy_moe_provenance_without_native_power_ledger_fails_closed() -> None:
+    with pytest.raises(ValueError, match="requires the physical body layout"):
+        replace(
+            _selector_observation(
+                supported=True,
+                issue_codes=(),
+                blocking_issue_codes=(),
+                recorded_issue_codes=(),
+            ),
+            moe_workload={
+                "schema": "plena-routed-moe-decode-workload/v1",
+                "provenance": {
+                    "publication_rankable": False,
+                    "unrankable_reason": "missing matched routed-MoE calibration",
+                },
+            },
+        )
+
+
 def test_selector_observation_contract_rejects_inconsistent_evidence() -> None:
     # supported must remain exactly the emptiness of the BLOCKING codes, the
     # partition must stay exhaustive, and the lists must stay canonical.
@@ -3440,16 +4011,14 @@ def test_admission_cost_exports_its_recompute_policy() -> None:
 
 # --- decode-local BF16 output head ------------------------------------------
 #
-# The headline output-head boundary is the decode-local BF16 head: its weights
-# and its per-decode-step traffic are charged to the decode chip's own physical
-# ledger, and only its compute is idealized.  These tests pin the three things
-# that keeps honest: the idealization is always disclosed on the row, the
-# decode chip actually pays for the head, and the measured remote service
-# remains available as a comparison arm at its own evidence tier.
+# The decode-local BF16 head is an analytic sensitivity: its weights and its
+# per-decode-step traffic are charged to the decode chip's physical ledger, but
+# its compute is idealized. These tests pin its disclosure and unrankability,
+# then independently validate the measured remote publication boundary.
 
 
 def _head_service_calibration(tmp_path: Path):
-    """A passing synthetic remote-head calibration for the comparison arm."""
+    """A passing synthetic remote-head calibration for the publication arm."""
 
     path, model = _assembled_synthetic_head_artifact(tmp_path)
     status = load_bf16_head_service_artifact(
@@ -3471,7 +4040,8 @@ def _boundary_metrics(
     head_estimate=None,
     comparison=None,
     head_status: Mapping[str, object] | None = None,
-    rankable: bool = True,
+    head_resource_status: Mapping[str, object] | None = None,
+    rankable: bool | None = None,
     energy=None,
     system_calibration_id: str | None = None,
 ) -> HardwareMetrics:
@@ -3479,6 +4049,25 @@ def _boundary_metrics(
 
     from decode_dse.hardware.design_space import OUTPUT_HEAD_SERVICE_MODES
 
+    if rankable is None:
+        rankable = location == EXTERNAL_BF16_HEAD
+    if (
+        head_resource_status is None
+        and rankable
+        and head_status is not None
+    ):
+        head_resource_status = dict(
+            _serialized_measured_head_boundary()["resource_status"]
+        )
+        head_resource_status["head_service_artifact_sha256"] = head_status[
+            "artifact_sha256"
+        ]
+        head_resource_status["head_service_calibration_id"] = head_status[
+            "calibration_id"
+        ]
+        head_resource_status["head_service_provenance_id"] = head_status[
+            "provenance_id"
+        ]
     tpot_ms = 10.0
     batch = head_estimate.batch if head_estimate is not None else (
         comparison.batch if comparison is not None else 1
@@ -3516,6 +4105,7 @@ def _boundary_metrics(
                 else {}
             )
         ),
+        output_head_resource_status=(head_resource_status or {}),
         output_head_service=head_estimate,
         output_head_comparison=comparison,
         whole_model_tpot_ms=whole_tpot_ms if rankable else None,
@@ -3531,19 +4121,17 @@ def _boundary_metrics(
     )
 
 
-def test_local_bf16_head_is_rankable_and_discloses_its_idealization() -> None:
+def test_local_bf16_head_is_unrankable_and_discloses_its_idealization() -> None:
     metrics = _boundary_metrics(location=DECODE_BF16_HEAD)
     boundary = metrics.to_dict()["output_head_boundary"]
 
-    # Rankable at the analytic publication tier without any remote endpoint.
-    assert metrics.whole_model_rankable is True
-    assert metrics.publication_timing_tier == (
-        STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
-    )
-    # The local head runs inside the decode step the decoder TPOT already
-    # prices, so the whole model adds no serialized latency.
-    assert metrics.whole_model_tpot_ms == metrics.tpot_ms
-    assert metrics.whole_model_tps == metrics.tps
+    # The decoder-stack sensitivity remains available, but missing measured
+    # head compute prevents every whole-model publication metric.
+    assert metrics.tpot_ms == 10.0
+    assert metrics.whole_model_rankable is False
+    assert metrics.publication_timing_tier is None
+    assert metrics.whole_model_tpot_ms is None
+    assert metrics.whole_model_tps is None
 
     # The idealization is on the row, named, and machine readable.
     assert boundary["location"] == DECODE_BF16_HEAD
@@ -3555,6 +4143,19 @@ def test_local_bf16_head_is_rankable_and_discloses_its_idealization() -> None:
     assert boundary["estimate"] is None
     assert boundary["status"]["passed"] is False
     assert LOCAL_HEAD_COMPUTE_IDEALIZATION in boundary["status"]["failures"]
+    with pytest.raises(
+        ValueError,
+        match="fully priced output-head boundary",
+    ):
+        replace(
+            metrics,
+            whole_model_rankable=True,
+            whole_model_tpot_ms=metrics.tpot_ms,
+            whole_model_tps=metrics.tps,
+            publication_timing_tier=(
+                STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
+            ),
+        )
 
 
 def test_local_head_disclosure_cannot_be_dropped_or_forged() -> None:
@@ -3610,8 +4211,12 @@ def test_local_head_charges_its_weights_and_traffic_to_the_decode_hbm() -> None:
     assert dd.decoder_owns_output_head(DECODE_BF16_HEAD) is True
     assert dd.decoder_owns_output_head(EXTERNAL_BF16_HEAD) is False
 
-    with_head = ledger.weight_ledger(dims, prec, include_lm_head=True)
-    without_head = ledger.weight_ledger(dims, prec, include_lm_head=False)
+    with_head = ledger.weight_ledger(
+        dims, prec, include_lm_head=True, mlen=128
+    )
+    without_head = ledger.weight_ledger(
+        dims, prec, include_lm_head=False, mlen=128
+    )
     capacity_delta = (
         with_head.resident.total_aligned - without_head.resident.total_aligned
     )
@@ -3661,6 +4266,69 @@ def test_external_head_arm_still_prices_and_stays_measured(
     assert metrics.whole_model_tpot_ms > metrics.tpot_ms
 
 
+def test_strict_system_boundary_requires_a_feasible_composed_budget(
+    tmp_path: Path,
+) -> None:
+    status = _head_service_calibration(tmp_path)
+    estimate = status.calibration.estimate(1)
+    metrics = _boundary_metrics(
+        location=EXTERNAL_BF16_HEAD,
+        head_estimate=estimate,
+        head_status=status.to_dict(),
+    )
+
+    # A valid endpoint receipt alone is insufficient: the row must carry a
+    # composed decoder-plus-endpoint budget and survive every hard limit.
+    assert (
+        metrics.to_dict()["whole_model"][
+            "strict_system_resource_boundary_valid"
+        ]
+        is False
+    )
+
+    feasible_budget = ResourceBudgetStatus(
+        aggregate_area_mm2=100.0,
+        aggregate_hbm_capacity_bytes=1_000,
+        aggregate_hbm_bandwidth_bytes_per_s=2_000.0,
+        aggregate_multiplier_count=1,
+        budget=ResourceBudget(
+            aggregate_area_limit_mm2=100.0,
+            aggregate_hbm_capacity_limit_bytes=1_000,
+            aggregate_hbm_bandwidth_limit_bytes_per_s=2_000.0,
+            reference_system="test-reference",
+        ),
+    )
+    feasible = replace(
+        metrics,
+        system_area_mm2=100.0,
+        resource_budget=feasible_budget,
+    )
+    assert (
+        feasible.to_dict()["whole_model"][
+            "strict_system_resource_boundary_valid"
+        ]
+        is True
+    )
+
+    over_budget = replace(
+        metrics,
+        system_area_mm2=100.1,
+        resource_budget=replace(
+            feasible_budget,
+            aggregate_area_mm2=100.1,
+        ),
+    )
+    serialized = over_budget.to_dict()
+    assert serialized["resource_budget"]["area_feasible"] is False
+    assert serialized["resource_budget"]["feasible"] is False
+    assert (
+        serialized["whole_model"][
+            "strict_system_resource_boundary_valid"
+        ]
+        is False
+    )
+
+
 def test_head_service_artifact_is_recorded_beside_a_local_headline(
     tmp_path: Path,
 ) -> None:
@@ -3672,14 +4340,15 @@ def test_head_service_artifact_is_recorded_beside_a_local_headline(
     )
     boundary = metrics.to_dict()["output_head_boundary"]
 
-    # Both placements stay reportable from one row, and the comparison arm is
-    # kept strictly out of the priced cost.
+    # Both placements stay reportable from one row, but the local arm remains
+    # a decoder-stack sensitivity rather than a whole-model price.
     assert boundary["location"] == DECODE_BF16_HEAD
     assert boundary["estimate"] is None
     assert boundary["comparison_estimate"]["calibration_id"] == (
         estimate.calibration_id
     )
-    assert metrics.whole_model_tpot_ms == metrics.tpot_ms
+    assert metrics.whole_model_rankable is False
+    assert metrics.whole_model_tpot_ms is None
     with pytest.raises(ValueError, match="belongs to the local boundary"):
         _boundary_metrics(
             location=EXTERNAL_BF16_HEAD,
@@ -3713,6 +4382,9 @@ def test_local_head_energy_charges_no_external_idle_power(
         estimate,
         decoder_tpot_ms=10.0,
         batch=1,
+        head_resource_receipt=SimpleNamespace(
+            decoder_interface_energy_j_per_byte=1e-12
+        ),
     )
     local, local_id = evaluation._whole_model_energy(
         decoder,
@@ -3736,7 +4408,7 @@ def test_local_head_energy_charges_no_external_idle_power(
     assert local_id.startswith("decode-local-head-system-")
 
 
-def test_study_config_declares_the_local_head_as_the_headline() -> None:
+def test_legacy_configs_retain_an_unrankable_local_analytic_headline() -> None:
     for name in ("llama3_1_8b", "qwen3_32b"):
         config = json.loads(
             (
@@ -3759,6 +4431,28 @@ def test_study_config_declares_the_local_head_as_the_headline() -> None:
         evaluation._validate_system_boundary_config(config)
 
 
+def test_qwen30b_config_requires_the_local_mx_headline() -> None:
+    config = json.loads(
+        (
+            Path(evaluation.__file__).resolve().parents[1]
+            / "configs"
+            / "qwen3_30b_a3b_thinking_2507.json"
+        ).read_text(encoding="utf-8")
+    )
+    contract = config["output_head_contract"]
+    assert contract == dict(evaluation.OUTPUT_HEAD_CONTRACT)
+    assert contract["headline_location"] == evaluation.DECODE_MX_HEAD
+    assert contract["headline_idealizations"] == []
+    assert contract["comparison_location"] == EXTERNAL_BF16_HEAD
+    assert config["publication"]["output_head_location"] == (
+        evaluation.DECODE_MX_HEAD
+    )
+    assert evaluation.config_output_head_location(config) == (
+        evaluation.DECODE_MX_HEAD
+    )
+    evaluation._validate_system_boundary_config(config)
+
+
 # --- publication eligibility rests on the blocking stages --------------------
 #
 # The declared contract is that RTL evidence is recorded, never required: both
@@ -3771,24 +4465,18 @@ def test_study_config_declares_the_local_head_as_the_headline() -> None:
 def _publication_fixture(
     *,
     validity: StackValidity,
-    output_head_location: str = EXTERNAL_BF16_HEAD,
 ):
-    """One complete publication set, parameterised on validity and boundary."""
+    """One complete measured-external-head publication set."""
 
     power_id = "analytic-decode-energy-" + "a" * 64
     head_id = "bf16-head-service-" + "c" * 64
     head_provenance = "bf16-head-provenance-" + "d" * 64
     timing = _TimingEvidence("timing-" + "e" * 64)
     head = _HeadEvidence(head_id, head_provenance)
-    local = output_head_location == DECODE_BF16_HEAD
-    system_id = (
-        local_head_system_calibration_id(power_id)
-        if local
-        else composite_system_calibration_id(
-            power_id,
-            head_id,
-            head_provenance,
-        )
+    system_id = composite_system_calibration_id(
+        power_id,
+        head_id,
+        head_provenance,
     )
 
     def candidate(role: str, index: int) -> PublicationCandidate:
@@ -3805,11 +4493,9 @@ def _publication_fixture(
             power_calibration_id=power_id,
             cost_scope="whole_model",
             system_calibration_id=system_id,
-            head_service_calibration_id=None if local else head_id,
-            output_head_location=output_head_location,
-            output_head_idealizations=(
-                (LOCAL_HEAD_COMPUTE_IDEALIZATION,) if local else ()
-            ),
+            head_service_calibration_id=head_id,
+            output_head_location=EXTERNAL_BF16_HEAD,
+            output_head_idealizations=(),
             whole_model_rankable=True,
             timing_calibrated=True,
             timing_evidence_id=timing.evidence_id,
@@ -3837,7 +4523,7 @@ def _publication_fixture(
         candidate("uniform_i4", 2),
         candidate("pareto_candidate", 3),
     )
-    return values, timing, (None if local else head)
+    return values, timing, head
 
 
 def test_publication_admits_a_candidate_whose_rtl_is_unvalidated() -> None:
@@ -3856,6 +4542,7 @@ def test_publication_admits_a_candidate_whose_rtl_is_unvalidated() -> None:
             calibration=None,
             timing_evidence=timing,
             head_service_evidence=head,
+            output_head_location=EXTERNAL_BF16_HEAD,
         )
         assert decision.global_failures == (), decision.global_failures
         assert decision.selected is values[-1]
@@ -3911,6 +4598,7 @@ def test_publication_still_rejects_blocking_stage_failures() -> None:
             calibration=None,
             timing_evidence=timing,
             head_service_evidence=head,
+            output_head_location=EXTERNAL_BF16_HEAD,
         )
         assert decision.selected is None
         failures = dict(decision.candidate_failures)
@@ -3936,6 +4624,7 @@ def test_publication_admits_unmeasured_compiler_and_emulator_coverage() -> None:
         calibration=None,
         timing_evidence=timing,
         head_service_evidence=head,
+        output_head_location=EXTERNAL_BF16_HEAD,
     )
     assert decision.global_failures == (), decision.global_failures
     selected = decision.selected
@@ -3993,8 +4682,8 @@ def test_dc_calibrated_energy_still_requires_measured_dc_validity() -> None:
     assert values[-1].priced_evidence_complete is True
 
 
-def test_publication_admits_the_local_head_without_a_remote_service() -> None:
-    values, timing, head = _publication_fixture(
+def test_publication_rejects_the_unmeasured_local_head_boundary() -> None:
+    values, timing, _ = _publication_fixture(
         validity=StackValidity(
             software_valid=True,
             compiler_valid=True,
@@ -4002,9 +4691,7 @@ def test_publication_admits_the_local_head_without_a_remote_service() -> None:
             rtl_valid=False,
             dc_calibrated=None,
         ),
-        output_head_location=DECODE_BF16_HEAD,
     )
-    assert head is None
     decision = select_final_deployment(
         values,
         calibration=None,
@@ -4012,37 +4699,13 @@ def test_publication_admits_the_local_head_without_a_remote_service() -> None:
         head_service_evidence=None,
         output_head_location=DECODE_BF16_HEAD,
     )
-    # The local headline never hard-requires the remote endpoint...
-    assert decision.global_failures == (), decision.global_failures
-    assert decision.selected is values[-1]
+    assert decision.selected is None
+    assert "output_head_boundary_unmeasured" in decision.global_failures
     record = decision.to_dict()
     assert record["output_head_location"] == DECODE_BF16_HEAD
     assert record["output_head_idealizations"] == [
         LOCAL_HEAD_COMPUTE_IDEALIZATION
     ]
-
-    # ...and the external arm keeps working exactly as before.
-    external_values, external_timing, external_head = _publication_fixture(
-        validity=StackValidity(
-            software_valid=True,
-            compiler_valid=True,
-            emulator_valid=True,
-            rtl_valid=False,
-            dc_calibrated=None,
-        ),
-        output_head_location=EXTERNAL_BF16_HEAD,
-    )
-    external_decision = select_final_deployment(
-        external_values,
-        calibration=None,
-        timing_evidence=external_timing,
-        head_service_evidence=external_head,
-    )
-    assert external_decision.global_failures == ()
-    assert external_decision.selected is external_values[-1]
-    assert external_decision.to_dict()["output_head_location"] == (
-        EXTERNAL_BF16_HEAD
-    )
 
 
 def test_local_head_candidate_cannot_borrow_a_head_service_identity() -> None:
@@ -4155,11 +4818,11 @@ def _model_validated_row(**overrides: Any) -> dict[str, Any]:
             "capacity": {"feasible": True},
             "runtime_capacity_evidence": {"max_runtime_batch": 4},
             "resource_budget": {"feasible": True},
-            "output_head_boundary": {
-                "estimate": {"calibration_id": "bf16-head-service-" + "c" * 64}
-            },
+            "output_head_boundary": _serialized_measured_head_boundary(4),
+            "generated_tokens_per_step": 4,
             "whole_model": {
                 "rankable": True,
+                "strict_system_resource_boundary_valid": True,
                 "publication_timing_tier": "stage_calibrated_analytic",
                 "tpot_ms": 10.0,
                 "tps": 100.0,
@@ -4236,6 +4899,35 @@ def test_admission_admits_a_model_validated_row_without_individual_evidence() ->
     assert pricing["energy_id"].startswith("analytic-decode-energy-")
     assert pricing["area_source"] == "analytic_full_chip"
     assert pricing["system_calibration_id"].startswith("decode-head-system-")
+
+
+def test_admission_rejects_a_forged_rankable_local_head_row() -> None:
+    row = _model_validated_row()
+    row["deployment_valid"] = True
+    row["metrics"]["output_head_boundary"] = {
+        "location": DECODE_BF16_HEAD,
+        "service_mode": LOCAL_HEAD_MODE,
+        "scope_idealizations": [LOCAL_HEAD_COMPUTE_IDEALIZATION],
+        "status": local_head_boundary_status(),
+        "estimate": None,
+        "comparison_estimate": None,
+    }
+
+    admission = evaluate_publication_admission(row)
+
+    assert admission.admitted is False
+    assert admission.reason == "output_head_boundary"
+
+
+def test_admission_rechecks_budget_on_a_strict_deployment_row() -> None:
+    row = _model_validated_row()
+    row["deployment_valid"] = True
+    row["metrics"]["resource_budget"]["feasible"] = False
+
+    admission = evaluate_publication_admission(row)
+
+    assert admission.admitted is False
+    assert admission.reason == "output_head_boundary"
 
 
 def test_admission_marks_an_individually_validated_row_true() -> None:

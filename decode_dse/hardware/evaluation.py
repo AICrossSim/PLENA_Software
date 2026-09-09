@@ -50,6 +50,7 @@ from decode_dse.hardware.design_space import (
 from decode_dse.hardware.lm_head_service import (
     BF16HeadServiceStatus,
     DECODE_BF16_HEAD,
+    DECODE_MX_HEAD,
     EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_SCHEMA,
     OUTPUT_HEAD_IDEALIZATIONS,
@@ -59,6 +60,16 @@ from decode_dse.hardware.lm_head_service import (
     load_bf16_head_service_artifact,
     local_head_boundary_status,
     local_head_system_calibration_id,
+    local_mx_head_boundary_status,
+    local_mx_head_breakdown_valid,
+    local_mx_head_status_valid,
+)
+from decode_dse.hardware.head_service_resources import (
+    BF16HeadEndpointResourceStatus,
+    HEAD_RESOURCE_SCHEMA,
+    head_endpoint_resource_status_valid,
+    load_bf16_head_endpoint_resource_receipt,
+    qwen3_moe_bf16_parameter_census,
 )
 from decode_dse.hardware.power_model import (
     calibrated_area_from_simulator,
@@ -72,11 +83,22 @@ from decode_dse.hardware.power_bridge import (
     hbm_peak_bandwidth_bytes_per_s,
     resolve_simulator_root,
 )
+from decode_dse.hardware.moe_power_events import (
+    MOE_POWER_EVENT_BLOCKER,
+    build_moe_power_event_input_binding,
+    build_moe_power_event_ledger,
+    generic_calibration_event_counts,
+    validate_moe_power_event_input_binding,
+    validate_moe_power_event_ledger,
+    validate_moe_power_event_receipt_for_engine,
+)
 from decode_dse.hardware.workload_events import (
     EVENT_MODEL,
     DecodeEvent,
     DenseDecoderShape,
     count_decode_events,
+    local_output_head_event_counts,
+    merge_decode_event_counts,
 )
 from decode_dse.legality import StackValidity
 from decode_dse.manifest import (
@@ -85,6 +107,8 @@ from decode_dse.manifest import (
     load_manifest,
 )
 from decode_dse.profiles import (
+    FOUNDATION_MATRIX_MLEN,
+    LEGACY_PROFILE_SCHEMA,
     MXINT_FORMATS,
     PROFILE_KIND_BF16_REFERENCE,
     DecodePrecisionProfile,
@@ -149,6 +173,8 @@ _PROVENANCE_MODULES = (
     "decode_dse.hardware.design_space",
     "decode_dse.hardware.evaluation",
     "decode_dse.hardware.lm_head_service",
+    "decode_dse.hardware.head_service_resources",
+    "decode_dse.hardware.moe_power_events",
     "decode_dse.hardware.power_model",
     "decode_dse.hardware.power_bridge",
     "decode_dse.hardware.synthesis_anchor",
@@ -188,6 +214,9 @@ _SIMULATOR_SOURCES = {
     ),
     "physical_ledger_sha256": (
         "analytic_models/disagg_serve/physical_ledger.py"
+    ),
+    "body_weight_layout_sha256": (
+        "analytic_models/disagg_serve/body_weight_layout.py"
     ),
     "decode_power_sha256": "analytic_models/disagg_serve/decode_power.py",
     "handoff_model_sha256": "analytic_models/disagg_serve/handoff.py",
@@ -720,12 +749,29 @@ def precision_request(profile: DecodePrecisionProfile) -> PrecisionRequest:
     """Map one hardware profile without reducing formats to effective bits."""
 
     if profile.kind == PROFILE_KIND_BF16_REFERENCE:
-        raise ValueError("the BF16 split reference is not a PLENA hardware profile")
+        raise ValueError(
+            "the BF16 reference is a numerical/B200 control, not a PLENA "
+            "hardware candidate"
+        )
     if profile.block_size != 8:
         raise ValueError("the PLENA decode datapath requires MX block size 8")
-    required_bf16 = {"embedding", "lm_head"}
+    required_bf16 = (
+        {"embedding", "lm_head"}
+        if profile.schema_version == LEGACY_PROFILE_SCHEMA
+        else {"embedding"}
+    )
     if not required_bf16.issubset(profile.bf16_operators):
-        raise ValueError("embeddings and the LM head must remain BF16")
+        raise ValueError("the embedding must remain BF16")
+    if (
+        profile.schema_version != LEGACY_PROFILE_SCHEMA
+        and "lm_head" in profile.bf16_operators
+    ):
+        raise ValueError("the cached-decode LM head must not use legacy BF16 coverage")
+    if profile.schema_version != LEGACY_PROFILE_SCHEMA and (
+        "decode_lm_head" not in profile.weight_operators
+        or "decode_lm_head" not in profile.activation_operators
+    ):
+        raise ValueError("the cached-decode LM head must follow profile W/A")
     quantized_coverage = (
         profile.weight_operators
         + profile.activation_operators
@@ -734,7 +780,7 @@ def precision_request(profile: DecodePrecisionProfile) -> PrecisionRequest:
     )
     if required_bf16.intersection(quantized_coverage):
         raise ValueError(
-            "embedding and LM-head quantization is accuracy-only"
+            "operators required to remain BF16 cannot enter MX coverage"
         )
 
     def role(token: str) -> tuple[int | str, str]:
@@ -761,6 +807,70 @@ def precision_request(profile: DecodePrecisionProfile) -> PrecisionRequest:
         key_family=key_family,
         value_family=value_family,
         block_size=profile.block_size,
+    )
+
+
+def _bind_local_head_precision(
+    entry: SweepManifestEntry,
+    precision: Any,
+    output_head_location: str,
+) -> Any:
+    """Bind the profile's local-head arithmetic to one simulator precision."""
+
+    if output_head_location != DECODE_MX_HEAD:
+        return precision
+    if entry.profile.kind == PROFILE_KIND_BF16_REFERENCE:
+        raise ValueError(
+            "the BF16 reference is a numerical/B200 control, not a PLENA "
+            "local-MX-head candidate"
+        )
+    head_contract = entry.profile.local_head_contract
+    if (
+        head_contract.get("weight_format") != entry.profile.weight_format
+        or head_contract.get("activation_format")
+        != entry.profile.activation_format
+        or head_contract.get("matrix_storage_format")
+        != entry.profile.vector_format
+        or head_contract.get("matrix_output_format")
+        != entry.profile.vector_format
+        or head_contract.get("logit_container_format") != "BF16"
+        or head_contract.get("bf16_container_precision_recovery") is not False
+        or head_contract.get("matrix_mlen") != entry.profile.matrix_mlen
+    ):
+        raise ValueError("profile-local output-head precision binding differs")
+    return replace(
+        precision,
+        spec={
+            **precision.spec,
+            "lm_head_quantized": True,
+            "lm_head_top_k": 20,
+            "profile_id": entry.profile_id,
+            "head_vector_format": entry.profile.vector_format,
+            "head_matrix_storage_format": entry.profile.vector_format,
+            "head_logit_container_format": "BF16",
+            "head_bf16_container_precision_recovery": False,
+            "head_operand_family_supported": bool(
+                head_contract["operand_family_deployment_supported"]
+            ),
+            "head_operand_family_binding": str(
+                head_contract["operand_family_binding"]
+            ),
+            "head_numerical_oracle_rule": str(
+                head_contract["numerical_oracle_rule"]
+            ),
+            "head_partial_conversion_rule": str(
+                head_contract["partial_conversion_rule"]
+            ),
+            "head_hardware_bit_parity_verified": bool(
+                head_contract["hardware_bit_parity_verified"]
+            ),
+            "head_accumulation_chain": list(
+                head_contract["arithmetic_chain"]
+            ),
+            "head_numerical_matrix_mlen": int(
+                entry.profile.matrix_mlen
+            ),
+        },
     )
 
 
@@ -875,6 +985,19 @@ def capacity_from_metrics(
             raise ValueError(f"{name} must be a non-negative integer")
     if int(metrics.hbm_capacity) <= 0:
         raise ValueError("hbm_capacity must be positive")
+    if (metrics.slowest_rank_hbm_required_bytes is None) != (
+        metrics.per_chip_hbm_capacity_bytes is None
+    ):
+        raise ValueError("rank-local HBM evidence must be paired")
+    for name in (
+        "slowest_rank_hbm_required_bytes",
+        "per_chip_hbm_capacity_bytes",
+    ):
+        raw = getattr(metrics, name)
+        if raw is not None and (
+            isinstance(raw, bool) or int(raw) != raw or int(raw) < 0
+        ):
+            raise ValueError(f"{name} must be a non-negative integer")
     for name in (
         "fits_in_hbm",
         "fits_onchip_sram",
@@ -896,6 +1019,16 @@ def capacity_from_metrics(
         kv_cache_bytes=kv_bytes,
         runtime_bytes=int(metrics.runtime_hbm_reserve_bytes),
         available_bytes=int(metrics.hbm_capacity),
+        slowest_rank_required_bytes=(
+            int(metrics.slowest_rank_hbm_required_bytes)
+            if metrics.slowest_rank_hbm_required_bytes is not None
+            else None
+        ),
+        per_chip_available_bytes=(
+            int(metrics.per_chip_hbm_capacity_bytes)
+            if metrics.per_chip_hbm_capacity_bytes is not None
+            else None
+        ),
     )
     hbm_required = float(metrics.hbm_required)
     if not math.isfinite(hbm_required) or hbm_required < 0:
@@ -981,6 +1114,12 @@ class SimulatorObservation:
     total_hbm_bytes: float
     events: tuple[DecodeEvent, ...]
     output_head_location: str
+    local_output_head: Mapping[str, Any] | None = None
+    moe_workload: Mapping[str, Any] | None = None
+    body_physical_layout: Mapping[str, Any] | None = None
+    moe_power_event_ledger: Mapping[str, Any] | None = None
+    moe_power_event_input_binding: Mapping[str, Any] | None = None
+    moe_power_event_receipt: Mapping[str, Any] | None = None
     collective_time_s_per_step: float = 0.0
     collective_bytes_per_generated_token: float = 0.0
     link_generation: str = "nvlink4"
@@ -1101,6 +1240,7 @@ class SimulatorObservation:
             raise ValueError("PackedKV layout identity is invalid")
         if self.output_head_location not in {
             DECODE_BF16_HEAD,
+            DECODE_MX_HEAD,
             EXTERNAL_BF16_HEAD,
         }:
             raise ValueError("output-head location is invalid")
@@ -1221,6 +1361,7 @@ class SimulatorObservation:
                 "schema",
                 "explicit",
                 "attention_partition",
+                "expert_parallel_mode",
                 "kv_head_reuse",
                 "drain_overlapped",
                 "area",
@@ -1235,6 +1376,11 @@ class SimulatorObservation:
                 raise TypeError(
                     "architecture-option attention partition must be an object"
                 )
+            if self.architecture_options["expert_parallel_mode"] not in {
+                "tensor_parallel",
+                "expert_id_parallel",
+            }:
+                raise ValueError("architecture-option expert mode is invalid")
         if self.capacity_throughput_chain:
             chain = self.capacity_throughput_chain
             if int(chain.get("evaluated_batch", -1)) != self.generated_tokens_per_step:
@@ -1268,6 +1414,123 @@ class SimulatorObservation:
         ):
             raise ValueError(
                 "output-head location and event boundary disagree"
+            )
+        local_head = self.local_output_head
+        if self.output_head_location == DECODE_MX_HEAD:
+            if (
+                not isinstance(local_head, Mapping)
+                or not local_mx_head_breakdown_valid(
+                    local_head,
+                    profile_id=self.profile_id,
+                    require_passed=False,
+                )
+            ):
+                raise ValueError(
+                    "decode-local MX head requires a valid cost breakdown"
+                )
+            object.__setattr__(
+                self,
+                "local_output_head",
+                json.loads(_canonical_bytes(dict(local_head))),
+            )
+        elif local_head is not None:
+            raise ValueError(
+                "local output-head breakdown requires decode_local_mx_head"
+            )
+        body_layout = self.body_physical_layout
+        if body_layout is not None:
+            if not isinstance(body_layout, Mapping):
+                raise TypeError("body_physical_layout must be an object")
+            canonical_body = json.loads(_canonical_bytes(dict(body_layout)))
+            provenance = canonical_body.get("provenance")
+            capacity = canonical_body.get("capacity")
+            if (
+                canonical_body.get("schema_version")
+                != "plena-body-weight-physical-layout/v1"
+                or not isinstance(provenance, Mapping)
+                or provenance.get("analytic_layout_valid") is not True
+                or provenance.get("analytic_timing_valid") is not True
+                or provenance.get("compiler_layout_valid") is not False
+                or provenance.get("rtl_layout_valid") is not False
+                or provenance.get("publication_rankable") is not False
+                or provenance.get("selection_eligible") is not False
+                or not isinstance(capacity, Mapping)
+                or capacity.get("overall_feasible") is not self.capacity.feasible
+            ):
+                raise ValueError("body physical-layout provenance is invalid")
+            object.__setattr__(self, "body_physical_layout", canonical_body)
+        moe_workload = self.moe_workload
+        if moe_workload is None:
+            if any(
+                value is not None
+                for value in (
+                    self.moe_power_event_ledger,
+                    self.moe_power_event_input_binding,
+                    self.moe_power_event_receipt,
+                )
+            ):
+                raise ValueError(
+                    "routed-MoE power evidence requires a routed-MoE workload"
+                )
+        else:
+            if not isinstance(moe_workload, Mapping):
+                raise TypeError("moe_workload must be an object")
+            canonical_moe = json.loads(_canonical_bytes(dict(moe_workload)))
+            if canonical_moe.get("schema") != (
+                "plena-routed-moe-decode-workload/v1"
+            ):
+                raise ValueError("routed-MoE workload schema differs")
+            if body_layout is None:
+                raise ValueError(
+                    "routed-MoE power accounting requires the physical body layout"
+                )
+            ledger = self.moe_power_event_ledger
+            if (
+                not isinstance(ledger, Mapping)
+                or not validate_moe_power_event_ledger(ledger)
+                or ledger.get("profile_id") != self.profile_id
+                or ledger.get("candidate_id") != self.candidate_id
+                or ledger.get("provenance", {}).get("body_layout_sha256")
+                != _content_hash(canonical_body)
+                or ledger.get("provenance", {}).get("moe_workload_sha256")
+                != _content_hash(canonical_moe)
+            ):
+                raise ValueError("routed-MoE power-event ledger is invalid")
+            event_counts = {
+                event.signature: event.count for event in self.events
+            }
+            if len(event_counts) != len(self.events):
+                raise ValueError("decode power-event signatures must be unique")
+            for signature, count in generic_calibration_event_counts(ledger):
+                if event_counts.get(signature, 0) < count:
+                    raise ValueError(
+                        "decode events omitted native routed-MoE operations"
+                    )
+            binding = self.moe_power_event_input_binding
+            if binding is not None:
+                if not isinstance(binding, Mapping) or not (
+                    validate_moe_power_event_input_binding(binding)
+                ):
+                    raise ValueError("routed-MoE power input binding is invalid")
+                binding = json.loads(_canonical_bytes(dict(binding)))
+            receipt = self.moe_power_event_receipt
+            if receipt is not None and not isinstance(receipt, Mapping):
+                raise TypeError("routed-MoE power-event receipt must be an object")
+            object.__setattr__(self, "moe_workload", canonical_moe)
+            object.__setattr__(
+                self,
+                "moe_power_event_ledger",
+                json.loads(_canonical_bytes(dict(ledger))),
+            )
+            object.__setattr__(self, "moe_power_event_input_binding", binding)
+            object.__setattr__(
+                self,
+                "moe_power_event_receipt",
+                (
+                    json.loads(_canonical_bytes(dict(receipt)))
+                    if receipt is not None
+                    else None
+                ),
             )
         if not self.capacity_model:
             raise ValueError("capacity model identity must be non-empty")
@@ -1411,6 +1674,8 @@ class SimulatorObservation:
             avg_realized_compute_seconds=self.avg_realized_compute_seconds,
             avg_memory_seconds=self.avg_memory_seconds,
             step_composition=self.step_composition,
+            output_head_location=DECODE_BF16_HEAD,
+            output_head_status=local_head_boundary_status(),
         )
         if not physical_traffic.traffic_evidence_complete:
             raise ValueError("physical traffic evidence is incomplete")
@@ -1734,6 +1999,7 @@ def _whole_model_energy(
     *,
     decoder_tpot_ms: float,
     batch: int,
+    head_resource_receipt=None,
 ) -> tuple[CalibratedEnergy, str]:
     """Compose the whole-model energy ledger over the decode dependency.
 
@@ -1760,6 +2026,10 @@ def _whole_model_energy(
         return (
             replace(decoder, calibration_id=system_id, energy_id=system_id),
             system_id,
+        )
+    if head_resource_receipt is None:
+        raise ValueError(
+            "external whole-model energy requires endpoint/link resources"
         )
     whole_duration = (
         decoder_tpot_ms / 1000.0 + head.total_latency_s
@@ -1798,6 +2068,11 @@ def _whole_model_energy(
         link_j=(
             decoder.link_j
             + head.link_dynamic_energy_j / batch
+            + (
+                (head.request_bytes + head.response_bytes)
+                * head_resource_receipt.decoder_interface_energy_j_per_byte
+                / batch
+            )
         ),
         duration_s=whole_duration,
         token_latency_s=(
@@ -1934,6 +2209,63 @@ def _augment_with_stage_reference(
     raise ValueError(
         "no sibling stage partition recorded the BF16 reference measurement"
     )
+
+
+def _filter_profile_inputs(
+    manifest: SweepManifest,
+    rows: tuple[Mapping[str, Any], ...],
+    profile_ids: Sequence[str],
+) -> tuple[SweepManifest, tuple[Mapping[str, Any], ...]]:
+    """Return a deterministic evaluator view over an exact profile subset.
+
+    Source rows are validated against their original stage manifest before this
+    view is constructed.  Their record hashes and numerical payloads remain
+    unchanged; only manifest entry ordinals are made contiguous for the subset.
+    """
+
+    if not profile_ids:
+        return manifest, rows
+    requested = tuple(str(profile_id) for profile_id in profile_ids)
+    if (
+        any(not profile_id for profile_id in requested)
+        or len(requested) != len(set(requested))
+    ):
+        raise ValueError("profile filters must be unique non-empty IDs")
+    entries = {entry.profile_id: entry for entry in manifest.entries}
+    rows_by_id = {str(row.get("profile_id", "")): row for row in rows}
+    if len(rows_by_id) != len(rows):
+        raise ValueError("profile filtering found duplicate source rows")
+    missing = sorted(set(requested) - set(entries))
+    if missing:
+        raise ValueError(
+            "profile filters are absent from the validated stage inputs: "
+            + ",".join(missing)
+        )
+    missing_rows = sorted(set(requested) - set(rows_by_id))
+    if missing_rows:
+        raise ValueError(
+            "profile filters lack validated numerical rows: "
+            + ",".join(missing_rows)
+        )
+    requested_set = set(requested)
+    selected_entries = tuple(
+        replace(entry, ordinal=ordinal)
+        for ordinal, entry in enumerate(
+            entry
+            for entry in manifest.entries
+            if entry.profile_id in requested_set
+        )
+    )
+    selected_manifest = SweepManifest(
+        model_name=manifest.model_name,
+        model_revision=manifest.model_revision,
+        model_architecture=manifest.model_architecture,
+        tokenizer_revision=manifest.tokenizer_revision,
+        quantizer_provenance=manifest.quantizer_provenance,
+        entries=selected_entries,
+    )
+    selected_rows = tuple(rows_by_id[entry.profile_id] for entry in selected_entries)
+    return selected_manifest, selected_rows
 
 
 def load_terminal_numerical_rows(
@@ -2089,10 +2421,12 @@ class DecodeSimulatorBackend:
         compiler_trace_artifacts: str | os.PathLike[str] | None = None,
         request_memory_calibration: str | os.PathLike[str] | None = None,
         head_service_artifact: str | os.PathLike[str] | None = None,
+        head_service_resource_receipt: str | os.PathLike[str] | None = None,
         output_head_location: str | None = None,
         model_name: str | None = None,
         model_revision: str | None = None,
         required_batches: Sequence[int] = (),
+        prefill_model_excluding_head_bytes: int | None = None,
     ) -> None:
         from decode_dse.simulator_bridge import DecodeSimulator
 
@@ -2126,6 +2460,9 @@ class DecodeSimulatorBackend:
         self.compiler_trace_artifact_path: Path | None = None
         self.request_memory_calibration_path: Path | None = None
         self.head_service_status: BF16HeadServiceStatus | None = None
+        self.head_service_resource_status: (
+            BF16HeadEndpointResourceStatus | None
+        ) = None
         if head_service_artifact is not None:
             if not model_name or not model_revision or not required_batches:
                 raise ValueError(
@@ -2142,19 +2479,30 @@ class DecodeSimulatorBackend:
                 ),
                 required_batches=required_batches,
             )
+        if head_service_resource_receipt is not None:
+            if self.head_service_status is None:
+                raise ValueError(
+                    "head-service resource validation requires head evidence"
+                )
+            self.head_service_resource_status = (
+                load_bf16_head_endpoint_resource_receipt(
+                    head_service_resource_receipt,
+                    head_service_status=self.head_service_status,
+                    prefill_model_excluding_head_bytes=(
+                        prefill_model_excluding_head_bytes
+                    ),
+                )
+            )
         head_service_passed = (
             self.head_service_status is not None
             and self.head_service_status.passed
         )
         # The boundary is a configuration decision, not an inference from which
-        # artifacts happen to be present: the decode-local head is the headline
-        # placement and the measured remote service is the comparison arm, so
-        # a passing head-service artifact may accompany either.  Only when no
-        # boundary is requested does the artifact still select one.
+        # artifacts happen to be present. A passing head-service artifact may
+        # accompany a local analytic sensitivity for comparison. Only when no
+        # boundary is requested does the available artifact select one.
         if output_head_location is None:
-            output_head_location = (
-                EXTERNAL_BF16_HEAD if head_service_passed else DECODE_BF16_HEAD
-            )
+            output_head_location = DECODE_MX_HEAD
         if output_head_location not in OUTPUT_HEAD_LOCATIONS:
             raise ValueError("output_head_location is unsupported")
         if output_head_location == EXTERNAL_BF16_HEAD and not head_service_passed:
@@ -2256,6 +2604,15 @@ class DecodeSimulatorBackend:
                     "service_mode": "unmodeled",
                     "service_location": None,
                     "required_batches": [],
+                }
+            ),
+            "head_service_resource_status": (
+                self.head_service_resource_status.to_dict()
+                if self.head_service_resource_status is not None
+                else {
+                    "schema_version": HEAD_RESOURCE_SCHEMA,
+                    "passed": False,
+                    "failures": ["missing_head_service_resource_receipt"],
                 }
             ),
             **paths,
@@ -2493,6 +2850,11 @@ class DecodeSimulatorBackend:
             act_w=request.activation,
             act_fmt=request.activation_family,
         )
+        precision = _bind_local_head_precision(
+            entry,
+            precision,
+            self.output_head_location,
+        )
         hbm = self.sim.hbm_overrides(
             candidate.hbm_generation,
             candidate.hbm_channels,
@@ -2506,6 +2868,7 @@ class DecodeSimulatorBackend:
             "KVP": candidate.kvp,
             "LINK_PORTS": candidate.link_ports,
             "SRAM_POLICY": candidate.sram_policy,
+            "EXPERT_PARALLEL_MODE": candidate.expert_parallel_mode,
             "LINK_GENERATION": "nvlink4",
             **hbm,
         }
@@ -2542,6 +2905,7 @@ class DecodeSimulatorBackend:
             candidate.tp,
             candidate.kvp,
             candidate.sram_policy,
+            candidate.expert_parallel_mode,
             effective_reserve,
         )
         ledger = self._resource_ledger_cache.get(ledger_key)
@@ -2556,9 +2920,59 @@ class DecodeSimulatorBackend:
                 runtime_hbm_reserve_bytes=effective_reserve,
                 kv_layout=workload.kv_layout,
                 include_lm_head=(
-                    self.output_head_location == DECODE_BF16_HEAD
+                    self.output_head_location
+                    in {DECODE_BF16_HEAD, DECODE_MX_HEAD}
                 ),
             )
+            body_layout = None
+            slowest_rank_kv = None
+            system_kv = None
+            if (
+                self.sim._dd.is_moe(self.sim.dims)
+                and self.output_head_location
+                in {DECODE_MX_HEAD, EXTERNAL_BF16_HEAD}
+            ):
+                unique_experts = self.sim.dims.get(
+                    "moe_unique_experts_per_step"
+                )
+                if unique_experts is None:
+                    unique_experts = self.sim._dd.conservative_unique_experts(
+                        int(self.sim.dims["num_experts"]),
+                        int(self.sim.dims["experts_per_token"]),
+                        candidate.batch,
+                    )
+                body_layout = (
+                    self.sim._dd.build_body_weight_physical_layout(
+                        self.sim.dims,
+                        precision.spec,
+                        mlen=candidate.mlen,
+                        tp=int(candidate.tp),
+                        kvp=int(candidate.kvp),
+                        batch=candidate.batch,
+                        unique_experts=int(unique_experts),
+                        expert_parallel_mode=getattr(
+                            candidate,
+                            "expert_parallel_mode",
+                            self.sim._dd.EXPERT_TENSOR_PARALLEL,
+                        ),
+                        active_experts_per_rank=None,
+                        include_lm_head=(
+                            self.output_head_location == DECODE_MX_HEAD
+                        ),
+                    )
+                )
+                slowest_rank_kv, system_kv, _ = (
+                    self.sim._dd._partitioned_kv_ledgers(
+                        self.sim.dims,
+                        precision.spec,
+                        context=workload.input_seq + workload.output_seq,
+                        batch=candidate.batch,
+                        mlen=candidate.mlen,
+                        kv_layout=workload.kv_layout,
+                        tp=int(candidate.tp),
+                        kvp=int(candidate.kvp),
+                    )
+                )
             ledger = self.sim._dd._partition_physical_ledger(
                 ledger,
                 tp=int(candidate.tp),
@@ -2566,6 +2980,9 @@ class DecodeSimulatorBackend:
                 hbm_per_chip=hbm_per_chip,
                 sram_policy=candidate.sram_policy,
                 batch=candidate.batch,
+                body_weight_layout=body_layout,
+                slowest_rank_kv=slowest_rank_kv,
+                system_kv=system_kv,
             )
             if len(self._resource_ledger_cache) >= 4096:
                 self._resource_ledger_cache.clear()
@@ -2575,6 +2992,16 @@ class DecodeSimulatorBackend:
             kv_cache_bytes=int(ledger.kv.total_bytes),
             runtime_bytes=int(ledger.runtime_hbm_reserve_bytes),
             available_bytes=int(ledger.hbm_capacity_bytes),
+            slowest_rank_required_bytes=(
+                int(ledger.slowest_rank_hbm_required_bytes)
+                if ledger.slowest_rank_hbm_required_bytes is not None
+                else None
+            ),
+            per_chip_available_bytes=(
+                int(ledger.per_chip_hbm_capacity_bytes)
+                if ledger.per_chip_hbm_capacity_bytes is not None
+                else None
+            ),
         )
         sram = ledger.sram
         runtime_feasible = (
@@ -2667,6 +3094,11 @@ class DecodeSimulatorBackend:
             act_w=request.activation,
             act_fmt=request.activation_family,
         )
+        precision = _bind_local_head_precision(
+            entry,
+            precision,
+            self.output_head_location,
+        )
         hbm = self.sim.hbm_overrides(
             candidate.hbm_generation,
             candidate.hbm_channels,
@@ -2680,6 +3112,7 @@ class DecodeSimulatorBackend:
             "KVP": candidate.kvp,
             "LINK_PORTS": candidate.link_ports,
             "SRAM_POLICY": candidate.sram_policy,
+            "EXPERT_PARALLEL_MODE": candidate.expert_parallel_mode,
             "LINK_GENERATION": "nvlink4",
             **hbm,
         }
@@ -2759,6 +3192,12 @@ class DecodeSimulatorBackend:
             "packedkv-selector-capability-"
             + _content_hash(selector_capability.to_dict())
         )
+        linear_signature = (
+            f"LINEAR:{_simulator_token(profile.weight_format)}"
+            f"x{_simulator_token(profile.activation_format)}"
+        )
+        vector_signature = f"VECTOR:{profile.vector_format}"
+        is_routed_moe = int(self.sim.dims.get("num_experts", 1)) > 1
         events = count_decode_events(
             shape,
             input_seq=workload.input_seq,
@@ -2766,11 +3205,9 @@ class DecodeSimulatorBackend:
             batch=candidate.batch,
             mlen=candidate.mlen,
             blen=candidate.blen,
+            vlen=candidate.vlen,
             hlen=candidate.hlen,
-            linear_signature=(
-                f"LINEAR:{_simulator_token(profile.weight_format)}"
-                f"x{_simulator_token(profile.activation_format)}"
-            ),
+            linear_signature=linear_signature,
             qk_signature=(
                 f"QK:{_simulator_token(profile.key_format)}"
                 f"x{_simulator_token(profile.activation_format)}"
@@ -2779,12 +3216,59 @@ class DecodeSimulatorBackend:
                 f"PV:{_simulator_token(profile.value_format)}"
                 f"x{_simulator_token(profile.activation_format)}"
             ),
-            vector_signature=f"VECTOR:{profile.vector_format}",
+            vector_signature=vector_signature,
             stride=workload.stride,
+            include_local_output_head_padding=(
+                self.output_head_location == DECODE_MX_HEAD
+            ),
+            include_dense_ffn=not is_routed_moe,
+            tp=candidate.tp,
+            kvp=candidate.kvp,
             include_output_head=(
-                self.output_head_location == DECODE_BF16_HEAD
+                self.output_head_location
+                in {DECODE_BF16_HEAD, DECODE_MX_HEAD}
+            ),
+            lm_head_signature=(
+                (
+                    linear_signature
+                )
+                if self.output_head_location == DECODE_MX_HEAD
+                else "UNMODELED:LM_HEAD_BF16"
             ),
         )
+        moe_power_event_ledger = None
+        if is_routed_moe:
+            if not isinstance(metrics.moe_workload, Mapping):
+                raise ValueError(
+                    "simulator omitted the native routed-MoE workload ledger"
+                )
+            if not isinstance(metrics.body_physical_layout, Mapping):
+                raise ValueError(
+                    "simulator omitted the routed-MoE physical body layout"
+                )
+            moe_power_event_ledger = build_moe_power_event_ledger(
+                dims=self.sim.dims,
+                profile_id=entry.profile_id,
+                candidate_id=candidate.candidate_id,
+                expert_linear_signature=linear_signature,
+                vector_signature=vector_signature,
+                body_layout=metrics.body_physical_layout,
+                moe_workload=metrics.moe_workload,
+                batch=candidate.batch,
+                decode_steps=workload.output_seq,
+                mlen=candidate.mlen,
+                blen=candidate.blen,
+                vlen=candidate.vlen,
+                tp=candidate.tp,
+                kvp=candidate.kvp,
+                expert_parallel_mode=candidate.expert_parallel_mode,
+            )
+            events = merge_decode_event_counts(
+                events,
+                generic_calibration_event_counts(moe_power_event_ledger),
+                mlen=candidate.mlen,
+                blen=candidate.blen,
+            )
         architecture_issue = (
             "memory"
             if metrics.frac_architecture_issue_mem_bound >= 0.5
@@ -2797,6 +3281,11 @@ class DecodeSimulatorBackend:
             kvp=candidate.kvp,
             link_ports=candidate.link_ports,
             link_generation="nvlink4",
+            include_local_output_selection=(
+                self.output_head_location == DECODE_MX_HEAD
+            ),
+            local_output_top_k=20,
+            expert_parallel_mode=candidate.expert_parallel_mode,
         )
         area_status = self.sim._dd.system_area(
             self.sim.base_hw.model_copy(update=override),
@@ -2903,6 +3392,7 @@ class DecodeSimulatorBackend:
             "schema": "plena-decode-architecture-options",
             "explicit": candidate.architecture_knobs_explicit,
             "attention_partition": attention_partition.to_dict(),
+            "expert_parallel_mode": candidate.expert_parallel_mode,
             "kv_head_reuse": reuse_status,
             "drain_overlapped": drain_status,
             "area": dict(area_status["architecture_options"]),
@@ -2941,6 +3431,44 @@ class DecodeSimulatorBackend:
             "byte_unit": "physical_bytes",
             "batch_unit": "active_sequences",
         }
+        local_output_head = metrics.local_output_head
+        if self.output_head_location == DECODE_MX_HEAD:
+            if not isinstance(local_output_head, Mapping):
+                raise ValueError("simulator omitted local-head cost evidence")
+            from compiler.asm_templates.lm_head import (
+                local_lm_head_lowering_receipt,
+            )
+
+            compiler_receipt = None
+            compiler_lowering_blocker = None
+            if (
+                candidate.mlen == entry.profile.matrix_mlen
+                and candidate.tp == 1
+            ):
+                compiler_receipt = local_lm_head_lowering_receipt(
+                    mlen=candidate.mlen,
+                    blen=candidate.blen,
+                    batch=candidate.batch,
+                    hidden_size=int(self.sim.dims["hidden"]),
+                    vocab_size=int(self.sim.dims["vocab"]),
+                    profile=entry.profile.to_dict(),
+                    profile_id=entry.profile_id,
+                    tensor_parallel_ranks=candidate.tp,
+                )
+            elif candidate.mlen == entry.profile.matrix_mlen:
+                compiler_lowering_blocker = (
+                    "tensor_parallel_local_head_compiler_lowering_unavailable"
+                )
+            else:
+                compiler_lowering_blocker = (
+                    "numerical_matrix_mlen_mismatch_no_profile_bound_"
+                    "compiler_receipt"
+                )
+            local_output_head = {
+                **dict(local_output_head),
+                "compiler_lowering_receipt": compiler_receipt,
+                "compiler_lowering_blocker": compiler_lowering_blocker,
+            }
         return SimulatorObservation(
             profile_id=entry.profile_id,
             candidate_id=candidate.candidate_id,
@@ -2992,6 +3520,10 @@ class DecodeSimulatorBackend:
             total_hbm_bytes=total_hbm_bytes,
             events=events,
             output_head_location=metrics.output_head_location,
+            local_output_head=local_output_head,
+            moe_workload=metrics.moe_workload,
+            body_physical_layout=metrics.body_physical_layout,
+            moe_power_event_ledger=moe_power_event_ledger,
             collective_time_s_per_step=float(collective["time_s"]),
             collective_bytes_per_generated_token=(
                 float(collective["total_bytes"]) / candidate.batch
@@ -3025,6 +3557,53 @@ class DecodeSimulatorBackend:
             step_composition=metrics.step_composition,
             architecture_options=architecture_options,
             capacity_throughput_chain=capacity_throughput_chain,
+        )
+
+
+def _require_moe_power_event_receipt(
+    *,
+    ledger: Mapping[str, Any] | None,
+    input_binding: Mapping[str, Any] | None,
+    receipt: Mapping[str, Any] | None,
+    calibration_id: str,
+    calibration_sha256: str | None,
+) -> None:
+    """Reject routed-MoE pricing until every exact v1 boundary is valid."""
+
+    if ledger is None and input_binding is None and receipt is None:
+        return
+    failures: list[str] = []
+    if not isinstance(ledger, Mapping) or not validate_moe_power_event_ledger(
+        ledger
+    ):
+        failures.append("moe_power_event_ledger_missing_or_invalid")
+    else:
+        failures.extend(str(item) for item in ledger.get("blockers", ()))
+        if ledger.get("power_engine_eligible") is not True:
+            failures.append(MOE_POWER_EVENT_BLOCKER)
+    if not isinstance(input_binding, Mapping) or not (
+        validate_moe_power_event_input_binding(input_binding)
+    ):
+        failures.append("moe_power_event_input_binding_missing_or_invalid")
+    if not isinstance(receipt, Mapping):
+        failures.append(MOE_POWER_EVENT_BLOCKER)
+    elif (
+        not isinstance(ledger, Mapping)
+        or not isinstance(input_binding, Mapping)
+        or calibration_sha256 is None
+        or not validate_moe_power_event_receipt_for_engine(
+            receipt,
+            ledger=ledger,
+            input_binding=input_binding,
+            calibration_id=calibration_id,
+            calibration_sha256=calibration_sha256,
+        )
+    ):
+        failures.append(MOE_POWER_EVENT_BLOCKER)
+    if failures:
+        raise ValueError(
+            "routed-MoE calibrated power is unavailable: "
+            + ",".join(dict.fromkeys(failures))
         )
 
 
@@ -3078,10 +3657,22 @@ class SimulatorPowerEngine:
         profile: DecodePrecisionProfile,
         candidate: HardwareCandidate,
         events: Iterable[DecodeEvent],
+        *,
+        moe_power_event_ledger: Mapping[str, Any] | None = None,
+        moe_power_event_input_binding: Mapping[str, Any] | None = None,
+        moe_power_event_receipt: Mapping[str, Any] | None = None,
     ) -> float:
         """Evaluate the calibrated chip area without timing or traffic pricing."""
 
         from power.model import EventCount, estimate_power
+
+        _require_moe_power_event_receipt(
+            ledger=moe_power_event_ledger,
+            input_binding=moe_power_event_input_binding,
+            receipt=moe_power_event_receipt,
+            calibration_id=self.status.calibration_id,
+            calibration_sha256=self.status.source_sha256,
+        )
 
         area_config = {
             **self.area_config,
@@ -3125,6 +3716,14 @@ class SimulatorPowerEngine:
     ) -> PowerOutcome:
         from power.model import EventCount, estimate_power
 
+        if observation.moe_workload is not None:
+            _require_moe_power_event_receipt(
+                ledger=observation.moe_power_event_ledger,
+                input_binding=observation.moe_power_event_input_binding,
+                receipt=observation.moe_power_event_receipt,
+                calibration_id=self.status.calibration_id,
+                calibration_sha256=self.status.source_sha256,
+            )
         if not observation.packedkv_selector_supported:
             raise ValueError(
                 "selector power cannot rank an unsupported PackedKV path"
@@ -3194,6 +3793,14 @@ class SimulatorPowerEngine:
     ) -> tuple[float, str]:
         """Return only independently sourced HBM energy for an exact anchor."""
 
+        if observation.moe_workload is not None:
+            _require_moe_power_event_receipt(
+                ledger=observation.moe_power_event_ledger,
+                input_binding=observation.moe_power_event_input_binding,
+                receipt=observation.moe_power_event_receipt,
+                calibration_id=self.status.calibration_id,
+                calibration_sha256=self.status.source_sha256,
+            )
         if not self.status.passed:
             raise ValueError("HBM energy requires a passing power artifact")
         generated_tokens = (
@@ -3222,6 +3829,14 @@ class SimulatorPowerEngine:
 
         from power.model import EventCount, estimate_power
 
+        if observation.moe_workload is not None:
+            _require_moe_power_event_receipt(
+                ledger=observation.moe_power_event_ledger,
+                input_binding=observation.moe_power_event_input_binding,
+                receipt=observation.moe_power_event_receipt,
+                calibration_id=self.status.calibration_id,
+                calibration_sha256=self.status.source_sha256,
+            )
         area_config = {
             **self.area_config,
             "MLEN": candidate.mlen,
@@ -3287,10 +3902,14 @@ class ProductionHardwareEvaluator:
         power_engine: PowerEngine | None = None,
         dc_anchor_index: ExactDCAnchorIndex | None = None,
         head_service_status: BF16HeadServiceStatus | None = None,
+        head_service_resource_status: (
+            BF16HeadEndpointResourceStatus | None
+        ) = None,
         admission_correctness_status: AdmissionCorrectnessStatus | None = None,
         handoff_artifact: PrefillHandoffArtifact | None = None,
         resource_budget: ResourceBudget = ResourceBudget(),
         publication_timing_tier: str = COMPILER_TRACE_TIMING_TIER,
+        study_config_sha256: str | None = None,
     ) -> None:
         self.backend = backend
         self.workload = workload
@@ -3330,6 +3949,19 @@ class ProductionHardwareEvaluator:
             if (
                 self.head_service_status is not None
                 and self.head_service_status.passed
+            )
+            else None
+        )
+        self.head_service_resource_status = (
+            head_service_resource_status
+            if head_service_resource_status is not None
+            else getattr(backend, "head_service_resource_status", None)
+        )
+        self.head_service_resource_receipt = (
+            self.head_service_resource_status.receipt
+            if (
+                self.head_service_resource_status is not None
+                and self.head_service_resource_status.passed
             )
             else None
         )
@@ -3374,7 +4006,35 @@ class ProductionHardwareEvaluator:
                 "backend and head-service artifact boundaries differ"
             )
         self.output_head_location = backend_location
-        self.local_output_head = backend_location == DECODE_BF16_HEAD
+        self.local_output_head = backend_location in {
+            DECODE_BF16_HEAD,
+            DECODE_MX_HEAD,
+        }
+        self.priced_local_output_head = backend_location == DECODE_MX_HEAD
+        simulator = getattr(backend, "sim", None)
+        dimensions = getattr(simulator, "dims", None)
+        is_routed_moe = (
+            isinstance(dimensions, Mapping)
+            and int(dimensions.get("num_experts", 1)) > 1
+        )
+        power_source_sha256 = (
+            getattr(getattr(power_engine, "status", None), "source_sha256", None)
+            if power_engine is not None
+            else None
+        )
+        self.moe_power_event_input_binding = None
+        if (
+            is_routed_moe
+            and study_config_sha256 is not None
+            and power_source_sha256 is not None
+        ):
+            self.moe_power_event_input_binding = (
+                build_moe_power_event_input_binding(
+                    config_sha256=study_config_sha256,
+                    workload=workload.to_dict(),
+                    power_calibration_sha256=power_source_sha256,
+                )
+            )
         # A head-service artifact supplied alongside the decode-local headline
         # is retained as the recorded comparison arm, never as a priced cost.
         self.head_service_comparison_only = (
@@ -3382,14 +4042,17 @@ class ProductionHardwareEvaluator:
             and self.head_service_calibration is not None
         )
         if self.local_output_head:
-            self.output_head_status = local_head_boundary_status()
-            if self.head_service_status is not None:
-                # Keep the measured remote evidence addressable beside the
-                # local headline so both placements can be reported together.
-                self.output_head_status = {
-                    **self.output_head_status,
-                    "comparison_status": self.head_service_status.to_dict(),
+            self.output_head_status = (
+                {
+                    "schema_version": "decode-local-mx-output-head/v2",
+                    "passed": False,
+                    "failures": ["profile_binding_resolved_per_row"],
+                    "service_mode": OUTPUT_HEAD_SERVICE_MODES[DECODE_MX_HEAD],
+                    "service_location": "decode_chip",
                 }
+                if self.priced_local_output_head
+                else local_head_boundary_status()
+            )
         else:
             self.output_head_status = (
                 self.head_service_status.to_dict()
@@ -3427,6 +4090,21 @@ class ProductionHardwareEvaluator:
             "traffic_unit": TRAFFIC_UNIT,
             "output_head_location": self.output_head_location,
             "head_service_status": dict(self.output_head_status),
+            "optional_head_service_comparison_status": (
+                self.head_service_status.to_dict()
+                if self.local_output_head
+                and self.head_service_status is not None
+                else None
+            ),
+            "head_service_resource_status": (
+                self.head_service_resource_status.to_dict()
+                if self.head_service_resource_status is not None
+                else {
+                    "schema_version": HEAD_RESOURCE_SCHEMA,
+                    "passed": False,
+                    "failures": ["missing_head_service_resource_receipt"],
+                }
+            ),
             # The named scope limits of the priced boundary travel with the
             # evaluator identity, so a study cannot be re-read without them.
             "output_head_idealizations": list(
@@ -3440,6 +4118,7 @@ class ProductionHardwareEvaluator:
                 if handoff_artifact is not None
                 else None
             ),
+            "moe_power_event_inputs": self.moe_power_event_input_binding,
         }
         self.provenance = payload
         self.evaluator_id = (
@@ -3529,6 +4208,13 @@ class ProductionHardwareEvaluator:
         dimensions = getattr(simulator, "dims", None)
         if not isinstance(dimensions, Mapping):
             raise TypeError("area preflight requires simulator dimensions")
+        if int(dimensions.get("num_experts", 1)) > 1:
+            # Preflight has no route/body observation and therefore cannot
+            # construct or authenticate the exact routed-event receipt.  Never
+            # substitute the old dense-FFN proxy for a MoE area/power query.
+            raise ValueError(
+                "routed-MoE calibrated area requires an exact power-event receipt"
+            )
         shape = DenseDecoderShape.from_mapping(dimensions)
         return count_decode_events(
             shape,
@@ -3537,6 +4223,7 @@ class ProductionHardwareEvaluator:
             batch=candidate.batch,
             mlen=candidate.mlen,
             blen=candidate.blen,
+            vlen=candidate.vlen,
             hlen=candidate.hlen,
             linear_signature=(
                 f"LINEAR:{_simulator_token(profile.weight_format)}"
@@ -3552,8 +4239,22 @@ class ProductionHardwareEvaluator:
             ),
             vector_signature=f"VECTOR:{profile.vector_format}",
             stride=self.workload.stride,
+            include_local_output_head_padding=(
+                self.output_head_location == DECODE_MX_HEAD
+            ),
+            tp=candidate.tp,
+            kvp=candidate.kvp,
             include_output_head=(
-                self.output_head_location == DECODE_BF16_HEAD
+                self.output_head_location
+                in {DECODE_BF16_HEAD, DECODE_MX_HEAD}
+            ),
+            lm_head_signature=(
+                (
+                    f"LINEAR:{_simulator_token(profile.weight_format)}"
+                    f"x{_simulator_token(profile.activation_format)}"
+                )
+                if self.output_head_location == DECODE_MX_HEAD
+                else "UNMODELED:LM_HEAD_BF16"
             ),
         )
 
@@ -3748,6 +4449,24 @@ class ProductionHardwareEvaluator:
                 candidate,
                 self.workload,
             )
+            if (
+                observation.moe_workload is not None
+                and self.moe_power_event_input_binding is not None
+            ):
+                if (
+                    observation.moe_power_event_input_binding is not None
+                    and observation.moe_power_event_input_binding
+                    != self.moe_power_event_input_binding
+                ):
+                    raise ValueError(
+                        "simulator and evaluator MoE power input bindings differ"
+                    )
+                observation = replace(
+                    observation,
+                    moe_power_event_input_binding=(
+                        self.moe_power_event_input_binding
+                    ),
+                )
             if observation.profile_id != entry.profile_id:
                 raise ValueError("simulator profile identity mismatch")
             if observation.candidate_id != candidate.candidate_id:
@@ -3806,6 +4525,21 @@ class ProductionHardwareEvaluator:
                 head_estimate = self.head_service_calibration.estimate(
                     candidate.batch
                 )
+                if self.head_service_resource_receipt is not None:
+                    resources = self.head_service_resource_receipt
+                    head_estimate = replace(
+                        head_estimate,
+                        request_latency_s=(
+                            resources.deployment_request_fixed_latency_s
+                            + head_estimate.request_bytes
+                            / resources.deployment_request_bandwidth_bytes_s
+                        ),
+                        response_latency_s=(
+                            resources.deployment_response_fixed_latency_s
+                            + head_estimate.response_bytes
+                            / resources.deployment_response_bandwidth_bytes_s
+                        ),
+                    )
             except Exception as exc:
                 head_estimate_error = f"{type(exc).__name__}: {exc}"
         resolved_timing_tier: str | None = None
@@ -3823,18 +4557,118 @@ class ProductionHardwareEvaluator:
             and observation.bandwidth_calibration_id is not None
         ):
             resolved_timing_tier = STAGE_CALIBRATED_ANALYTIC_TIMING_TIER
-        local_head = observation.output_head_location == DECODE_BF16_HEAD
+        legacy_local_head = (
+            observation.output_head_location == DECODE_BF16_HEAD
+        )
+        local_mx_head = observation.output_head_location == DECODE_MX_HEAD
+        local_head = legacy_local_head or local_mx_head
+        if local_mx_head:
+            row_head_status = local_mx_head_boundary_status(
+                profile_id=entry.profile_id,
+                weight_format=entry.profile.weight_format,
+                activation_format=entry.profile.activation_format,
+                vector_format=entry.profile.vector_format,
+                matrix_mlen=entry.profile.matrix_mlen,
+            )
+            local_head_cost_valid = (
+                local_mx_head_status_valid(
+                    row_head_status,
+                    profile_id=entry.profile_id,
+                    weight_format=entry.profile.weight_format,
+                    activation_format=entry.profile.activation_format,
+                    vector_format=entry.profile.vector_format,
+                    matrix_mlen=entry.profile.matrix_mlen,
+                )
+                and isinstance(observation.local_output_head, Mapping)
+                and local_mx_head_breakdown_valid(
+                    observation.local_output_head,
+                    profile_id=entry.profile_id,
+                    weight_format=entry.profile.weight_format,
+                    activation_format=entry.profile.activation_format,
+                    vector_format=entry.profile.vector_format,
+                    matrix_mlen=entry.profile.matrix_mlen,
+                )
+            )
+        else:
+            row_head_status = self.output_head_status
+            local_head_cost_valid = False
+        moe_provenance = observation.moe_workload
+        moe_provenance_detail = (
+            moe_provenance.get("provenance", {})
+            if isinstance(moe_provenance, Mapping)
+            else {}
+        )
+        moe_publication_rankable = (
+            moe_provenance is None
+            or (
+                isinstance(moe_provenance_detail, Mapping)
+                and moe_provenance_detail.get("publication_rankable") is True
+            )
+        )
+        body_layout = observation.body_physical_layout
+        body_layout_provenance = (
+            body_layout.get("provenance", {})
+            if isinstance(body_layout, Mapping)
+            else {}
+        )
+        body_publication_rankable = (
+            moe_provenance is None
+            or (
+                isinstance(body_layout_provenance, Mapping)
+                and body_layout_provenance.get("publication_rankable") is True
+                and body_layout_provenance.get("selection_eligible") is True
+                and body_layout_provenance.get("compiler_layout_valid") is True
+                and body_layout_provenance.get("rtl_layout_valid") is True
+            )
+        )
+        moe_power_event_rankable = moe_provenance is None
+        moe_power_event_error = None
+        if moe_provenance is not None:
+            if self.power_engine is None:
+                moe_power_event_error = (
+                    "routed-MoE calibrated power is unavailable: "
+                    "moe_power_calibration_receipt_unavailable,"
+                    + MOE_POWER_EVENT_BLOCKER
+                )
+            else:
+                try:
+                    _require_moe_power_event_receipt(
+                        ledger=observation.moe_power_event_ledger,
+                        input_binding=(
+                            observation.moe_power_event_input_binding
+                        ),
+                        receipt=observation.moe_power_event_receipt,
+                        calibration_id=(
+                            self.power_engine.status.calibration_id
+                        ),
+                        calibration_sha256=(
+                            self.power_engine.status.source_sha256
+                        ),
+                    )
+                    moe_power_event_rankable = True
+                except Exception as exc:
+                    moe_power_event_error = str(exc)
         # A head-service artifact carried alongside the local headline prices
         # nothing; it is recorded so both placements can be reported together.
         priced_head_estimate = None if local_head else head_estimate
         comparison_head_estimate = head_estimate if local_head else None
+        output_head_rankable = (
+            local_mx_head and local_head_cost_valid
+        ) or (
+            not local_head
+            and priced_head_estimate is not None
+            and self.head_service_resource_receipt is not None
+        )
         whole_rankable = (
-            (local_head or priced_head_estimate is not None)
+            output_head_rankable
             and observation.output_head_location == self.output_head_location
             and observation.runtime_feasible
             and observation.timing_calibrated
             and resolved_timing_tier is not None
             and self.admission_correctness_valid
+            and moe_publication_rankable
+            and body_publication_rankable
+            and moe_power_event_rankable
         )
         # The decode-local head runs inside the decode step this TPOT already
         # prices - its weights and per-step traffic are on the decode chip's
@@ -3861,6 +4695,23 @@ class ProductionHardwareEvaluator:
         elif not observation.timing_calibrated:
             error_code = "timing_uncalibrated"
             error_message = observation.timing_reason
+        elif not moe_power_event_rankable:
+            error_code = "moe_power_event_unrankable"
+            error_message = moe_power_event_error or MOE_POWER_EVENT_BLOCKER
+        elif not moe_publication_rankable:
+            error_code = "moe_provenance_unrankable"
+            error_message = str(
+                moe_provenance_detail.get(
+                    "unrankable_reason",
+                    "routed-MoE publication evidence is incomplete",
+                )
+            )
+        elif not body_publication_rankable:
+            error_code = "body_physical_layout_unrankable"
+            error_message = ",".join(
+                str(item)
+                for item in body_layout_provenance.get("blockers", [])
+            ) or "rank-local body layout lacks compiler/RTL provenance"
         elif (
             observation.execution_mode == LEGACY_AGGREGATE_BANDWIDTH_MODE
             and resolved_timing_tier is None
@@ -3879,18 +4730,32 @@ class ProductionHardwareEvaluator:
                 "PackedKV selector capability failed: "
                 + ",".join(observation.packedkv_selector_blocking_issue_codes)
             )
+        elif local_mx_head and not local_head_cost_valid:
+            error_code = "local_output_head_contract_invalid"
+            failures = row_head_status.get("failures", [])
+            error_message = ",".join(str(item) for item in failures) or (
+                "profile-bound local-head cost breakdown is invalid"
+            )
         elif head_estimate_error is not None and not local_head:
             error_code = "head_service_evaluation_failed"
             error_message = head_estimate_error
         elif priced_head_estimate is None and not local_head:
             # Only the external boundary depends on a measured remote endpoint.
-            # The decode-local head is rankable on the decode chip's own
-            # ledger, with its compute idealization disclosed on the row.
+            # The canonical decode-local arm is priced in the decode step; this
+            # branch applies only to the optional external-head comparison.
             error_code = "output_head_unmodeled"
             error_message = (
                 "UNMODELED:LM_HEAD_BF16; a passing remote BF16 "
                 "head-service artifact is required"
             )
+        elif self.head_service_resource_receipt is None and not local_head:
+            error_code = "head_service_resource_boundary_unverified"
+            failures = (
+                self.head_service_resource_status.failures
+                if self.head_service_resource_status is not None
+                else ("missing_head_service_resource_receipt",)
+            )
+            error_message = ",".join(failures)
         elif not self.admission_correctness_valid:
             error_code = "admission_correctness_unverified"
             error_message = ",".join(
@@ -3929,6 +4794,9 @@ class ProductionHardwareEvaluator:
                             priced_head_estimate,
                             decoder_tpot_ms=observation.tpot_ms,
                             batch=candidate.batch,
+                            head_resource_receipt=(
+                                self.head_service_resource_receipt
+                            ),
                         )
                     )
             except Exception as exc:
@@ -3987,6 +4855,9 @@ class ProductionHardwareEvaluator:
                             priced_head_estimate,
                             decoder_tpot_ms=observation.tpot_ms,
                             batch=candidate.batch,
+                            head_resource_receipt=(
+                                self.head_service_resource_receipt
+                            ),
                         )
                     )
             except Exception as exc:
@@ -4013,6 +4884,9 @@ class ProductionHardwareEvaluator:
                             priced_head_estimate,
                             decoder_tpot_ms=observation.tpot_ms,
                             batch=candidate.batch,
+                            head_resource_receipt=(
+                                self.head_service_resource_receipt
+                            ),
                         )
                     )
                 dc_valid = None
@@ -4038,10 +4912,26 @@ class ProductionHardwareEvaluator:
         system_area = (
             area * candidate.chip_count + max(0.0, analytic_link_area)
         )
+        endpoint_area = 0.0
+        endpoint_hbm_capacity = 0
+        endpoint_hbm_bandwidth = 0.0
+        if self.head_service_resource_receipt is not None and not local_head:
+            endpoint_area = (
+                self.head_service_resource_receipt
+                .endpoint_aggregate_compute_silicon_area_mm2
+            )
+            endpoint_hbm_capacity = (
+                self.head_service_resource_receipt.endpoint_hbm_capacity_bytes
+            )
+            endpoint_hbm_bandwidth = (
+                self.head_service_resource_receipt
+                .endpoint_hbm_bandwidth_bytes_per_s
+            )
+            system_area += endpoint_area
         resource_status = ResourceBudgetStatus(
             aggregate_area_mm2=system_area,
             aggregate_hbm_capacity_bytes=(
-                observation.capacity.available_bytes
+                observation.capacity.available_bytes + endpoint_hbm_capacity
             ),
             aggregate_hbm_bandwidth_bytes_per_s=(
                 hbm_peak_bandwidth_bytes_per_s(
@@ -4049,6 +4939,7 @@ class ProductionHardwareEvaluator:
                     candidate.hbm_channels,
                 )
                 * candidate.chip_count
+                + endpoint_hbm_bandwidth
             ),
             aggregate_multiplier_count=(
                 candidate.mlen
@@ -4207,7 +5098,19 @@ class ProductionHardwareEvaluator:
             output_head_idealizations=OUTPUT_HEAD_IDEALIZATIONS[
                 self.output_head_location
             ],
-            output_head_status=self.output_head_status,
+            output_head_status=row_head_status,
+            output_head_resource_status=(
+                self.head_service_resource_status.to_dict()
+                if self.head_service_resource_status is not None
+                else {
+                    "schema_version": HEAD_RESOURCE_SCHEMA,
+                    "passed": False,
+                    "failures": ["missing_head_service_resource_receipt"],
+                }
+            ),
+            output_head_cost_breakdown=(
+                observation.local_output_head or {}
+            ),
             output_head_service=priced_head_estimate,
             output_head_comparison=comparison_head_estimate,
             whole_model_tpot_ms=whole_tpot_ms,
@@ -4236,6 +5139,13 @@ class ProductionHardwareEvaluator:
                 observation.capacity_throughput_chain
             ),
             handoff_analysis=handoff_analysis,
+            moe_workload=observation.moe_workload,
+            body_physical_layout=observation.body_physical_layout,
+            moe_power_event_ledger=observation.moe_power_event_ledger,
+            moe_power_event_input_binding=(
+                observation.moe_power_event_input_binding
+            ),
+            moe_power_event_receipt=observation.moe_power_event_receipt,
         )
         return HardwareEvaluation(
             metrics=metrics,
@@ -4252,12 +5162,40 @@ def _load_json_object(path: str | os.PathLike[str]) -> dict[str, Any]:
     return dict(value)
 
 
-#: The declared output-head contract.  The headline is the decode-local BF16
-#: head: its weights and per-decode-step traffic are charged to the decode
-#: chip and only its compute is idealized, which the contract names outright.
-#: The measured remote service remains the comparison arm so both placements
-#: can be reported side by side with their evidence tiers.
+#: Canonical decode-only publication boundary.  Every profile pays for its
+#: untied local projection, bounded selection state, TP merge, and output-head
+#: traffic inside the decoder subsystem.  A measured external BF16 service is
+#: a non-blocking sensitivity, not a prerequisite for the headline.
 OUTPUT_HEAD_CONTRACT: Mapping[str, Any] = {
+    "headline_location": DECODE_MX_HEAD,
+    "headline_precision": "profile_w_a_bf16_logits",
+    "headline_idealizations": list(
+        OUTPUT_HEAD_IDEALIZATIONS[DECODE_MX_HEAD]
+    ),
+    "profile_binding": "weight_activation_and_vector_format",
+    "logit_container_format": "BF16",
+    "bf16_container_precision_recovery": False,
+    "serving_selection": "streaming_topk20_topp0.95_minp0",
+    "diagnostic_selection": "argmax_lowest_token_id_on_tie",
+    "comparison_location": EXTERNAL_BF16_HEAD,
+    "comparison_evidence": "optional_measured_sensitivity",
+}
+
+EXTERNAL_BF16_OUTPUT_HEAD_CONTRACT: Mapping[str, Any] = {
+    "headline_location": EXTERNAL_BF16_HEAD,
+    "headline_precision": "BF16",
+    "headline_idealizations": list(
+        OUTPUT_HEAD_IDEALIZATIONS[EXTERNAL_BF16_HEAD]
+    ),
+    "comparison_location": DECODE_BF16_HEAD,
+    "comparison_evidence": "analytic_only_unrankable",
+    "local_low_precision": "accuracy_only",
+}
+
+#: Retained compatibility contract for older analytic-study configurations.
+#: It may drive decoder-stack sensitivity rows, but those rows cannot acquire
+#: whole-model publication metrics or enter selection.
+LOCAL_ANALYTIC_OUTPUT_HEAD_CONTRACT: Mapping[str, Any] = {
     "headline_location": DECODE_BF16_HEAD,
     "headline_precision": "BF16",
     "headline_idealizations": list(
@@ -4274,7 +5212,7 @@ def config_output_head_location(config: Mapping[str, Any]) -> str:
 
     output_head = config.get("output_head_contract")
     if not isinstance(output_head, Mapping):
-        return DECODE_BF16_HEAD
+        return DECODE_MX_HEAD
     location = output_head.get("headline_location")
     if location not in OUTPUT_HEAD_LOCATIONS:
         raise ValueError("output_head_contract headline location is unsupported")
@@ -4284,8 +5222,58 @@ def config_output_head_location(config: Mapping[str, Any]) -> str:
 def _validate_system_boundary_config(config: Mapping[str, Any]) -> None:
     output_head = config.get("output_head_contract")
     if output_head is not None:
-        if output_head != dict(OUTPUT_HEAD_CONTRACT):
+        if output_head not in (
+            dict(OUTPUT_HEAD_CONTRACT),
+            dict(EXTERNAL_BF16_OUTPUT_HEAD_CONTRACT),
+            dict(LOCAL_ANALYTIC_OUTPUT_HEAD_CONTRACT),
+        ):
             raise ValueError("output_head_contract differs from the evaluator")
+    architecture = config.get("model_architecture")
+    if (
+        isinstance(architecture, Mapping)
+        and architecture.get("model_type") == "qwen3_moe"
+    ):
+        expected_census = qwen3_moe_bf16_parameter_census(architecture)
+        if config.get("parameter_census") != expected_census:
+            raise ValueError(
+                "parameter_census differs from the exact Qwen3-MoE "
+                "architecture-derived BF16 residency"
+            )
+        search = config.get("search")
+        if (
+            not isinstance(search, Mapping)
+            or search.get("numerical_foundation_mlen")
+            != FOUNDATION_MATRIX_MLEN
+        ):
+            raise ValueError(
+                "search.numerical_foundation_mlen differs from the "
+                "profile precision foundation"
+            )
+        expected_resource_boundary = {
+            "schema_version": "decode-local-head-resource-boundary/v1",
+            "budget_scope": "steady_state_decode_subsystem",
+            "reference_envelope": "A100x4",
+            "reference_envelope_role": (
+                "frozen_equal_resource_comparability_screen_not_gpu_baseline"
+            ),
+            "local_head_resources": (
+                "included_weights_scales_hbm_traffic_matrix_vector_"
+                "selection_collective_area_power_energy"
+            ),
+            "local_head_additional_compute_area": (
+                "zero_existing_matrix_vector_units"
+            ),
+            "prefill_scope": (
+                "separate_disaggregated_handoff_queue_sensitivity"
+            ),
+            "external_head_service": "optional_nonblocking_sensitivity",
+            "allow_empty_frontier": True,
+        }
+        if config.get("system_resource_boundary") != expected_resource_boundary:
+            raise ValueError(
+                "system_resource_boundary differs from the fixed equal-resource "
+                "contract"
+            )
     hbm = config.get("hbm_sensitivity")
     if hbm is not None:
         expected_hbm = {
@@ -4438,6 +5426,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--exact-dc-anchors")
     parser.add_argument("--rtl-source-tree-sha256")
     parser.add_argument("--head-service-calibration")
+    parser.add_argument("--head-service-resource-receipt")
     parser.add_argument("--admission-receipt", required=True)
     parser.add_argument(
         "--handoff-artifact",
@@ -4467,6 +5456,15 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--isa-path")
     parser.add_argument("--output", required=True)
     parser.add_argument("--code-revision", action="append", default=[])
+    parser.add_argument(
+        "--profile-id",
+        action="append",
+        default=[],
+        help=(
+            "validated source profile to price; repeat for an exact subset. "
+            "Source numerical rows are verified before filtering"
+        ),
+    )
     parser.add_argument("--allow-incomplete", action="store_true")
     parser.add_argument("--parallel-workers", type=int, default=1)
     return parser
@@ -4524,11 +5522,13 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
             args.refinement_schedule is None
             or args.refinement_merge is None
             or args.numerical_jsonl
+            or getattr(args, "profile_id", ())
             or args.allow_incomplete
         ):
             raise ValueError(
                 "refined hardware repricing requires schedule and merge, "
-                "and forbids base numerical inputs or incomplete coverage"
+                "and forbids base numerical inputs, profile filters, or "
+                "incomplete coverage"
             )
     elif not args.numerical_jsonl:
         raise ValueError(
@@ -4581,9 +5581,8 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
     else:
         output_head_location = config_output_head_location(config)
     args.output_head_location = output_head_location
-    # The measured remote service is required only when it prices the head.
-    # Beside the decode-local headline the same artifact is still accepted and
-    # recorded, so the two placements stay comparable within one run.
+    # The measured remote service is required whenever it prices the head. The
+    # same artifact may be recorded beside a local analytic sensitivity.
     if (
         output_head_location == EXTERNAL_BF16_HEAD
         and not args.head_service_calibration
@@ -4591,6 +5590,14 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
         raise ValueError(
             "the external output-head boundary requires "
             "--head-service-calibration"
+        )
+    if (
+        output_head_location == EXTERNAL_BF16_HEAD
+        and not args.head_service_resource_receipt
+    ):
+        raise ValueError(
+            "the external output-head boundary requires "
+            "--head-service-resource-receipt"
         )
     if config.get("model_name") != base_manifest.model_name:
         raise ValueError("config and manifest model names differ")
@@ -4652,6 +5659,11 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
             workspace_manifest=workspace_manifest,
             numerical_paths=args.numerical_jsonl,
         )
+        manifest, rows = _filter_profile_inputs(
+            manifest,
+            rows,
+            getattr(args, "profile_id", ()),
+        )
     reference = config.get("reference_workload")
     if not isinstance(reference, Mapping):
         raise ValueError("config is missing reference_workload")
@@ -4687,10 +5699,16 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
         compiler_trace_artifacts=args.compiler_trace_artifacts,
         request_memory_calibration=args.request_memory_calibration,
         head_service_artifact=args.head_service_calibration,
+        head_service_resource_receipt=args.head_service_resource_receipt,
         output_head_location=args.output_head_location,
         model_name=manifest.model_name,
         model_revision=manifest.model_revision,
         required_batches=space.batch,
+        prefill_model_excluding_head_bytes=int(
+            config["parameter_census"][
+                "prefill_model_excluding_lm_head_bf16_bytes"
+            ]
+        ),
     )
     if backend.output_head_location != args.output_head_location:
         failures = (
@@ -4746,10 +5764,12 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
         power_engine=power_engine,
         dc_anchor_index=dc_anchor_index,
         head_service_status=backend.head_service_status,
+        head_service_resource_status=backend.head_service_resource_status,
         admission_correctness_status=admission_status,
         handoff_artifact=handoff_artifact,
         resource_budget=space.resource_budget,
         publication_timing_tier=args.publication_timing_tier,
+        study_config_sha256=_file_sha256(args.config),
     )
     return ExactHardwareStudy(
         manifest=manifest,
@@ -4765,6 +5785,26 @@ def _construct_study(args: argparse.Namespace) -> ExactHardwareStudy:
             None if refinement_mode else _relative_perplexity_limit(config)
         ),
     )
+
+
+def construct_study_from_argv(argv: Sequence[str]) -> ExactHardwareStudy:
+    """Reconstruct a validated study for read-only producer replay.
+
+    The matched-geometry producer must replay the exact evaluator, but it must
+    never broaden the source study by accepting incomplete numerical coverage
+    or a caller-selected profile subset.  ``--output`` is parsed because it is
+    part of the normal launch contract; this helper only constructs the study
+    and never writes that path.
+    """
+
+    args = _parser().parse_args(list(argv))
+    if args.allow_incomplete or args.profile_id:
+        raise ValueError(
+            "producer replay forbids incomplete coverage and profile filters"
+        )
+    if args.parallel_workers != 1:
+        raise ValueError("producer replay requires one deterministic worker")
+    return _construct_study(args)
 
 
 _PARALLEL_WORKER_STUDY: ExactHardwareStudy | None = None
@@ -4869,6 +5909,7 @@ __all__ = [
     "SimulatorObservation",
     "SimulatorPowerEngine",
     "capacity_from_metrics",
+    "construct_study_from_argv",
     "load_terminal_numerical_rows",
     "main",
     "physical_traffic_from_metrics",
