@@ -103,7 +103,143 @@ from decode_dse.software.sweep_plan import (
 from decode_dse.software.sweep_runner import (
     EvaluationOutcome,
     ExhaustiveSweepRunner,
+    ResultShardStore,
 )
+
+
+def _measured_head_boundary(batch: int = 1) -> dict[str, object]:
+    """Serialized passing external-head boundary for publication fixtures."""
+
+    calibration_id = "bf16-head-service-" + "c" * 64
+    provenance_id = "bf16-head-provenance-" + "d" * 64
+    resource_status = {
+        "schema_version": "bf16-output-head-endpoint-resources/v1",
+        "artifact_sha256": "e" * 64,
+        "content_hash": "f" * 64,
+        "receipt_id": "bf16-head-endpoint-resources-" + "1" * 64,
+        "passed": True,
+        "failures": [],
+        "head_service_artifact_sha256": "a" * 64,
+        "head_service_calibration_id": calibration_id,
+        "head_service_provenance_id": provenance_id,
+        "service_mode": "remote_bf16_head_dedicated",
+        "service_location": "prefill_chip",
+        "deployment_scope": "prefill_endpoint_with_bf16_head_service_fully_accounted",
+        "service_instances": 1,
+        "endpoint_instances": 1,
+        "endpoint_resources_included_once": True,
+        "endpoint_shared_with_decoder": False,
+        "endpoint_shared_with_prefill": True,
+        "decoder_resources_included": False,
+        "prefill_resources_included": True,
+        "measurement_driver_role": "instrumentation_only_not_deployed",
+        "measurement_driver_resources_included": False,
+        "endpoint": {
+            "device_name": "Synthetic Accelerator",
+            "device_uuid": "GPU-SYNTHETIC",
+            "aggregate_compute_silicon_area_mm2": 100.0,
+            "compute_die_count": 2,
+            "hbm_capacity_bytes": 1_000_000,
+            "hbm_bandwidth_bytes_per_s": 1_000_000_000.0,
+            "prefill_resident_bytes": 100_000,
+            "head_resident_bytes": 100_000,
+            "runtime_reserve_bytes": 100_000,
+            "resident_total_bytes": 300_000,
+            "area_comparison_basis": "aggregate_physical_compute_silicon_area_mm2_unscaled_excludes_hbm",
+            "hbm_capacity_basis": "installed_endpoint_capacity_bytes",
+            "hbm_bandwidth_basis": "vendor_peak_theoretical_bytes_per_s",
+        },
+        "composed_link_energy": {
+            "decoder_interface_energy_j_per_byte": 1e-12,
+            "decoder_interface_energy_scope": "decoder_request_response_interface_only_excludes_endpoint",
+            "endpoint_interface_energy_scope": "endpoint_receive_transmit_incremental_only",
+            "measurement_driver_dynamic_included": False,
+            "complete": True,
+        },
+        "deployment_link_timing": {
+            "request_bandwidth_bytes_s": 1e9,
+            "response_bandwidth_bytes_s": 1e9,
+            "link_peak_bandwidth_bytes_s": 1e9,
+            "request_fixed_latency_s": 1e-6,
+            "response_fixed_latency_s": 1e-6,
+            "scope": "plena_decoder_to_prefill_endpoint_bound_interface",
+            "measurement_driver_timing_used": False,
+            "complete": True,
+        },
+        "model_residency": {
+            "precision": "BF16",
+            "prefill_model_excluding_lm_head_bytes": 100_000,
+            "lm_head_bytes": 100_000,
+            "untied_lm_head_counted_once": True,
+        },
+        "evidence": {
+            "input_artifact_sha256": "2" * 64,
+            "specification_artifact_sha256": "3" * 64,
+            "source": {
+                "publisher": "Synthetic vendor",
+                "title": "Synthetic specification",
+                "revision": "1",
+                "locator": "retained://synthetic",
+                "retrieved_at_utc": "2026-08-20T00:00:00Z",
+                "area_basis_statement": "two compute dies, aggregate compute silicon, HBM excluded",
+                "deployment_link_basis_statement": "bound decoder-to-endpoint interface timing and energy",
+            },
+        },
+    }
+    return {
+        "location": "external_bf16_service",
+        "service_mode": "remote_bf16_head_dedicated",
+        "scope_idealizations": [],
+        "status": {
+            "schema_version": "bf16-output-head-service",
+            "artifact_sha256": "a" * 64,
+            "head_weight_sha256": "b" * 64,
+            "cost_scope": {
+                "dynamic_energy": "endpoint_only",
+                "leakage": "endpoint_only",
+                "link_dynamic_energy": "endpoint_receive_transmit_incremental_only",
+                "measurement_link_timing": "instrumentation_driver_to_endpoint_not_deployment",
+                "measurement_driver_dynamic_included": False,
+                "measurement_driver_leakage_included": False,
+            },
+            "passed": True,
+            "failures": [],
+            "calibration_id": calibration_id,
+            "provenance_id": provenance_id,
+            "service_mode": "remote_bf16_head_dedicated",
+            "service_location": "prefill_chip",
+            "required_batches": [1, 4, 8],
+            "numerical_policy": {
+                "mac_input_dtype": "BF16",
+                "accumulator_dtype": "FP32",
+                "logit_dtype": "BF16",
+                "selection_policy": "argmax_lowest_token_id_on_tie",
+                "validation_topk": 10,
+                "logit_max_abs_error_limit": 0.25,
+                "logit_mean_abs_error_limit": 0.02,
+                "topk_set_agreement_min": 0.9,
+            },
+            "numerical_validation": {
+                "measurement_count": 12,
+                "numerical_sample_count": 12,
+                "holdout_count": 3,
+                "selected_token_exact_match_count": 12,
+                "sampled_logit_max_abs_error": 0.0,
+                "sampled_logit_mean_abs_error_max": 0.0,
+                "sampled_topk_set_agreement_min": 1.0,
+            },
+        },
+        "estimate": {
+            "calibration_id": calibration_id,
+            "provenance_id": provenance_id,
+            "service_mode": "remote_bf16_head_dedicated",
+            "service_location": "prefill_chip",
+            "batch": batch,
+        },
+        "resource_status": resource_status,
+        "comparison_estimate": None,
+    }
+
 
 REPOSITORY = Path(__file__).resolve().parents[2]
 CONFIG_PATH = REPOSITORY / "decode_dse/configs/qwen3_32b.json"
@@ -601,6 +737,45 @@ def test_runner_reports_first_completion_continuous_eta_failure_and_resume(
     assert resumed.succeeded == 2
     assert resumed_executor.evaluations == 0
     assert any("event=resume" in line for line in resumed_messages)
+
+
+def test_runner_installs_exact_precomputed_rows_before_opening_weight_bank(
+    tmp_path: Path,
+) -> None:
+    manifest = _small_manifest()
+    clock = _Clock()
+    executor = _Executor(clock)
+    outcomes = {
+        entry.profile_id: EvaluationOutcome(
+            metrics={
+                "mean_token_nll": float(index + 1),
+                "evaluation_reuse": {"source": "sealed-pilot"},
+            }
+        )
+        for index, entry in enumerate(manifest.entries)
+    }
+    summary = ExhaustiveSweepRunner(
+        manifest=manifest,
+        output_dir=tmp_path,
+        executor=executor,
+        stage="numerical-screen",
+        clock=clock,
+        emit_progress=lambda message: None,
+        precomputed_outcomes=outcomes,
+    ).run()
+
+    assert summary.succeeded == len(manifest.entries)
+    assert summary.pending == 0
+    assert executor.evaluations == 0
+    assert clock.value == 0.0
+    records = ResultShardStore(tmp_path, manifest).records
+    assert len(records) == len(manifest.entries)
+    assert all(pointer.record["runtime_seconds"] == 0.0 for pointer in records)
+    assert all(
+        pointer.record["result"]["evaluation_reuse"]["source"]
+        == "sealed-pilot"
+        for pointer in records
+    )
 
 
 def test_runner_counts_terminal_failure(tmp_path: Path) -> None:
@@ -1654,8 +1829,10 @@ def test_refinement_hardware_points_preserve_energy_identity_and_tier() -> None:
                 "timing_calibrated": True,
                 "runtime_feasible": True,
                 "capacity": {"feasible": True},
-                "whole_model": {
-                    "rankable": True,
+                "resource_budget": {"feasible": True},
+                    "whole_model": {
+                        "rankable": True,
+                        "strict_system_resource_boundary_valid": True,
                     "publication_timing_tier": "stage_calibrated_analytic",
                     "tpot_ms": 10.0,
                     "tps": 100.0,
@@ -1667,9 +1844,8 @@ def test_refinement_hardware_points_preserve_energy_identity_and_tier() -> None:
                         "total_j": total_j,
                     },
                 },
-                "output_head_boundary": {
-                    "estimate": {"calibration_id": "head-calibration"}
-                },
+                "output_head_boundary": _measured_head_boundary(),
+                "generated_tokens_per_step": 1,
             },
         }
         return _hardware_point(row, profile=profile, mean_nll=1.0)
@@ -1755,6 +1931,7 @@ def _rtl_recorded_row(**overrides: Any) -> dict[str, Any]:
             "capacity": {"feasible": True},
             "whole_model": {
                 "rankable": True,
+                "strict_system_resource_boundary_valid": True,
                 "publication_timing_tier": "stage_calibrated_analytic",
                 "tpot_ms": 10.0,
                 "tps": 100.0,
@@ -1765,9 +1942,8 @@ def _rtl_recorded_row(**overrides: Any) -> dict[str, Any]:
                     "total_j": 1.0,
                 },
             },
-            "output_head_boundary": {
-                "estimate": {"calibration_id": "head-calibration"}
-            },
+            "output_head_boundary": _measured_head_boundary(),
+            "generated_tokens_per_step": 1,
         },
     }
     row.update(overrides)
@@ -2675,8 +2851,12 @@ def test_publication_configuration_builder_separates_accuracy_and_hardware(
             "deployment_valid": True,
             "validity": validity.to_dict(),
             "metrics": {
+                "output_head_boundary": _measured_head_boundary(),
+                "generated_tokens_per_step": 1,
+                "resource_budget": {"feasible": True},
                 "whole_model": {
                     "rankable": True,
+                    "strict_system_resource_boundary_valid": True,
                     "tpot_ms": 2.0 + index,
                     "calibrated_energy": {
                         "total_j": 0.2 + index * 0.1,
@@ -3119,7 +3299,7 @@ def test_full_publication_pipeline_receipts_partition_and_resume(
     assert (workspace / "pipeline" / "receipt.json").read_bytes() == receipt_bytes
 
 
-def test_publication_evidence_gate_rejects_missing_physical_head_before_sweep(
+def test_publication_evidence_gate_treats_external_head_as_optional(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
@@ -3151,7 +3331,7 @@ def test_publication_evidence_gate_rejects_missing_physical_head_before_sweep(
     monkeypatch.setattr(simulator_bridge, "_disagg", lambda: SimulatorTiming())
     with pytest.raises(
         FileNotFoundError,
-        match="required publication artifact head_service_calibration is missing",
+        match="required publication artifact admission_receipt is missing",
     ):
         sweep.validate_publication_evidence(
             config=config_path,
@@ -3242,8 +3422,12 @@ def test_final_publication_gate_joins_benchmarks_to_exact_hardware(
                     "deployment_valid": True,
                     "retention_labels": ["profile_frontier"],
                     "metrics": {
+                        "output_head_boundary": _measured_head_boundary(),
+                        "generated_tokens_per_step": 1,
+                        "resource_budget": {"feasible": True},
                         "whole_model": {
                             "rankable": True,
+                            "strict_system_resource_boundary_valid": True,
                             "tpot_ms": 1.5,
                             "calibrated_energy": {
                                 "total_j": 0.25,

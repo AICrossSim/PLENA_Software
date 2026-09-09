@@ -1434,6 +1434,25 @@ def compiler_trace_artifacts_main(
         return 2
 
 
+def _compiler_model_blockers(
+    architecture: Mapping[str, Any],
+) -> tuple[int, list[str]]:
+    """Return model-family blockers without aliasing official MoE to dense."""
+
+    num_experts = int(
+        architecture.get(
+            "num_experts",
+            architecture.get("num_local_experts", 1),
+        )
+    )
+    blockers: list[str] = []
+    if num_experts > 1:
+        blockers.append("mixture_of_experts_trace_evidence_not_bound")
+    if int(architecture.get("n_sliding", 0)) > 0:
+        blockers.append("sliding_attention_not_lowered")
+    return num_experts, blockers
+
+
 def _compiler_trace_feasibility(
     config: Mapping[str, Any],
     manifest: SweepManifest,
@@ -1564,11 +1583,10 @@ def _compiler_trace_feasibility(
         for signature, blockers in hardware_signature_blockers.items()
         if not blockers
     }
-    model_blockers = []
-    if int(architecture.get("num_local_experts", 1)) > 1:
-        model_blockers.append("mixture_of_experts_not_lowered")
-    if int(architecture.get("n_sliding", 0)) > 0:
-        model_blockers.append("sliding_attention_not_lowered")
+    # The compiler has a routed-MoE substrate, but this pipeline does not yet
+    # bind a measured route trace/capability receipt to native timing. Never
+    # price the official `num_experts` model through the dense path.
+    num_experts, model_blockers = _compiler_model_blockers(architecture)
 
     batch_record_counts: dict[tuple[Any, ...], int] = {}
     for signature in batch_resolution_signatures:
@@ -1730,6 +1748,7 @@ def _compiler_trace_feasibility(
             structural_candidates / len(batch_resolution_signatures)
         ),
         "hardware_relevant_precision_profiles": len(hardware_entries),
+        "detected_num_experts": num_experts,
         "unique_storage_signatures": len(storage_signatures),
         "unique_structure_changing_storage_signatures": len(
             lowering_storage_signatures
@@ -2666,6 +2685,7 @@ _PIPELINE_ARTIFACT_FIELDS = frozenset(
         "compiler_trace_artifacts",
         "request_memory_calibration",
         "head_service_calibration",
+        "head_service_resource_receipt",
         "handoff_artifact",
         "power_calibration",
         "area_config",
@@ -2689,6 +2709,8 @@ _PIPELINE_ARTIFACT_FIELDS = frozenset(
 )
 _OPTIONAL_PIPELINE_ARTIFACT_FIELDS = frozenset(
     {
+        "head_service_calibration",
+        "head_service_resource_receipt",
         "handoff_artifact",
         "power_calibration",
         "area_config",
@@ -2959,6 +2981,11 @@ def validate_publication_evidence(
 
     repository = Path(__file__).resolve().parents[2]
     value = _load_config(config)
+    from decode_dse.hardware.evaluation import (
+        _validate_system_boundary_config,
+    )
+
+    _validate_system_boundary_config(value)
     _, artifact_values, resources = _publication_pipeline_config(value)
     paths = _resolve_publication_pipeline_paths(
         artifact_values,
@@ -2984,7 +3011,6 @@ def validate_publication_evidence(
             "(rtl_serialized or emulator_serialized) for the production study"
         )
 
-    head_path = require("head_service_calibration")
     architecture = value.get("model_architecture")
     space = value.get("hardware_space")
     if not isinstance(architecture, Mapping) or not isinstance(space, Mapping):
@@ -2992,27 +3018,73 @@ def validate_publication_evidence(
     batches = space.get("BATCH")
     if not isinstance(batches, list):
         raise ValueError("hardware_space.BATCH must be a list")
-    from decode_dse.hardware.lm_head_service import (
-        load_bf16_head_service_artifact,
-    )
-
-    head = load_bf16_head_service_artifact(
-        head_path,
-        model_name=str(value["model_name"]),
-        model_revision=str(value["model_revision"]),
-        hidden_size=int(architecture["hidden_size"]),
-        vocab_size=int(architecture["vocab_size"]),
-        tie_embeddings=bool(architecture["tie_word_embeddings"]),
-        required_batches=tuple(int(batch) for batch in batches),
-    )
-    if not head.passed:
-        raise ValueError(
-            "the external BF16 output-head artifact is not publication-rankable; "
-            "it must contain repeated and holdout measurements from the dedicated "
-            "prefill-chip endpoint, including numerical logits, remote-link timing, "
-            "component dynamic energy, and leakage evidence: "
-            + "; ".join(head.failures)
+    derived_census = None
+    if architecture.get("model_type") == "qwen3_moe":
+        from decode_dse.hardware.head_service_resources import (
+            qwen3_moe_bf16_parameter_census,
         )
+
+        derived_census = qwen3_moe_bf16_parameter_census(architecture)
+        if value.get("parameter_census") != derived_census:
+            raise ValueError(
+                "parameter_census differs from the architecture-derived "
+                "BF16 residency"
+            )
+
+    head_path = paths["head_service_calibration"]
+    head_resources_path = paths["head_service_resource_receipt"]
+    head_files_present = (
+        head_path is not None and head_path.is_file(),
+        head_resources_path is not None and head_resources_path.is_file(),
+    )
+    if head_files_present[0] != head_files_present[1]:
+        raise ValueError(
+            "optional external-head sensitivity requires both the service "
+            "artifact and endpoint resource receipt"
+        )
+    head = None
+    head_resources = None
+    if all(head_files_present):
+        if derived_census is None:
+            raise ValueError(
+                "optional external-head resources are supported only for "
+                "the sealed Qwen3-MoE architecture contract"
+            )
+        from decode_dse.hardware.lm_head_service import (
+            load_bf16_head_service_artifact,
+        )
+        from decode_dse.hardware.head_service_resources import (
+            load_bf16_head_endpoint_resource_receipt,
+        )
+
+        head = load_bf16_head_service_artifact(
+            head_path,
+            model_name=str(value["model_name"]),
+            model_revision=str(value["model_revision"]),
+            hidden_size=int(architecture["hidden_size"]),
+            vocab_size=int(architecture["vocab_size"]),
+            tie_embeddings=bool(architecture["tie_word_embeddings"]),
+            required_batches=tuple(int(batch) for batch in batches),
+        )
+        if not head.passed:
+            raise ValueError(
+                "the optional external BF16 output-head artifact failed: "
+                + "; ".join(head.failures)
+            )
+        head_resources = load_bf16_head_endpoint_resource_receipt(
+            head_resources_path,
+            head_service_status=head,
+            prefill_model_excluding_head_bytes=int(
+                derived_census[
+                    "prefill_model_excluding_lm_head_bf16_bytes"
+                ]
+            ),
+        )
+        if not head_resources.passed:
+            raise ValueError(
+                "the optional external BF16 endpoint resource receipt failed: "
+                + "; ".join(head_resources.failures)
+            )
 
     required_inputs = {
         "admission_receipt",
@@ -3032,8 +3104,12 @@ def validate_publication_evidence(
     }
     identities = {
         "timing_evidence": _path_identity(timing_path),
-        "head_service_calibration": _path_identity(head_path),
     }
+    if head is not None and head_resources is not None:
+        identities["head_service_calibration"] = _path_identity(head_path)
+        identities["head_service_resource_receipt"] = _path_identity(
+            head_resources_path
+        )
     for name in sorted(required_inputs):
         identities[name] = _path_identity(require(name))
     for name in sorted(optional_inputs):
@@ -3054,7 +3130,16 @@ def validate_publication_evidence(
             if timing_tier == "compiler_trace_request_calibrated"
             else "spot_check_only"
         ),
-        "head_service": head.to_dict(),
+        "output_head_location": _config_output_head_location(config),
+        "external_head_sensitivity": (
+            {
+                "available": True,
+                "service": head.to_dict(),
+                "resources": head_resources.to_dict(),
+            }
+            if head is not None and head_resources is not None
+            else {"available": False, "reason": "optional_artifacts_absent"}
+        ),
         "artifacts": identities,
     }
     write_immutable_json(report, body)
@@ -3739,11 +3824,6 @@ def build_pipeline(
             str(resources["stride"]),
             "--runtime-hbm-reserve-bytes",
             str(resources["runtime_hbm_reserve_bytes"]),
-            # The measured remote head stays available as the recorded
-            # comparison arm; the headline boundary is named explicitly so the
-            # launch never depends on which artifacts happen to be present.
-            "--head-service-calibration",
-            str(required_path("head_service_calibration")),
             "--output-head-location",
             str(_config_output_head_location(config)),
             "--admission-receipt",
@@ -3753,6 +3833,19 @@ def build_pipeline(
             "--output",
             str(hardware_study),
         ]
+        optional_head_paths = (
+            paths["head_service_calibration"],
+            paths["head_service_resource_receipt"],
+        )
+        if all(path is not None and path.is_file() for path in optional_head_paths):
+            hardware_arguments.extend(
+                (
+                    "--head-service-calibration",
+                    str(optional_head_paths[0]),
+                    "--head-service-resource-receipt",
+                    str(optional_head_paths[1]),
+                )
+            )
         optional_hardware_paths = (
             ("handoff_artifact", "--handoff-artifact"),
             ("power_calibration", "--power-calibration"),
@@ -3961,11 +4054,6 @@ def build_pipeline(
             str(resources["stride"]),
             "--runtime-hbm-reserve-bytes",
             str(resources["runtime_hbm_reserve_bytes"]),
-            # The measured remote head stays available as the recorded
-            # comparison arm; the headline boundary is named explicitly so the
-            # launch never depends on which artifacts happen to be present.
-            "--head-service-calibration",
-            str(required_path("head_service_calibration")),
             "--output-head-location",
             str(_config_output_head_location(config)),
             "--admission-receipt",
@@ -3973,6 +4061,19 @@ def build_pipeline(
             "--output",
             str(refined_hardware_study),
         ]
+        optional_head_paths = (
+            paths["head_service_calibration"],
+            paths["head_service_resource_receipt"],
+        )
+        if all(path is not None and path.is_file() for path in optional_head_paths):
+            refined_hardware_arguments.extend(
+                (
+                    "--head-service-calibration",
+                    str(optional_head_paths[0]),
+                    "--head-service-resource-receipt",
+                    str(optional_head_paths[1]),
+                )
+            )
         for name, flag in (
             ("handoff_artifact", "--handoff-artifact"),
             ("power_calibration", "--power-calibration"),
@@ -3989,21 +4090,23 @@ def build_pipeline(
                     str(resources["rtl_source_tree_sha256"]),
                 )
             )
-        commands.extend(
-            (
-                PipelineCommand(
-                    "refined-hardware-study",
-                    _module_command(
-                        "decode_dse.hardware.evaluation",
-                        *refined_hardware_arguments,
-                    ),
-                    outputs=(
-                        refined_hardware_study,
-                        refined_hardware_study.with_name(
-                            f"{refined_hardware_study.name}.meta.json"
-                        ),
+        commands.append(
+            PipelineCommand(
+                "refined-hardware-study",
+                _module_command(
+                    "decode_dse.hardware.evaluation",
+                    *refined_hardware_arguments,
+                ),
+                outputs=(
+                    refined_hardware_study,
+                    refined_hardware_study.with_name(
+                        f"{refined_hardware_study.name}.meta.json"
                     ),
                 ),
+            )
+        )
+        if resources["publication_enabled"]:
+            commands.append(
                 PipelineCommand(
                     "publication-configurations",
                     _module_command(
@@ -4027,9 +4130,8 @@ def build_pipeline(
                         str(required_path("publication_configurations")),
                     ),
                     outputs=(required_path("publication_configurations"),),
-                ),
+                )
             )
-        )
 
     if resources["publication_enabled"]:
         commands.extend(

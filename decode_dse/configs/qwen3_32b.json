@@ -389,6 +389,7 @@
       "compiler_trace_artifacts": "workspace://external/compiler_trace_artifacts.json",
       "request_memory_calibration": "simulator://analytic_models/disagg_serve/calibration_dma_requests.csv",
       "head_service_calibration": "workspace://external/bf16_output_head_service.json",
+      "head_service_resource_receipt": "workspace://external/bf16_output_head_endpoint_resources.json",
       "handoff_artifact": null,
       "power_calibration": null,
       "area_config": null,

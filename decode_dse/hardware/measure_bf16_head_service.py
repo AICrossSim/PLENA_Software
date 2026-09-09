@@ -6,9 +6,10 @@ an endpoint process pinned to one CUDA device holds the exported BF16 head
 weight and serves argmax token ids, while the driver on a second device sends
 BF16 hidden payloads over the physical inter-device link. Request transfer,
 head compute (BF16 MACs, FP32 accumulation), selection, and response transfer
-are timed as separate phases; per-phase dynamic energy comes from NVML board
+are timed as separate phases. Per-board phase energy comes from NVML board
 meters (total-energy counter, with a sampled power-trace fallback) bound to
-the devices by UUID, amplified over an inner iteration loop that scales until
+the devices by UUID; only endpoint dynamic is priced, while driver dynamic is
+retained as instrumentation provenance. Windows are amplified until
 the counter delta clears its resolution floor, and leakage from an idle-power
 window. Both devices must be held exclusively by this process, and every
 phase delta must be positive and plausible against the boards' enforced
@@ -358,6 +359,9 @@ def fit_service_coefficients(
         "request_fixed_latency_s": request_fixed,
         "response_fixed_latency_s": response_fixed,
         "link_energy_j_per_byte": link_energy_rate,
+        "link_dynamic_energy_scope": (
+            "endpoint_receive_transmit_incremental_only"
+        ),
         "duplex_schedule": "serialized_request_service_response",
     }
     service = {
@@ -1018,27 +1022,47 @@ def _measure_payload(
                 math.ceil(iterations * MIN_ACTIVE_WINDOW_S / max(wall, 1e-9)),
             )
             iterations = min(MAX_INNER_ITERATIONS, scale_target)
-        dynamic_total = sum(
-            delta - leakage * window
-            for (delta, window), leakage in zip(readings, leakages_w)
-        )
-        idle_energy = sum(
-            leakage * window
-            for (_, window), leakage in zip(readings, leakages_w)
-        )
-        resolved_total, below_resolution = _resolved_dynamic_energy(
-            dynamic_total_j=dynamic_total,
-            idle_energy_j=idle_energy,
-            label=f"{label} phase (batch {batch})",
-        )
-        dynamic = resolved_total / iterations
+        board_dynamic: list[float] = []
+        board_below_resolution: list[bool] = []
+        board_raw_dynamic: list[float] = []
+        for meter, (delta, window), leakage in zip(
+            meters, readings, leakages_w
+        ):
+            raw_dynamic = delta - leakage * window
+            resolved, below_resolution = _resolved_dynamic_energy(
+                dynamic_total_j=raw_dynamic,
+                idle_energy_j=leakage * window,
+                label=(
+                    f"{label} phase (batch {batch}) on {meter.label}"
+                ),
+            )
+            board_raw_dynamic.append(raw_dynamic)
+            board_dynamic.append(resolved / iterations)
+            board_below_resolution.append(below_resolution)
+        # The driver emulates the already-priced decoder.  Its incremental
+        # draw stays in raw provenance and cannot become endpoint or PLENA-link
+        # energy by implication.
+        dynamic = board_dynamic[1]
         resolution[label] = {
             "inner_iterations": float(iterations),
             "counter_delta_j": float(delta_sum),
             "meter_window_s": float(max(window for _, window in readings)),
             "active_wall_s": float(wall),
-            "raw_dynamic_energy_j": float(dynamic_total),
-            "below_measurement_resolution": float(below_resolution),
+            "driver_raw_dynamic_energy_j": float(board_raw_dynamic[0]),
+            "endpoint_raw_dynamic_energy_j": float(board_raw_dynamic[1]),
+            "driver_dynamic_energy_j_per_invocation": float(
+                board_dynamic[0]
+            ),
+            "endpoint_dynamic_energy_j_per_invocation": float(
+                board_dynamic[1]
+            ),
+            "driver_below_measurement_resolution": float(
+                board_below_resolution[0]
+            ),
+            "endpoint_below_measurement_resolution": float(
+                board_below_resolution[1]
+            ),
+            "priced_dynamic_energy_scope": "endpoint_only",
         }
         return seconds, dynamic
 
@@ -1072,7 +1096,10 @@ def _measure_payload(
         link_energy_j=request_energy + response_energy,
         head_compute_energy_j=head_energy,
         selection_energy_j=selection_energy,
-        leakage_power_w=sum(leakages_w),
+        # The driver emulates the already-priced decoder and exists only to
+        # instrument the request/response link.  Its idle draw is retained in
+        # provenance but is not a second deployed head-service endpoint.
+        leakage_power_w=leakages_w[1],
         hidden_sha256=numerical["hidden_sha256"],
         reference_logits_sha256=numerical["reference_logits_sha256"],
         service_logits_sha256=numerical["service_logits_sha256"],
@@ -1297,6 +1324,12 @@ def run_measurement(args: argparse.Namespace) -> int:
                 "endpoint": leakages_w[1],
                 "total": leakage,
             },
+            "service_leakage_power_w": leakages_w[1],
+            "service_leakage_scope": "endpoint_only",
+            "measurement_driver_idle_role": (
+                "instrumentation_only_not_deployed"
+            ),
+            "measurement_driver_leakage_included": False,
             "phase_windows": phase_resolutions,
         },
     }
