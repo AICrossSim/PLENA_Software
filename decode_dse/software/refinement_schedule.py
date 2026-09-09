@@ -43,6 +43,9 @@ from decode_dse.software.sweep_plan import (
 REFINEMENT_PROFILE_SCHEMA = "decode-refinement-profile"
 REFINEMENT_SCHEDULE_SCHEMA = "decode-refinement-schedule"
 REFINEMENT_SHARD_PLAN_SCHEMA = "decode-refinement-shard-plan"
+PROJECTED_REFINEMENT_SHARD_PLAN_SCHEMA = (
+    "decode-projected-refinement-shard-plan/v1"
+)
 REFINEMENT_VALIDITY_SCHEMA = "decode-refinement-validity"
 REFINEMENT_WEIGHT_METHODS = ("rtn", "gptq_erry", "rotation")
 REFINEMENT_EVIDENCE_STATES = ("succeeded", "failed", "oom")
@@ -676,6 +679,155 @@ def load_refinement_shard_plan(path: str | Path) -> RefinementShardPlan:
 
 
 @dataclass(frozen=True)
+class ProjectedRefinementShardPlan:
+    """One deterministic profile partition for a single-source derivative.
+
+    The publication refinement lane assigns one complete source to each GPU.
+    A projected derivative has exactly one selected source, so it needs a
+    separate schema.  Empty partitions are intentional when a symmetric-K/V
+    schedule contains fewer than four profiles; they are sealed by the run
+    contract and must still appear in the merge receipt.
+    """
+
+    master_schedule_hash: str
+    shard_index: int
+    shard_count: int
+    source_profile_id: str
+    profile_ids: tuple[str, ...]
+    partition_policy: str = "profile_ordinal_modulo_four/v1"
+    schema_version: str = PROJECTED_REFINEMENT_SHARD_PLAN_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PROJECTED_REFINEMENT_SHARD_PLAN_SCHEMA:
+            raise ValueError("unsupported projected refinement shard-plan schema")
+        if len(self.master_schedule_hash) != 64 or any(
+            character not in "0123456789abcdef"
+            for character in self.master_schedule_hash
+        ):
+            raise ValueError("master schedule hash must be a lowercase SHA-256")
+        if self.shard_count != 4:
+            raise ValueError("projected refinement requires exactly four shards")
+        if self.shard_index < 0 or self.shard_index >= self.shard_count:
+            raise ValueError("projected refinement shard index is out of range")
+        if not self.source_profile_id:
+            raise ValueError("projected refinement source identity is required")
+        if self.partition_policy != "profile_ordinal_modulo_four/v1":
+            raise ValueError("unsupported projected refinement partition policy")
+        if len(self.profile_ids) != len(set(self.profile_ids)):
+            raise ValueError("projected refinement shard profiles must be unique")
+
+    def _content_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "master_schedule_hash": self.master_schedule_hash,
+            "shard_index": self.shard_index,
+            "shard_count": self.shard_count,
+            "source_profile_id": self.source_profile_id,
+            "profile_ids": list(self.profile_ids),
+            "partition_policy": self.partition_policy,
+        }
+
+    @property
+    def canonical_hash(self) -> str:
+        return hashlib.sha256(
+            _canonical_json(self._content_dict()).encode("utf-8")
+        ).hexdigest()
+
+    def to_dict(self) -> dict[str, Any]:
+        return self._content_dict() | {"shard_plan_hash": self.canonical_hash}
+
+    @classmethod
+    def from_dict(
+        cls, value: Mapping[str, Any]
+    ) -> "ProjectedRefinementShardPlan":
+        plan = cls(
+            master_schedule_hash=str(value["master_schedule_hash"]),
+            shard_index=int(value["shard_index"]),
+            shard_count=int(value["shard_count"]),
+            source_profile_id=str(value["source_profile_id"]),
+            profile_ids=tuple(str(item) for item in value["profile_ids"]),
+            partition_policy=str(value["partition_policy"]),
+            schema_version=str(value["schema_version"]),
+        )
+        if value.get("shard_plan_hash") != plan.canonical_hash:
+            raise ValueError("projected refinement shard-plan hash mismatch")
+        return plan
+
+
+def validate_projected_refinement_shard_plan(
+    schedule: RefinementSchedule,
+    plan: ProjectedRefinementShardPlan,
+) -> tuple[RefinementScheduleEntry, ...]:
+    """Bind a projected shard to the exact modulo partition of one source."""
+
+    if len(schedule.source_profile_ids) != 1:
+        raise ValueError("projected refinement schedule must have exactly one source")
+    if plan.master_schedule_hash != schedule.canonical_hash:
+        raise ValueError("projected shard plan targets another master schedule")
+    if plan.source_profile_id != schedule.source_profile_ids[0]:
+        raise ValueError("projected shard plan names another source")
+    expected = tuple(
+        entry.profile_id
+        for entry in schedule.entries
+        if entry.ordinal % plan.shard_count == plan.shard_index
+    )
+    if plan.profile_ids != expected:
+        raise ValueError("projected shard differs from deterministic partition")
+    by_id = {entry.profile_id: entry for entry in schedule.entries}
+    return tuple(by_id[profile_id] for profile_id in expected)
+
+
+def build_projected_refinement_shard_plans(
+    schedule: RefinementSchedule,
+) -> tuple[ProjectedRefinementShardPlan, ...]:
+    """Partition a single-source derivative without changing strict sharding."""
+
+    if len(schedule.source_profile_ids) != 1:
+        raise ValueError("projected refinement requires exactly one source profile")
+    source_profile_id = schedule.source_profile_ids[0]
+    plans = tuple(
+        ProjectedRefinementShardPlan(
+            master_schedule_hash=schedule.canonical_hash,
+            shard_index=index,
+            shard_count=4,
+            source_profile_id=source_profile_id,
+            profile_ids=tuple(
+                entry.profile_id
+                for entry in schedule.entries
+                if entry.ordinal % 4 == index
+            ),
+        )
+        for index in range(4)
+    )
+    covered = tuple(profile_id for plan in plans for profile_id in plan.profile_ids)
+    expected = tuple(entry.profile_id for entry in schedule.entries)
+    if len(covered) != len(set(covered)) or set(covered) != set(expected):
+        raise AssertionError("projected shard plans are not a disjoint cover")
+    for plan in plans:
+        validate_projected_refinement_shard_plan(schedule, plan)
+    return plans
+
+
+def write_projected_refinement_shard_plan(
+    path: str | Path,
+    plan: ProjectedRefinementShardPlan,
+) -> Path:
+    from decode_dse.software.sweep_plan import write_immutable_json
+
+    return write_immutable_json(path, plan.to_dict())
+
+
+def load_projected_refinement_shard_plan(
+    path: str | Path,
+) -> ProjectedRefinementShardPlan:
+    from decode_dse.software.sweep_plan import load_immutable_json
+
+    value = load_immutable_json(path)
+    value.pop("content_hash", None)
+    return ProjectedRefinementShardPlan.from_dict(value)
+
+
+@dataclass(frozen=True)
 class RefinementValidityRecord:
     """Measured validity for one exact equal- or split-K/V profile."""
 
@@ -829,8 +981,12 @@ def build_refinement_schedule(
     reference_mean_nll: float,
     policy: DoomedGatePolicy = DoomedGatePolicy(),
     weight_method: str = "gptq_erry",
+    require_symmetric_kv: bool = False,
 ) -> RefinementSchedule:
     """Build a stable schedule without expanding the screening manifest."""
+
+    if not isinstance(require_symmetric_kv, bool):
+        raise TypeError("require_symmetric_kv must be a boolean")
 
     sources = tuple(sorted(promoted_profiles, key=lambda item: item.profile_id))
     source_ids = tuple(profile.profile_id for profile in sources)
@@ -854,10 +1010,13 @@ def build_refinement_schedule(
             reference_mean_nll=reference_mean_nll,
             policy=policy,
         )
-        for profile in iter_split_kv_variants(
+        candidates = iter_split_kv_variants(
             source,
             weight_method=weight_method,
-        ):
+        )
+        for profile in candidates:
+            if require_symmetric_kv and profile.split_kv:
+                continue
             if profile.profile_id in seen:
                 raise AssertionError("split-KV generation produced a duplicate")
             seen.add(profile.profile_id)
@@ -883,6 +1042,7 @@ def build_refinement_schedule_from_promotion(
     reference_mean_nll: float,
     policy: DoomedGatePolicy = DoomedGatePolicy(),
     weight_method: str = "gptq_erry",
+    require_symmetric_kv: bool = False,
 ) -> RefinementSchedule:
     """Build refinement directly from a complete epsilon-Pareto promotion."""
 
@@ -898,6 +1058,7 @@ def build_refinement_schedule_from_promotion(
         reference_mean_nll=reference_mean_nll,
         policy=policy,
         weight_method=weight_method,
+        require_symmetric_kv=require_symmetric_kv,
     )
 
 
@@ -907,7 +1068,14 @@ def build_selective_rotation_schedule(
     best_supported_profile_ids: Sequence[str],
     uniform_i8_profile_id: str,
 ) -> RefinementSchedule:
-    """Rotate one measured winner per source, including equal-K/V MXINT8."""
+    """Materialize one unrankable attention-only ablation per source.
+
+    The caller must derive ``best_supported_profile_ids`` from a verified
+    successful base-refinement merge.  This builder deliberately resets stack
+    validity: source-profile validity is not evidence that the rotated graph
+    has compiler, emulator, RTL, or even software coverage.  The rotation run
+    and any later stack validation must attach their own exact evidence.
+    """
 
     best = tuple(str(profile_id) for profile_id in best_supported_profile_ids)
     if len(best) != 4 or len(set(best)) != 4:
@@ -939,18 +1107,18 @@ def build_selective_rotation_schedule(
         source_entry = entries_by_id[profile_id]
         if not source_entry.gate.executable:
             raise ValueError("rotation selection contains a gated profile")
-        validity = source_entry.validity
-        if any(
-            value is not True
-            for value in (
-                validity.software_valid,
-                validity.compiler_valid,
-                validity.emulator_valid,
-                validity.rtl_valid,
+        if source_entry.profile.weight_method != "gptq_erry":
+            raise ValueError(
+                "rotation selection must descend from a GPTQ/Erry refinement"
             )
+        if (
+            source_entry.profile.key_format
+            != source_entry.profile.value_format
+            or source_entry.profile.key_format
+            != source_entry.profile.source_profile.kv_format
         ):
             raise ValueError(
-                "rotation selection requires measured software/compiler/emulator/RTL support"
+                "attention-only rotation requires canonical equal-K/V precision"
             )
         source = source_entry.profile.source_profile
         if profile_id == uniform_i8_profile_id and (
@@ -1053,6 +1221,7 @@ def refinement_profile_to_decode_quant_spec(
         fp_setting=profile.vector_format,
         fp_setting_attention=True,
         quant_attn_internals=True,
+        matrix_mlen=profile.source_profile.matrix_mlen,
     )
 
 
@@ -1258,12 +1427,15 @@ def _hardware_point(
     # The decode-local head prices the projection inside the decode chip, so a
     # measured remote estimate exists only at the external boundary.
     head_location = str(
-        output_head.get("location", "external_bf16_service")
+        output_head.get("location", "decode_local_mx_head")
     )
     head_idealizations = tuple(
         str(code) for code in output_head.get("scope_idealizations", ())
     )
-    local_head = head_location == "decode_bf16_unmodeled"
+    local_head = head_location in {
+        "decode_local_mx_head",
+        "decode_bf16_unmodeled",
+    }
     capacity = metrics.get("capacity")
     energy_tier = energy.get("energy_tier") if isinstance(energy, Mapping) else None
     energy_identity = (
@@ -1677,6 +1849,10 @@ def prepare_refinement_schedule(
         promotion,
         promoted_evidence,
         reference_mean_nll=reference_mean_nll,
+        require_symmetric_kv=(
+            manifest.model_name
+            == "Qwen/Qwen3-30B-A3B-Thinking-2507"
+        ),
     )
     if stack_validity_path is not None and validity_path is not None:
         raise ValueError(
@@ -1801,6 +1977,7 @@ __all__ = [
     "REFINEMENT_EVIDENCE_STATES",
     "REFINEMENT_EXECUTION_STATES",
     "REFINEMENT_PROFILE_SCHEMA",
+    "PROJECTED_REFINEMENT_SHARD_PLAN_SCHEMA",
     "REFINEMENT_SCHEDULE_SCHEMA",
     "REFINEMENT_SHARD_PLAN_SCHEMA",
     "REFINEMENT_VALIDITY_SCHEMA",
@@ -1808,22 +1985,27 @@ __all__ = [
     "RefinementSchedule",
     "RefinementScheduleEntry",
     "RefinementShardPlan",
+    "ProjectedRefinementShardPlan",
     "RefinementValidityManifest",
     "RefinementValidityRecord",
     "attach_refinement_validity",
     "build_refinement_schedule_from_promotion",
     "build_refinement_schedule",
     "build_refinement_shard_plans",
+    "build_projected_refinement_shard_plans",
     "build_selective_rotation_schedule",
     "derive_refinement_validity",
     "evaluate_doomed_gate",
     "iter_split_kv_variants",
     "load_refinement_schedule",
     "load_refinement_shard_plan",
+    "load_projected_refinement_shard_plan",
     "load_refinement_validity",
     "refinement_profile_to_decode_quant_spec",
     "write_refinement_schedule",
     "write_refinement_shard_plan",
+    "write_projected_refinement_shard_plan",
     "write_refinement_validity",
     "validate_refinement_shard_plan",
+    "validate_projected_refinement_shard_plan",
 ]

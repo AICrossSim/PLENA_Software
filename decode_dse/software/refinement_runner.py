@@ -35,13 +35,18 @@ from decode_dse.software.cache_artifacts import (
 from decode_dse.software.cached_decode import capture_bf16_prefill
 from decode_dse.software.refinement_schedule import (
     DecodeRefinementProfile,
+    ProjectedRefinementShardPlan,
     RefinementSchedule,
     RefinementScheduleEntry,
     RefinementShardPlan,
+    build_projected_refinement_shard_plans,
     build_refinement_shard_plans,
+    load_projected_refinement_shard_plan,
     load_refinement_schedule,
     load_refinement_shard_plan,
+    validate_projected_refinement_shard_plan,
     validate_refinement_shard_plan,
+    write_projected_refinement_shard_plan,
     write_refinement_shard_plan,
 )
 from decode_dse.software.runtime_environment import (
@@ -70,6 +75,28 @@ REFINEMENT_COMPLETION_SCHEMA = "decode-refinement-completion"
 
 
 REFINEMENT_MERGE_SCHEMA = "decode-refinement-merge"
+
+
+PROJECTED_REFINEMENT_MERGE_SCHEMA = "decode-projected-refinement-merge/v1"
+
+
+ATTENTION_ONLY_ROTATION_METHOD = (
+    "attention_only_selective_hadamard_rotation/v1"
+)
+ATTENTION_ONLY_ROTATION_MATMUL_TYPES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "qk_matmul",
+    "av_matmul",
+    "kv_cache",
+)
+FUSED_EXPERT_ROTATION_EXCLUSIONS = (
+    "down_proj",
+    "gate_proj",
+    "up_proj",
+)
 
 
 _SAFE_TOKEN = re.compile(r"^[a-zA-Z0-9_.-]+$")
@@ -169,13 +196,20 @@ def _is_out_of_memory(error: BaseException) -> bool:
 
 
 def rotation_policy() -> dict[str, Any]:
-    """Return the fixed calibration-aware rotation search contract."""
+    """Return the fixed attention-only selective Hadamard search contract."""
 
     return {
+        "schema_version": "decode-attention-only-rotation-policy/v1",
+        "method_id": ATTENTION_ONLY_ROTATION_METHOD,
         "calibration_samples": 32,
         "calibration_sequence_length": 1024,
         "improvement_epsilon": 0.0,
-        "matmul_types": "all_supported",
+        "matmul_types": list(ATTENTION_ONLY_ROTATION_MATMUL_TYPES),
+        "fused_expert_matmul_types": {
+            "included": [],
+            "excluded": list(FUSED_EXPERT_ROTATION_EXCLUSIONS),
+            "reason": "fused expert tensors have no rotation lowerer",
+        },
         "cache_winners": True,
         "score_phase": "decode",
     }
@@ -201,6 +235,54 @@ def rotation_decision_contract_hash(
     profile: DecodeRefinementProfile,
 ) -> str:
     return _content_hash(rotation_decision_contract(profile))
+
+
+def validate_attention_only_rotation_decision(
+    value: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate one measured Qwen3-MoE attention-only decision artifact."""
+
+    winners = value.get("winners")
+    searched = value.get("matmul_types_searched")
+    scope = value.get("rotation_scope")
+    allowed = set(ATTENTION_ONLY_ROTATION_MATMUL_TYPES)
+    if (
+        not isinstance(winners, list)
+        or len(winners) != len(set(winners))
+        or any(item not in allowed for item in winners)
+    ):
+        raise ValueError(
+            "rotation winners are not an attention-only Hadamard subset"
+        )
+    if searched != list(ATTENTION_ONLY_ROTATION_MATMUL_TYPES):
+        raise ValueError("rotation search did not cover the sealed attention scope")
+    if not isinstance(scope, Mapping) or (
+        scope.get("architecture") != "qwen3_moe_fused"
+        or scope.get("eligible_matmul_types")
+        != list(ATTENTION_ONLY_ROTATION_MATMUL_TYPES)
+        or scope.get("excluded_matmul_types")
+        != list(FUSED_EXPERT_ROTATION_EXCLUSIONS)
+        or scope.get("excluded_reason")
+        != "fused expert tensors have no rotation lowerer"
+    ):
+        raise ValueError("rotation decision has the wrong fused-MoE scope")
+    baseline = float(value.get("baseline_ppl", math.nan))
+    final = float(value.get("final_ppl", math.nan))
+    if (
+        not math.isfinite(baseline)
+        or baseline <= 0
+        or not math.isfinite(final)
+        or final <= 0
+        or final > baseline + 1e-12
+    ):
+        raise ValueError("rotation decision perplexities are invalid")
+    return {
+        "method_id": ATTENTION_ONLY_ROTATION_METHOD,
+        "winners": list(winners),
+        "baseline_ppl": baseline,
+        "final_ppl": final,
+        "rotation_scope": dict(scope),
+    }
 
 
 def refinement_rng_policy() -> dict[str, Any]:
@@ -948,12 +1030,13 @@ def load_refinement_merged_results(
     *,
     results_path: str | Path | None = None,
     verify_result_artifacts: bool = True,
+    _expected_schema: str = REFINEMENT_MERGE_SCHEMA,
 ) -> RefinementMergedResults:
     """Fail closed on merge coverage, checksums, terminals, and artifacts."""
 
     receipt_path = Path(merge_receipt).resolve()
     receipt = load_immutable_json(receipt_path)
-    if receipt.get("schema_version") != REFINEMENT_MERGE_SCHEMA:
+    if receipt.get("schema_version") != _expected_schema:
         raise ValueError("unsupported refinement merge receipt")
     if receipt.get("master_schedule_hash") != schedule.canonical_hash:
         raise ValueError("refinement merge was produced for another schedule")
@@ -1096,6 +1179,24 @@ def load_refinement_merged_results(
     )
 
 
+def load_projected_refinement_merged_results(
+    schedule: RefinementSchedule,
+    merge_receipt: str | Path,
+    *,
+    results_path: str | Path | None = None,
+    verify_result_artifacts: bool = True,
+) -> RefinementMergedResults:
+    """Load only a separately classified projected-refinement merge."""
+
+    return load_refinement_merged_results(
+        schedule,
+        merge_receipt,
+        results_path=results_path,
+        verify_result_artifacts=verify_result_artifacts,
+        _expected_schema=PROJECTED_REFINEMENT_MERGE_SCHEMA,
+    )
+
+
 class RefinementRunner:
     """Execute an immutable schedule with at most three attempts per point."""
 
@@ -1110,6 +1211,7 @@ class RefinementRunner:
         max_attempts: int = 3,
         bootstrap_replicates: int = 2000,
         shard_plan: RefinementShardPlan | None = None,
+        projected_shard_plan: ProjectedRefinementShardPlan | None = None,
     ) -> None:
         if max_attempts != 3:
             raise ValueError("the refinement artifact contract requires three attempts")
@@ -1122,12 +1224,20 @@ class RefinementRunner:
         self.output_dir = Path(output_dir)
         self.max_attempts = max_attempts
         self.bootstrap_replicates = bootstrap_replicates
+        if shard_plan is not None and projected_shard_plan is not None:
+            raise ValueError("strict and projected shard plans are mutually exclusive")
         self.shard_plan = shard_plan
-        self.execution_entries = (
-            validate_refinement_shard_plan(schedule, shard_plan)
-            if shard_plan is not None
-            else schedule.entries
-        )
+        self.projected_shard_plan = projected_shard_plan
+        if projected_shard_plan is not None:
+            self.execution_entries = validate_projected_refinement_shard_plan(
+                schedule, projected_shard_plan
+            )
+        elif shard_plan is not None:
+            self.execution_entries = validate_refinement_shard_plan(
+                schedule, shard_plan
+            )
+        else:
+            self.execution_entries = schedule.entries
         expected_groups = {
             refinement_bank_key(entry.profile)
             for entry in self.execution_entries
@@ -1267,9 +1377,7 @@ class RefinementRunner:
         )
         if callable(runtime_environment):
             runtime_environment = runtime_environment()
-        write_immutable_json(
-            self.output_dir / "contract.json",
-            {
+        contract = {
                 "schema_version": "decode-refinement-run",
                 "schedule": self.schedule.to_dict(),
                 "shard_plan": (
@@ -1283,8 +1391,10 @@ class RefinementRunner:
                 "runtime_environment": runtime_environment,
                 "max_attempts": self.max_attempts,
                 "bootstrap_replicates": self.bootstrap_replicates,
-            },
-        )
+            }
+        if self.projected_shard_plan is not None:
+            contract["projected_shard_plan"] = self.projected_shard_plan.to_dict()
+        write_immutable_json(self.output_dir / "contract.json", contract)
         store = _RecordStore(
             self.output_dir,
             self.schedule,
@@ -1474,6 +1584,7 @@ def merge_refinement_shards(
     shard_roots: Sequence[str | Path],
     output_dir: str | Path,
     max_attempts: int = 3,
+    projected: bool = False,
 ) -> RefinementMergeSummary:
     """Verify four shard journals and create one immutable coverage artifact."""
 
@@ -1481,10 +1592,20 @@ def merge_refinement_shards(
         raise ValueError("the refinement merge contract requires three attempts")
     if len(shard_roots) != 4:
         raise ValueError("the refinement merge requires exactly four shard roots")
-    expected_plans = build_refinement_shard_plans(schedule)
+    if not isinstance(projected, bool):
+        raise TypeError("projected merge mode must be a boolean")
+    expected_plans = (
+        build_projected_refinement_shard_plans(schedule)
+        if projected
+        else build_refinement_shard_plans(schedule)
+    )
     observed: dict[
         int,
-        tuple[Path, RefinementShardPlan, Mapping[str, Any]],
+        tuple[
+            Path,
+            RefinementShardPlan | ProjectedRefinementShardPlan,
+            Mapping[str, Any],
+        ],
     ] = {}
     logical_fingerprint: str | None = None
     for raw_root in shard_roots:
@@ -1497,11 +1618,19 @@ def merge_refinement_shards(
             raise ValueError("refinement shard master schedule mismatch")
         if contract.get("sample_bundle") != samples.to_dict():
             raise ValueError("refinement shard sample bundle mismatch")
-        plan_value = contract.get("shard_plan")
+        plan_value = contract.get(
+            "projected_shard_plan" if projected else "shard_plan"
+        )
         if not isinstance(plan_value, Mapping):
             raise ValueError("refinement shard contract has no shard plan")
-        plan = RefinementShardPlan.from_dict(plan_value)
-        validate_refinement_shard_plan(schedule, plan)
+        if projected:
+            if contract.get("shard_plan") is not None:
+                raise ValueError("projected shard contract embeds a strict shard plan")
+            plan = ProjectedRefinementShardPlan.from_dict(plan_value)
+            validate_projected_refinement_shard_plan(schedule, plan)
+        else:
+            plan = RefinementShardPlan.from_dict(plan_value)
+            validate_refinement_shard_plan(schedule, plan)
         if plan != expected_plans[plan.shard_index]:
             raise ValueError("refinement shard plan differs from deterministic plan")
         if plan.shard_index in observed:
@@ -1536,7 +1665,11 @@ def merge_refinement_shards(
     source_artifacts = []
     for shard_index in range(4):
         root, plan, _ = observed[shard_index]
-        entries = validate_refinement_shard_plan(schedule, plan)
+        entries = (
+            validate_projected_refinement_shard_plan(schedule, plan)
+            if projected and isinstance(plan, ProjectedRefinementShardPlan)
+            else validate_refinement_shard_plan(schedule, plan)
+        )
         store = _RecordStore(root, schedule, samples, entries)
         store.require_complete(max_attempts)
         rows = tuple(
@@ -1590,7 +1723,11 @@ def merge_refinement_shards(
     write_immutable_json(
         receipt_path,
         {
-            "schema_version": REFINEMENT_MERGE_SCHEMA,
+            "schema_version": (
+                PROJECTED_REFINEMENT_MERGE_SCHEMA
+                if projected
+                else REFINEMENT_MERGE_SCHEMA
+            ),
             "master_schedule_hash": schedule.canonical_hash,
             "sample_bundle_hash": samples.canonical_hash,
             "logical_runtime_fingerprint": logical_fingerprint,
@@ -1622,6 +1759,26 @@ def merge_refinement_shards(
         result_rows=len(merged_rows),
         merged_results_sha256=merged_hash,
         receipt_path=str(receipt_path),
+    )
+
+
+def merge_projected_refinement_shards(
+    *,
+    schedule: RefinementSchedule,
+    samples: RefinementSampleBundle,
+    shard_roots: Sequence[str | Path],
+    output_dir: str | Path,
+    max_attempts: int = 3,
+) -> RefinementMergeSummary:
+    """Merge the distinct single-source projected four-shard contract."""
+
+    return merge_refinement_shards(
+        schedule=schedule,
+        samples=samples,
+        shard_roots=shard_roots,
+        output_dir=output_dir,
+        max_attempts=max_attempts,
+        projected=True,
     )
 
 
@@ -1677,6 +1834,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--work-root")
     parser.add_argument("--shard-plan")
+    parser.add_argument("--projected-shard-plan")
     parser.add_argument("--device-label", required=True)
     parser.add_argument("--decode-microbatch-size", type=int, default=8)
     parser.add_argument("--bootstrap-replicates", type=int, default=2000)
@@ -1691,11 +1849,21 @@ def main(argv: Iterable[str] | None = None) -> int:
     shard_plan = (
         load_refinement_shard_plan(args.shard_plan) if args.shard_plan else None
     )
-    execution_entries = (
-        validate_refinement_shard_plan(schedule, shard_plan)
-        if shard_plan is not None
-        else schedule.entries
+    projected_shard_plan = (
+        load_projected_refinement_shard_plan(args.projected_shard_plan)
+        if args.projected_shard_plan
+        else None
     )
+    if shard_plan is not None and projected_shard_plan is not None:
+        raise ValueError("strict and projected shard plans are mutually exclusive")
+    if projected_shard_plan is not None:
+        execution_entries = validate_projected_refinement_shard_plan(
+            schedule, projected_shard_plan
+        )
+    elif shard_plan is not None:
+        execution_entries = validate_refinement_shard_plan(schedule, shard_plan)
+    else:
+        execution_entries = schedule.entries
     samples = load_refinement_sample_bundle(args.sample_bundle)
     receipt = load_immutable_json(args.calibration_receipt)
     if receipt.get("schema_version") != "decode-gptq-calibration":
@@ -1749,19 +1917,32 @@ def main(argv: Iterable[str] | None = None) -> int:
         if args.work_root
         else Path(args.output_dir).resolve() / "work"
     )
-    # Imported here: refinement_evaluator imports this module's bank types.
-    from decode_dse.software.refinement_evaluator import RefinementEvaluator
+    if execution_entries:
+        # Imported here: refinement_evaluator imports this module's bank types.
+        from decode_dse.software.refinement_evaluator import RefinementEvaluator
 
-    adapter = RefinementEvaluator(
-        config=config,
-        sample_bundle_path=args.sample_bundle,
-        prefill_root=args.prefill_root,
-        admission_root=args.admission_root,
-        workspace_root=work_root,
-        device_label=args.device_label,
-        decode_microbatch_size=args.decode_microbatch_size,
-        max_cpu_cache_gib=float(refinement.get("max_cpu_cache_gib", 24)),
-    )
+        adapter: Any = RefinementEvaluator(
+            config=config,
+            sample_bundle_path=args.sample_bundle,
+            prefill_root=args.prefill_root,
+            admission_root=args.admission_root,
+            workspace_root=work_root,
+            device_label=args.device_label,
+            decode_microbatch_size=args.decode_microbatch_size,
+            max_cpu_cache_gib=float(refinement.get("max_cpu_cache_gib", 24)),
+        )
+    else:
+        seed = int(config.get("seed", 0))
+        initialize_numerical_runtime(seed)
+        empty_runtime = capture_runtime_environment(
+            str(config.get("device", "cuda:0")), seed=seed
+        )
+
+        class _EmptyProjectedShardExecutor:
+            def runtime_environment(self) -> dict[str, Any]:
+                return empty_runtime.to_dict()
+
+        adapter = _EmptyProjectedShardExecutor()
     summary = RefinementRunner(
         schedule=schedule,
         samples=samples,
@@ -1770,6 +1951,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         output_dir=args.output_dir,
         bootstrap_replicates=args.bootstrap_replicates,
         shard_plan=shard_plan,
+        projected_shard_plan=projected_shard_plan,
     ).run()
     print(json.dumps(summary.__dict__, indent=2, sort_keys=True))
     return (
@@ -1811,7 +1993,11 @@ def refinement_worker_command(
     device_label: str,
     decode_microbatch_size: int,
     bootstrap_replicates: int,
+    projected: bool = False,
 ) -> tuple[str, ...]:
+    shard_argument = (
+        "--projected-shard-plan" if projected else "--shard-plan"
+    )
     return (
         sys.executable,
         "-m",
@@ -1821,7 +2007,7 @@ def refinement_worker_command(
         str(config),
         "--schedule",
         str(schedule),
-        "--shard-plan",
+        shard_argument,
         str(shard_plan),
         "--sample-bundle",
         str(sample_bundle),
@@ -1896,17 +2082,27 @@ def launch_refinement(
     devices: Sequence[str],
     decode_microbatch_size: int = 8,
     bootstrap_replicates: int = 2000,
+    projected: bool = False,
 ) -> int:
     waves = _refinement_launch_waves(devices)
     _require_isolated_roots((admission_root, checkpoint_root, output_root, work_root))
     schedule = load_refinement_schedule(schedule_path)
-    plans = build_refinement_shard_plans(schedule)
+    if not isinstance(projected, bool):
+        raise TypeError("projected launch mode must be a boolean")
+    plans = (
+        build_projected_refinement_shard_plans(schedule)
+        if projected
+        else build_refinement_shard_plans(schedule)
+    )
     shard_roots = _shard_roots(output_root)
     plan_root = output_root / "plans"
     plan_paths = []
     for plan in plans:
         path = plan_root / f"shard-{plan.shard_index:02d}.json"
-        write_refinement_shard_plan(path, plan)
+        if projected:
+            write_projected_refinement_shard_plan(path, plan)
+        else:
+            write_refinement_shard_plan(path, plan)
         plan_paths.append(path)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
@@ -1936,6 +2132,7 @@ def launch_refinement(
                     device_label=device_label,
                     decode_microbatch_size=decode_microbatch_size,
                     bootstrap_replicates=bootstrap_replicates,
+                    projected=projected,
                 )
                 log_path = log_root / f"{shard_name}.log"
                 handle = log_path.open("wb")
@@ -1988,11 +2185,16 @@ def launch_refinement(
         samples=samples,
         shard_roots=shard_roots,
         output_dir=output_root / "merged",
+        projected=projected,
     )
     write_immutable_json(
         log_root / "summary.json",
         {
-            "schema_version": "decode-refinement-launch",
+            "schema_version": (
+                "decode-projected-refinement-launch/v1"
+                if projected
+                else "decode-refinement-launch"
+            ),
             "master_schedule_hash": schedule.canonical_hash,
             "sample_bundle_hash": samples.canonical_hash,
             "workers": [
@@ -2019,12 +2221,14 @@ def merge_existing_refinement(
     schedule_path: Path,
     sample_bundle_path: Path,
     output_root: Path,
+    projected: bool = False,
 ) -> int:
     summary = merge_refinement_shards(
         schedule=load_refinement_schedule(schedule_path),
         samples=load_refinement_sample_bundle(sample_bundle_path),
         shard_roots=_shard_roots(output_root),
         output_dir=output_root / "merged",
+        projected=projected,
     )
     print(json.dumps(summary.__dict__, indent=2, sort_keys=True))
     return 0
@@ -2033,26 +2237,28 @@ def merge_existing_refinement(
 def launch_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    launch = subparsers.add_parser("launch")
-    launch.add_argument("--config", type=Path, required=True)
-    launch.add_argument("--schedule", type=Path, required=True)
-    launch.add_argument("--sample-bundle", type=Path, required=True)
-    launch.add_argument("--prefill-root", type=Path, required=True)
-    launch.add_argument("--admission-root", type=Path, required=True)
-    launch.add_argument("--calibration", type=Path, required=True)
-    launch.add_argument("--calibration-receipt", type=Path, required=True)
-    launch.add_argument("--checkpoint-root", type=Path, required=True)
-    launch.add_argument("--output-root", type=Path, required=True)
-    launch.add_argument("--work-root", type=Path, required=True)
-    launch.add_argument("--device-label", required=True)
-    launch.add_argument("--gpus", required=True)
-    launch.add_argument("--decode-microbatch-size", type=int, default=8)
-    launch.add_argument("--bootstrap-replicates", type=int, default=2000)
+    for command in ("launch", "launch-projected"):
+        launch = subparsers.add_parser(command)
+        launch.add_argument("--config", type=Path, required=True)
+        launch.add_argument("--schedule", type=Path, required=True)
+        launch.add_argument("--sample-bundle", type=Path, required=True)
+        launch.add_argument("--prefill-root", type=Path, required=True)
+        launch.add_argument("--admission-root", type=Path, required=True)
+        launch.add_argument("--calibration", type=Path, required=True)
+        launch.add_argument("--calibration-receipt", type=Path, required=True)
+        launch.add_argument("--checkpoint-root", type=Path, required=True)
+        launch.add_argument("--output-root", type=Path, required=True)
+        launch.add_argument("--work-root", type=Path, required=True)
+        launch.add_argument("--device-label", required=True)
+        launch.add_argument("--gpus", required=True)
+        launch.add_argument("--decode-microbatch-size", type=int, default=8)
+        launch.add_argument("--bootstrap-replicates", type=int, default=2000)
 
-    merge = subparsers.add_parser("merge")
-    merge.add_argument("--schedule", type=Path, required=True)
-    merge.add_argument("--sample-bundle", type=Path, required=True)
-    merge.add_argument("--output-root", type=Path, required=True)
+    for command in ("merge", "merge-projected"):
+        merge = subparsers.add_parser(command)
+        merge.add_argument("--schedule", type=Path, required=True)
+        merge.add_argument("--sample-bundle", type=Path, required=True)
+        merge.add_argument("--output-root", type=Path, required=True)
     return parser
 
 
@@ -2060,11 +2266,12 @@ def launch_main(argv: Iterable[str] | None = None) -> int:
     parser = launch_parser()
     args = parser.parse_args(tuple(argv) if argv is not None else None)
     try:
-        if args.command == "merge":
+        if args.command in {"merge", "merge-projected"}:
             return merge_existing_refinement(
                 schedule_path=args.schedule.resolve(),
                 sample_bundle_path=args.sample_bundle.resolve(),
                 output_root=args.output_root.resolve(),
+                projected=args.command == "merge-projected",
             )
         return launch_refinement(
             config=args.config.resolve(),
@@ -2081,6 +2288,7 @@ def launch_main(argv: Iterable[str] | None = None) -> int:
             devices=parse_gpu_pool(args.gpus),
             decode_microbatch_size=args.decode_microbatch_size,
             bootstrap_replicates=args.bootstrap_replicates,
+            projected=args.command == "launch-projected",
         )
     except (OSError, ValueError) as error:
         parser.error(str(error))
@@ -2088,9 +2296,13 @@ def launch_main(argv: Iterable[str] | None = None) -> int:
 
 
 __all__ = [
+    "ATTENTION_ONLY_ROTATION_METHOD",
+    "ATTENTION_ONLY_ROTATION_MATMUL_TYPES",
+    "FUSED_EXPERT_ROTATION_EXCLUSIONS",
     "REFINEMENT_BANK_SCHEMA",
     "REFINEMENT_COMPLETION_SCHEMA",
     "REFINEMENT_MERGE_SCHEMA",
+    "PROJECTED_REFINEMENT_MERGE_SCHEMA",
     "REFINEMENT_RESULT_SCHEMA",
     "RefinementBankHandle",
     "RefinementBankSpec",
@@ -2104,11 +2316,14 @@ __all__ = [
     "build_refinement_bank_specs",
     "clustered_bootstrap_mean_nll",
     "merge_refinement_shards",
+    "merge_projected_refinement_shards",
     "load_refinement_merged_results",
+    "load_projected_refinement_merged_results",
     "rotation_policy",
     "rotation_policy_hash",
     "rotation_decision_contract",
     "rotation_decision_contract_hash",
+    "validate_attention_only_rotation_decision",
     "refinement_bank_key",
     "refinement_rng_policy",
     "refinement_rng_policy_hash",
@@ -2735,7 +2950,12 @@ def dispatch(argv: Sequence[str] | None = None) -> int:
     """Route to one of this module's commands."""
 
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments and arguments[0] in {"launch", "merge"}:
+    if arguments and arguments[0] in {
+        "launch",
+        "launch-projected",
+        "merge",
+        "merge-projected",
+    }:
         return launch_main(arguments)
     commands = {
         "prepare": refinement_inputs_main,
@@ -2743,7 +2963,8 @@ def dispatch(argv: Sequence[str] | None = None) -> int:
     }
     if not arguments or arguments[0] not in commands:
         raise SystemExit(
-            "usage: <command> [options]; commands: launch, merge, prepare, run"
+            "usage: <command> [options]; commands: launch, launch-projected, "
+            "merge, merge-projected, prepare, run"
         )
     return commands[arguments[0]](arguments[1:])
 

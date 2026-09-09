@@ -8,8 +8,10 @@ from decode_dse.profiles import DecodePrecisionProfile
 from decode_dse.software.refinement_schedule import (
     DoomedGateDecision,
     DoomedGatePolicy,
+    RefinementAccuracyEvidence,
     RefinementSchedule,
     RefinementScheduleEntry,
+    build_refinement_schedule,
     derive_refinement_validity,
     iter_split_kv_variants,
     _path_hash,
@@ -99,6 +101,37 @@ def test_equal_kv_variant_inherits_measured_validity_split_kv_stays_unmeasured()
         entry.profile.key_format != entry.profile.value_format
         for entry in schedule.entries
     )
+
+
+def test_target_symmetric_kv_refinement_omits_legacy_split_neighbors():
+    source = DecodePrecisionProfile.quantized(
+        "MXINT8", "MXINT8", "MXINT4", "FP_E3M2"
+    )
+    evidence = {
+        source.profile_id: RefinementAccuracyEvidence(
+            source_profile_id=source.profile_id,
+            state="succeeded",
+            mean_nll=1.0,
+        )
+    }
+
+    canonical = build_refinement_schedule(
+        (source,),
+        evidence,
+        reference_mean_nll=1.0,
+        require_symmetric_kv=True,
+    )
+    legacy = build_refinement_schedule(
+        (source,),
+        evidence,
+        reference_mean_nll=1.0,
+    )
+
+    assert len(canonical.entries) == 1
+    assert canonical.entries[0].profile.key_format == "MXINT4"
+    assert canonical.entries[0].profile.value_format == "MXINT4"
+    assert all(not entry.profile.split_kv for entry in canonical.entries)
+    assert any(entry.profile.split_kv for entry in legacy.entries)
 
 
 def test_uncovered_refinement_source_fails_closed():
