@@ -20,6 +20,7 @@ from decode_dse.plots import (
     _model_validation_table,
     _multichip_table,
     _numerical_table,
+    _packedkv_receipt_policy,
     _packedkv_table,
     _stage_breakdown_table,
     _vector_table,
@@ -38,7 +39,14 @@ from decode_dse.plots import (
     plot_stage_breakdown,
     plot_vector_sensitivity,
 )
-from decode_dse.hardware.packedkv_claims import PACKEDKV_MODES, PRECISION_ROLES
+from decode_dse.hardware.packedkv_claims import (
+    EVIDENCE_SCHEMA as PACKEDKV_EVIDENCE_SCHEMA,
+    PACKEDKV_CLAIM_SCOPE,
+    PACKEDKV_MODES,
+    PACKEDKV_TARGET_HEADLINE_ELIGIBLE,
+    PRECISION_ROLES,
+    TPOT_SCOPE as PACKEDKV_TPOT_SCOPE,
+)
 from decode_dse.profiles import (
     DECODE_FORMATS,
     PROFILE_KIND_BF16_REFERENCE,
@@ -138,6 +146,9 @@ def test_selected_publication_rows_bind_every_consumed_artifact(
 ) -> None:
     from decode_dse import plots
     from decode_dse.hardware.design_space import HARDWARE_STORAGE_REVISION
+    from decode_dse.hardware.test_evaluation_contracts import (
+        _serialized_measured_head_boundary,
+    )
     from decode_dse.software import gpu_baseline
     from decode_dse.software.benchmark_runner import PublicationContract
     from decode_dse.software.sweep_plan import write_immutable_json
@@ -310,12 +321,16 @@ def test_selected_publication_rows_bind_every_consumed_artifact(
         "profile_id": profile_id,
         "candidate_id": candidate_id,
         "hardware": {"BATCH": 2},
-        "metrics": {
-            "execution_mode": "compiler_trace",
-            "timing_calibrated": True,
-            "timing_evidence_id": "timing-" + "6" * 64,
+            "metrics": {
+                "execution_mode": "compiler_trace",
+                "timing_calibrated": True,
+                "timing_evidence_id": "timing-" + "6" * 64,
+                "output_head_boundary": _serialized_measured_head_boundary(),
+                "resource_budget": {"feasible": True},
+                "generated_tokens_per_step": 1,
             "whole_model": {
                 "rankable": True,
+                "strict_system_resource_boundary_valid": True,
                 "publication_timing_tier": "compiler_trace_request_calibrated",
                 "tpot_ms": 4.0,
                 "tps": 500.0,
@@ -523,6 +538,24 @@ def test_packedkv_causal_ablation_renders_all_controls(
     table = _packedkv_table(evidence)
     assert len(table) == len(PRECISION_ROLES) * len(PACKEDKV_MODES)
     assert {row["mode"] for row in table} == set(PACKEDKV_MODES)
+
+
+def test_packedkv_receipt_is_explicitly_excluded_from_local_mx_headline() -> None:
+    policy = _packedkv_receipt_policy()
+
+    assert policy == {
+        "evidence_schema": PACKEDKV_EVIDENCE_SCHEMA,
+        "claim_scope": PACKEDKV_CLAIM_SCOPE,
+        "tpot_scope": PACKEDKV_TPOT_SCOPE,
+        "target_headline_eligible": PACKEDKV_TARGET_HEADLINE_ELIGIBLE,
+        "exclusion_reason": (
+            "requires a fixed remote BF16 output-head service and therefore "
+            "cannot rank or promote the decode-local MX target"
+        ),
+    }
+    assert policy["claim_scope"] == "legacy_remote_bf16_ablation_only"
+    assert policy["target_headline_eligible"] is False
+    assert policy["tpot_scope"] == "whole_model_remote_bf16_head"
 
 
 def test_completion_matrix_renders_an_all_failed_column(tmp_path: Path) -> None:
@@ -836,7 +869,7 @@ def _accuracy_budget_rows(
                 power_calibration_id="synthetic-power",
                 cost_scope="whole_model",
                 system_calibration_id="synthetic-system",
-                head_service_calibration_id="synthetic-head",
+                head_service_calibration_id=None,
                 whole_model_rankable=True,
                 energy_tier="analytic_anchored",
                 publication_timing_tier="stage_calibrated_analytic",

@@ -35,8 +35,12 @@ from decode_dse.hardware.model_validation import (  # noqa: E402
     pricing_model_validation,
 )
 from decode_dse.hardware.packedkv_claims import (  # noqa: E402
+    EVIDENCE_SCHEMA as PACKEDKV_EVIDENCE_SCHEMA,
+    PACKEDKV_CLAIM_SCOPE,
     PACKEDKV_MODES,
+    PACKEDKV_TARGET_HEADLINE_ELIGIBLE,
     PRECISION_ROLES,
+    TPOT_SCOPE as PACKEDKV_TPOT_SCOPE,
     evaluate_packedkv_publication,
     load_packedkv_evidence,
 )
@@ -73,6 +77,21 @@ RESULTS_PROVENANCE_SCHEMA = "decode-sweep-results-provenance"
 ANALYSIS_SCHEMA = "decode-publication-analysis"
 PORTABLE_WORKSPACE_PROVENANCE = "workspace_provenance.json"
 FIGURE_DPI = 600
+
+
+def _packedkv_receipt_policy() -> dict[str, Any]:
+    """Disclose that PackedKV evidence is a legacy, non-headline ablation."""
+
+    return {
+        "evidence_schema": PACKEDKV_EVIDENCE_SCHEMA,
+        "claim_scope": PACKEDKV_CLAIM_SCOPE,
+        "tpot_scope": PACKEDKV_TPOT_SCOPE,
+        "target_headline_eligible": PACKEDKV_TARGET_HEADLINE_ELIGIBLE,
+        "exclusion_reason": (
+            "requires a fixed remote BF16 output-head service and therefore "
+            "cannot rank or promote the decode-local MX target"
+        ),
+    }
 
 
 @dataclass(frozen=True)
@@ -2314,7 +2333,7 @@ def plot_packedkv_ablation(
     _set_title(
         axes[0],
         "PackedKV physical traffic",
-        "Qwen GQA-8 · fixed precision, geometry, clock, and HBM",
+        "Legacy remote-BF16 ablation · fixed precision, geometry, clock, and HBM",
     )
     _set_title(
         axes[1],
@@ -2324,7 +2343,10 @@ def plot_packedkv_ablation(
     _set_title(
         axes[2],
         "PackedKV serving throughput",
-        f"Gate status: {'passed' if report.passed else 'not passed'}",
+        (
+            f"Legacy-ablation gate: {'passed' if report.passed else 'not passed'} "
+            "· not target-headline eligible"
+        ),
     )
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
@@ -3784,7 +3806,7 @@ def render(args: argparse.Namespace) -> dict[str, Any]:
                 "means the point was priced by the validated model and was not "
                 "separately compiled and emulated at its own geometry"
             ),
-            "packedkv": "checksum-valid packedkv-publication-evidence/v4",
+            "packedkv": _packedkv_receipt_policy(),
             "decode_analysis": ANALYSIS_SCHEMA,
             "selected_deployment": (
                 "post-accuracy exact refined-hardware join with a separately "

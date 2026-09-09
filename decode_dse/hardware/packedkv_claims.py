@@ -1,4 +1,10 @@
-"""Fail-closed publication gate for the PackedKV causal ablation."""
+"""Fail-closed gate for the legacy remote-BF16 PackedKV ablation.
+
+This module prices a historical causal layout comparison whose whole-model
+TPOT includes a fixed remote BF16 output-head service.  It is intentionally
+separate from, and never headline-eligible for, the Qwen decode-local MX
+output-head study.
+"""
 
 from __future__ import annotations
 
@@ -41,6 +47,8 @@ REQUIRED_PROVENANCE = (
 )
 STEP_COMPOSITION = "max_compute_memory"
 TPOT_SCOPE = "whole_model_remote_bf16_head"
+PACKEDKV_CLAIM_SCOPE = "legacy_remote_bf16_ablation_only"
+PACKEDKV_TARGET_HEADLINE_ELIGIBLE = False
 CAPACITY_LIMITERS = ("hbm", "matrix_sram", "vector_sram", "isa_batch")
 CAPACITY_THROUGHPUT_SCOPES = (
     "cross_stack_measured",
@@ -1636,7 +1644,9 @@ __all__ = [
     "DENSE_SELECTOR",
     "EVIDENCE_SCHEMA",
     "IDEAL_TRAFFIC",
+    "PACKEDKV_CLAIM_SCOPE",
     "PACKEDKV_MODES",
+    "PACKEDKV_TARGET_HEADLINE_ELIGIBLE",
     "PADDED_PER_HEAD",
     "PackedKVAblationGroup",
     "PackedKVGateCheck",
@@ -1647,6 +1657,7 @@ __all__ = [
     "PackedKVPublicationReport",
     "PipelineValidationEvidence",
     "SelectorSynthesisEvidence",
+    "TPOT_SCOPE",
     "evaluate_packedkv_publication",
     "expected_packedkv_bytes",
     "load_packedkv_evidence",
