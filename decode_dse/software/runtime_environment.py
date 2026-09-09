@@ -61,6 +61,15 @@ _ARCHITECTURE_FIELDS = (
     "tie_word_embeddings",
     "attention_bias",
 )
+_MOE_ARCHITECTURE_FIELDS = (
+    "model_type",
+    "moe_intermediate_size",
+    "num_experts",
+    "num_experts_per_tok",
+    "norm_topk_prob",
+    "decoder_sparse_step",
+    "mlp_only_layers",
+)
 _MIB = 1 << 20
 _GIB = 1 << 30
 _ACTIVATION_LIVE_TENSOR_FACTOR = 4
@@ -358,6 +367,8 @@ class LaunchEnvironmentObservation:
     collection_errors: tuple[str, ...] = ()
     #: CUDA architectures the installed torch wheel was built for.
     torch_arch_list: tuple[str, ...] = ()
+    #: Cheap model-family ABI probe; no checkpoint tensors are loaded.
+    model_runtime_abi: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -458,12 +469,13 @@ class LaunchPreflightReport:
             raise LaunchPreflightError("\n".join(lines))
 
 
-def dense_decoder_parameter_count(model_config: Mapping[str, Any]) -> int:
-    """Compute parameters for a dense GQA decoder from its pinned architecture.
+def decoder_parameter_count(model_config: Mapping[str, Any]) -> int:
+    """Compute exact dense or routed-MoE GQA decoder parameters.
 
-    Covers the Llama and Qwen3 dense families. Qwen3 adds RMSNorm over the
-    per-head query and key projections, which Llama does not have; the term is
-    included only when the snapshot declares it.
+    Qwen3-MoE uses fused expert tensors, but their parameter arithmetic remains
+    two gate/up matrices plus one down matrix per expert.  Router weights are
+    counted separately and dense-only layers follow the snapshot's sparse-step
+    contract.
     """
 
     required = (
@@ -494,7 +506,43 @@ def dense_decoder_parameter_count(model_config: Mapping[str, Any]) -> int:
     attention = hidden * query_dim + 2 * hidden * kv_dim + query_dim * hidden
     if biased:
         attention += query_dim + 2 * kv_dim + hidden
-    feed_forward = 3 * hidden * intermediate
+    num_experts = int(model_config.get("num_experts", 1))
+    if num_experts <= 0:
+        raise ValueError("num_experts must be positive")
+    if num_experts > 1:
+        for field in _MOE_ARCHITECTURE_FIELDS:
+            if field not in model_config:
+                raise ValueError(f"pinned MoE model config lacks {field}")
+        moe_intermediate = int(model_config["moe_intermediate_size"])
+        topk = int(model_config["num_experts_per_tok"])
+        sparse_step = int(model_config["decoder_sparse_step"])
+        mlp_only_layers = tuple(int(index) for index in model_config["mlp_only_layers"])
+        if moe_intermediate <= 0 or sparse_step <= 0:
+            raise ValueError("MoE intermediate width and sparse step must be positive")
+        if not 1 <= topk <= num_experts:
+            raise ValueError("num_experts_per_tok must be in [1, num_experts]")
+        if (
+            len(mlp_only_layers) != len(set(mlp_only_layers))
+            or any(index < 0 or index >= layers for index in mlp_only_layers)
+        ):
+            raise ValueError("mlp_only_layers contains invalid or duplicate indices")
+        dense_only = set(mlp_only_layers)
+        moe_layer_count = sum(
+            index not in dense_only and (index + 1) % sparse_step == 0
+            for index in range(layers)
+        )
+        dense_layer_count = layers - moe_layer_count
+        dense_feed_forward = 3 * hidden * intermediate
+        moe_feed_forward = (
+            hidden * num_experts
+            + 3 * hidden * moe_intermediate * num_experts
+        )
+        feed_forward_total = (
+            dense_layer_count * dense_feed_forward
+            + moe_layer_count * moe_feed_forward
+        )
+    else:
+        feed_forward_total = layers * 3 * hidden * intermediate
     # Input and post-attention RMSNorm; Qwen3 adds q_norm and k_norm.
     layer_norms = 2 * hidden
     if _has_qk_norm(model_config):
@@ -506,9 +554,16 @@ def dense_decoder_parameter_count(model_config: Mapping[str, Any]) -> int:
     return (
         embedding
         + output_head
-        + layers * (attention + feed_forward + layer_norms)
+        + layers * (attention + layer_norms)
+        + feed_forward_total
         + final_norm
     )
+
+
+def dense_decoder_parameter_count(model_config: Mapping[str, Any]) -> int:
+    """Backward-compatible name for :func:`decoder_parameter_count`."""
+
+    return decoder_parameter_count(model_config)
 
 
 def _has_qk_norm(model_config: Mapping[str, Any]) -> bool:
@@ -526,7 +581,10 @@ def _has_qk_norm(model_config: Mapping[str, Any]) -> bool:
 def _architecture_view(model_config: Mapping[str, Any]) -> dict[str, Any]:
     """Return explicit architecture values, deriving standard head width."""
 
-    result = {field: model_config.get(field) for field in _ARCHITECTURE_FIELDS}
+    result = {
+        field: model_config.get(field)
+        for field in (*_ARCHITECTURE_FIELDS, *_MOE_ARCHITECTURE_FIELDS)
+    }
     if result["head_dim"] is None:
         hidden = result["hidden_size"]
         heads = result["num_attention_heads"]
@@ -743,6 +801,64 @@ def _dataset_asset(
         return None
 
 
+def _observe_qwen3_moe_runtime_abi() -> Mapping[str, Any]:
+    """Probe the fused Transformers Qwen3-MoE module ABI without a model load."""
+
+    schema = "transformers-qwen3-moe-fused-abi/v1"
+    try:
+        from transformers.models.qwen3_moe import Qwen3MoeConfig
+        from transformers.models.qwen3_moe.modeling_qwen3_moe import (
+            Qwen3MoeExperts,
+            Qwen3MoeSparseMoeBlock,
+            Qwen3MoeTopKRouter,
+        )
+
+        probe = Qwen3MoeConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            moe_intermediate_size=8,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            num_experts=4,
+            num_experts_per_tok=2,
+            norm_topk_prob=True,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            max_position_embeddings=32,
+        )
+        block = Qwen3MoeSparseMoeBlock(probe)
+        experts = block.experts
+        router = block.gate
+        gate_up_shape = tuple(int(value) for value in experts.gate_up_proj.shape)
+        down_shape = tuple(int(value) for value in experts.down_proj.shape)
+        router_shape = tuple(int(value) for value in router.weight.shape)
+        passed = (
+            isinstance(experts, Qwen3MoeExperts)
+            and isinstance(router, Qwen3MoeTopKRouter)
+            and gate_up_shape == (4, 16, 16)
+            and down_shape == (4, 16, 8)
+            and router_shape == (4, 16)
+        )
+        return {
+            "schema_version": schema,
+            "passed": passed,
+            "experts_class": type(experts).__name__,
+            "router_class": type(router).__name__,
+            "gate_up_proj_shape": list(gate_up_shape),
+            "down_proj_shape": list(down_shape),
+            "router_weight_shape": list(router_shape),
+        }
+    except Exception as error:
+        return {
+            "schema_version": schema,
+            "passed": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
 def collect_launch_environment(
     config: Mapping[str, Any],
     *,
@@ -883,6 +999,14 @@ def collect_launch_environment(
     observations = tuple(
         _observe_mutable_path(label, path) for label, path in path_values
     )
+    declared_architecture = config.get("model_architecture")
+    model_runtime_abi = None
+    if (
+        isinstance(declared_architecture, Mapping)
+        and declared_architecture.get("model_type") == "qwen3_moe"
+    ):
+        model_runtime_abi = _observe_qwen3_moe_runtime_abi()
+
     return LaunchEnvironmentObservation(
         package_versions=packages,
         cuda_devices=tuple(devices),
@@ -897,6 +1021,7 @@ def collect_launch_environment(
         mutable_paths=observations,
         collection_errors=tuple(errors),
         torch_arch_list=arch_list,
+        model_runtime_abi=model_runtime_abi,
     )
 
 
@@ -946,6 +1071,26 @@ def _version_at_least(observed: str | None, required: str) -> bool:
         return Version(observed) >= Version(required)
     except InvalidVersion:
         return False
+
+
+def _version_exact(observed: str | None, required: str) -> bool:
+    """Match one tested release while permitting only a local build suffix."""
+
+    if observed is None:
+        return False
+    try:
+        actual = Version(observed)
+        expected = Version(required)
+    except InvalidVersion:
+        return False
+    return (
+        actual.base_version == expected.base_version
+        and actual.epoch == expected.epoch
+        and not actual.is_prerelease
+        and not actual.is_devrelease
+        and not expected.is_prerelease
+        and not expected.is_devrelease
+    )
 
 
 def _projected_admission_bytes(model_config: Mapping[str, Any]) -> int:
@@ -1170,6 +1315,39 @@ def evaluate_launch_preflight(
             f"failures={json.dumps(version_failures, sort_keys=True)}"
         ),
     )
+    exact_versions = requirements_map.get("exact_package_versions")
+    exact_requirements = (
+        dict(exact_versions) if isinstance(exact_versions, Mapping) else {}
+    )
+    exact_failures = {
+        str(name): {
+            "required": str(required),
+            "observed": observation.package_versions.get(str(name)),
+        }
+        for name, required in sorted(exact_requirements.items())
+        if not _version_exact(
+            observation.package_versions.get(str(name)),
+            str(required),
+        )
+    }
+    if exact_requirements:
+        _append_check(
+            checks,
+            code="exact_package_versions",
+            passed=not exact_failures,
+            requirement="ABI-sensitive packages match their tested releases exactly",
+            observed=json.dumps(
+                {
+                    "exact": exact_requirements,
+                    "installed": dict(observation.package_versions),
+                },
+                sort_keys=True,
+            ),
+            resolution=(
+                "install the exact runtime_requirements releases; "
+                f"failures={json.dumps(exact_failures, sort_keys=True)}"
+            ),
+        )
 
     _append_check(
         checks,
@@ -1188,11 +1366,20 @@ def evaluate_launch_preflight(
     )
 
     declared_architecture = config.get("model_architecture")
+    is_declared_moe = (
+        isinstance(declared_architecture, Mapping)
+        and int(declared_architecture.get("num_experts", 1)) > 1
+    )
+    architecture_fields = (
+        (*_ARCHITECTURE_FIELDS, *_MOE_ARCHITECTURE_FIELDS)
+        if is_declared_moe
+        else _ARCHITECTURE_FIELDS
+    )
     architecture_declared = isinstance(declared_architecture, Mapping) and all(
-        field in declared_architecture for field in _ARCHITECTURE_FIELDS
+        field in declared_architecture for field in architecture_fields
     )
     expected_architecture: Mapping[str, Any] = (
-        {field: declared_architecture[field] for field in _ARCHITECTURE_FIELDS}
+        {field: declared_architecture[field] for field in architecture_fields}
         if architecture_declared
         else {}
     )
@@ -1213,11 +1400,11 @@ def evaluate_launch_preflight(
         passed=architecture_ok,
         requirement=(
             f"the cached revision must match the architecture {model_name} pins "
-            f"in model_architecture ({', '.join(_ARCHITECTURE_FIELDS)})"
+            f"in model_architecture ({', '.join(architecture_fields)})"
         ),
         observed=(
             json.dumps(
-                {key: observed_architecture.get(key) for key in _ARCHITECTURE_FIELDS},
+                {key: observed_architecture.get(key) for key in architecture_fields},
                 sort_keys=True,
             )
             if architecture_declared
@@ -1228,6 +1415,33 @@ def evaluate_launch_preflight(
             "do not substitute another size"
         ),
     )
+    if (
+        is_declared_moe
+        and isinstance(declared_architecture, Mapping)
+        and declared_architecture.get("model_type") == "qwen3_moe"
+    ):
+        abi = observation.model_runtime_abi
+        abi_ok = (
+            isinstance(abi, Mapping)
+            and abi.get("schema_version")
+            == "transformers-qwen3-moe-fused-abi/v1"
+            and abi.get("passed") is True
+        )
+        _append_check(
+            checks,
+            code="qwen3_moe_runtime_abi",
+            passed=abi_ok,
+            requirement=(
+                "Transformers exposes fused Qwen3MoeExperts tensors and the "
+                "Qwen3MoeTopKRouter layout consumed by MASE"
+            ),
+            observed=json.dumps(dict(abi), sort_keys=True) if abi else "not probed",
+            resolution=(
+                "use the exact Transformers 5.5.0 execution environment; "
+                "the checkpoint's transformers_version metadata is not a "
+                "runtime compatibility lower bound"
+            ),
+        )
     # Resource arithmetic is declarative: the snapshot is checked for identity,
     # while every required dimension comes from the pinned configuration.
     arithmetic_config: dict[str, Any] = dict(observation.model_config)
@@ -1374,7 +1588,7 @@ def evaluate_launch_preflight(
     )
 
     try:
-        parameter_count = dense_decoder_parameter_count(arithmetic_config)
+        parameter_count = decoder_parameter_count(arithmetic_config)
         parameter_count_error: str | None = None
     except Exception as error:
         parameter_count = 0

@@ -57,6 +57,7 @@ from decode_dse.software.refinement_runner import (
     refinement_rng_policy_hash,
     rotation_policy,
     seal_checkpoint_identity,
+    validate_attention_only_rotation_decision,
 )
 from decode_dse.software.token_samples import RefinementSampleBundle
 from decode_dse.software.runtime_environment import (
@@ -467,6 +468,7 @@ class RefinementEvaluator:
                 "improvement_eps": policy["improvement_epsilon"],
                 "cache_winners": policy["cache_winners"],
                 "score_phase": policy["score_phase"],
+                "matmul_types": list(policy["matmul_types"]),
                 "cache_path": str(
                     Path(bank.checkpoint_dir) / "rotation_decisions.json"
                 ),
@@ -494,11 +496,7 @@ class RefinementEvaluator:
             if not decision_path.is_file():
                 raise ValueError("rotation decisions are missing")
             decision = json.loads(decision_path.read_text(encoding="utf-8"))
-            if not isinstance(decision.get("winners"), list):
-                raise ValueError("rotation decisions contain no winner list")
-            for key in ("baseline_ppl", "final_ppl"):
-                if not math.isfinite(float(decision[key])):
-                    raise ValueError("rotation decision score is non-finite")
+            validate_attention_only_rotation_decision(decision)
 
     @contextmanager
     def open_weight_bank(
@@ -515,7 +513,10 @@ class RefinementEvaluator:
                 install_phase_context_pre_hooks,
                 quantize_module_transform_pass,
             )
-            from decode_dse.software.precision_bindings import build_decode_pass_args
+            from decode_dse.software.precision_bindings import (
+                build_decode_pass_args,
+                decode_binding_expectations,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "decode refinement requires torch, transformers, and MASE"
@@ -599,9 +600,9 @@ class RefinementEvaluator:
                         collapse = getattr(module, "collapse_to_decode_bank", None)
                         if callable(collapse) and collapse():
                             collapsed += 1
-                    expected_linears = 7 * int(
-                        self.engine.model_architecture["num_hidden_layers"]
-                    )
+                    expected_linears = decode_binding_expectations(
+                        dict(self.engine.model_architecture)
+                    ).sealed_weight_modules
                     if collapsed != expected_linears:
                         raise RuntimeError(
                             "rotation bank did not collapse all decode linears"
@@ -611,9 +612,9 @@ class RefinementEvaluator:
                 binding_plan = build_decode_binding_plan(model, pass_args)
                 quantization_guard = DecodeWeightQuantizationGuard.capture(
                     binding_plan,
-                    expected_modules=(
-                        7 * int(self.engine.model_architecture["num_hidden_layers"])
-                    ),
+                    expected_modules=decode_binding_expectations(
+                        dict(self.engine.model_architecture)
+                    ).sealed_weight_modules,
                 )
                 _validate_bank_structure(
                     model,

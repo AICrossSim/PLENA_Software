@@ -2163,11 +2163,16 @@ def evaluate_preflight_gates(
         )
     )
 
+    from decode_dse.software.precision_bindings import (
+        decode_binding_expectations,
+    )
+
     invalid_rebinding: list[str] = []
-    expected_sealed_modules = 7 * decoder_layers
-    expected_binding_targets = (
-        14 if manifest.model_architecture["use_qk_norm"] else 12
-    ) * decoder_layers + 1
+    binding_expectations = decode_binding_expectations(
+        dict(manifest.model_architecture)
+    )
+    expected_sealed_modules = binding_expectations.sealed_weight_modules
+    expected_binding_targets = binding_expectations.binding_targets
     for sample in evidence.runtime_rebinding_samples:
         profile = profile_by_id.get(sample.profile_id)
         is_bf16 = profile is not None and profile.kind == PROFILE_KIND_BF16_REFERENCE
@@ -2865,6 +2870,7 @@ def profile_to_decode_quant_spec(
         fp_setting=profile.vector_format,
         fp_setting_attention=True,
         quant_attn_internals=True,
+        matrix_mlen=profile.matrix_mlen,
     )
 
 

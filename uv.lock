@@ -2150,6 +2150,15 @@ wheels = [
 ]
 
 [[package]]
+name = "immutabledict"
+version = "4.3.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/e6/718471048fea0366c3e3d1df3acfd914ca66d571cdffcf6d37bbcd725708/immutabledict-4.3.1.tar.gz", hash = "sha256:f844a669106cfdc73f47b1a9da003782fb17dc955a54c80972e0d93d1c63c514", size = 7806, upload-time = "2026-02-15T10:32:34.668Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a3/ce/f9018bf69ae91b273b6391a095e7c93fa5e1617f25b6ba81ad4b20c9df10/immutabledict-4.3.1-py3-none-any.whl", hash = "sha256:c9facdc0ff30fdb8e35bd16532026cac472a549e182c94fa201b51b25e4bf7bf", size = 5000, upload-time = "2026-02-15T10:32:33.672Z" },
+]
+
+[[package]]
 name = "importlib-metadata"
 version = "9.0.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2701,6 +2710,15 @@ wheels = [
 ]
 
 [[package]]
+name = "langdetect"
+version = "1.0.9"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "six" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0e/72/a3add0e4eec4eb9e2569554f7c70f4a3c27712f40e3284d483e88094cc0e/langdetect-1.0.9.tar.gz", hash = "sha256:cbc1fef89f8d062739774bd51eda3da3274006b3661d199c2655f6b3f6d605a0", size = 981474, upload-time = "2021-05-07T07:54:13.562Z" }
+
+[[package]]
 name = "lightning"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2770,6 +2788,13 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/18/40/ad60ae17f97902ba4ee67914a94c159552f8643fb4598d1d2430a571f0a2/lm_eval-0.4.11.tar.gz", hash = "sha256:a3891d6d0b4ad17892f2ca1046094554ce3ab6cb522759e4a453858e45649916", size = 3246509, upload-time = "2026-02-13T20:22:59.494Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/df/b3/8c2923ad4c4d911307e20ab9c7d7869d3811b5a76fe6dbe53678aafbeb04/lm_eval-0.4.11-py3-none-any.whl", hash = "sha256:9c9945475a715558649a38ffcb90f46e7bd23a849524a5e838f249161b030517", size = 8744826, upload-time = "2026-02-13T20:22:56.317Z" },
+]
+
+[package.optional-dependencies]
+ifeval = [
+    { name = "immutabledict" },
+    { name = "langdetect" },
+    { name = "nltk" },
 ]
 
 [[package]]
@@ -2997,7 +3022,7 @@ wheels = [
 [[package]]
 name = "mase"
 version = "1.0.0"
-source = { git = "https://github.com/DeepWok/mase.git?branch=sr1325%2Fdecode-phase-quant#3fe1663e49be884034d17b6988a6f609cd633445" }
+source = { editable = "../mase" }
 dependencies = [
     { name = "absl-py" },
     { name = "accelerate" },
@@ -3077,6 +3102,82 @@ dependencies = [
 mx-ptq = [
     { name = "fast-hadamard-transform" },
 ]
+
+[package.metadata]
+requires-dist = [
+    { name = "absl-py" },
+    { name = "accelerate" },
+    { name = "attr-dot-dict" },
+    { name = "bitarray" },
+    { name = "bitstring", specifier = ">=4.2" },
+    { name = "black" },
+    { name = "colorlog" },
+    { name = "cvxpy" },
+    { name = "datasets", specifier = "==3.3.2" },
+    { name = "einops" },
+    { name = "emoji" },
+    { name = "evaluate", specifier = "==0.4.3" },
+    { name = "fast-hadamard-transform", marker = "extra == 'mx-ptq'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git" },
+    { name = "ghp-import" },
+    { name = "gitpython" },
+    { name = "h5py" },
+    { name = "hyperopt", git = "https://github.com/hyperopt/hyperopt.git" },
+    { name = "imageio" },
+    { name = "imageio-ffmpeg" },
+    { name = "ipdb" },
+    { name = "ipython" },
+    { name = "kornia" },
+    { name = "lightning" },
+    { name = "mase-triton", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = ">=0.0.6.post4" },
+    { name = "matplotlib" },
+    { name = "mpmath", specifier = "==1.3.0" },
+    { name = "myst-nb" },
+    { name = "myst-parser" },
+    { name = "numpy", specifier = "==2.2.4" },
+    { name = "onnx" },
+    { name = "onnxconverter-common" },
+    { name = "onnxruntime" },
+    { name = "opencv-python" },
+    { name = "optuna" },
+    { name = "pandas" },
+    { name = "pillow", specifier = "==10.4.0" },
+    { name = "prettytable" },
+    { name = "psutil" },
+    { name = "py-cpuinfo" },
+    { name = "pybind11" },
+    { name = "pydot" },
+    { name = "pynvml" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "pytest-html" },
+    { name = "pytest-profiling" },
+    { name = "pytest-sugar" },
+    { name = "pytest-xdist" },
+    { name = "pytorch-lightning" },
+    { name = "pytorch-nlp" },
+    { name = "pyyaml" },
+    { name = "scikit-learn" },
+    { name = "scipy", specifier = ">=1.15" },
+    { name = "sentencepiece" },
+    { name = "sphinx-book-theme" },
+    { name = "sphinx-glpi-theme" },
+    { name = "sphinx-needs", specifier = ">=4" },
+    { name = "sphinx-rtd-theme" },
+    { name = "sphinx-test-reports", git = "https://github.com/useblocks/sphinx-test-reports" },
+    { name = "sphinxcontrib-plantuml" },
+    { name = "stable-baselines3", extras = ["extra"] },
+    { name = "tabulate" },
+    { name = "tensorboard" },
+    { name = "tensorboardx" },
+    { name = "timm" },
+    { name = "toml" },
+    { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "torchvision", index = "https://download.pytorch.org/whl/cu128" },
+    { name = "transformers", specifier = "==5.5.0" },
+    { name = "ultralytics", specifier = "==8.3.235" },
+    { name = "wandb" },
+]
+provides-extras = ["mx-ptq"]
 
 [[package]]
 name = "mase-triton"
@@ -5357,8 +5458,9 @@ dependencies = [
     { name = "colorlog" },
     { name = "datasets" },
     { name = "jsonargparse" },
-    { name = "lm-eval" },
+    { name = "lm-eval", extra = ["ifeval"] },
     { name = "mase", extra = ["mx-ptq"] },
+    { name = "tomlkit" },
     { name = "torch" },
     { name = "torchvision" },
     { name = "tqdm" },
@@ -5410,9 +5512,9 @@ requires-dist = [
     { name = "gpytorch", marker = "extra == 'dse'", specifier = ">=1.11" },
     { name = "httpx", marker = "extra == 'bfcl'" },
     { name = "jsonargparse" },
-    { name = "lm-eval", specifier = ">=0.4" },
+    { name = "lm-eval", extras = ["ifeval"], specifier = "==0.4.11" },
     { name = "markdownify", marker = "extra == 'bfcl'" },
-    { name = "mase", extras = ["mx-ptq"], git = "https://github.com/DeepWok/mase.git?branch=sr1325%2Fdecode-phase-quant" },
+    { name = "mase", extras = ["mx-ptq"], editable = "../mase" },
     { name = "mkdocs", marker = "extra == 'docs'", specifier = ">=1.6" },
     { name = "mkdocs-jupyter", marker = "extra == 'docs'", specifier = ">=0.25" },
     { name = "mkdocs-material", marker = "extra == 'docs'", specifier = ">=9.5" },
@@ -5421,10 +5523,11 @@ requires-dist = [
     { name = "pydantic", marker = "extra == 'dse'", specifier = ">=2" },
     { name = "stop-sequencer", marker = "extra == 'evalplus'" },
     { name = "toml", marker = "extra == 'dse'" },
+    { name = "tomlkit", specifier = "==0.15.1" },
     { name = "torch", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchvision", index = "https://download.pytorch.org/whl/cu128" },
     { name = "tqdm" },
-    { name = "transformers", specifier = ">=4.55" },
+    { name = "transformers", specifier = "==5.5.0" },
     { name = "uvicorn", marker = "extra == 'bfcl'" },
     { name = "uvicorn", marker = "extra == 'serve'" },
 ]
@@ -6608,6 +6711,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/be/ba/1f744cdc819428fc6b5084ec34d9b30660f6f9daaf70eead706e3203ec3c/toml-0.10.2.tar.gz", hash = "sha256:b3bda1d108d5dd99f4a20d24d9c348e91c4db7ab1b749200bded2f839ccbe68f", size = 22253, upload-time = "2020-11-01T01:40:22.204Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/44/6f/7120676b6d73228c96e17f1f794d8ab046fc910d781c8d151120c3f1569e/toml-0.10.2-py2.py3-none-any.whl", hash = "sha256:806143ae5bfb6a3c6e736a764057db0e6a0e05e338b5630894a5f779cabb4f9b", size = 16588, upload-time = "2020-11-01T01:40:20.672Z" },
+]
+
+[[package]]
+name = "tomlkit"
+version = "0.15.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/96/e07752635b98536177fa1f37671c8f3cdde2e724c6bcf6034b2cfb571565/tomlkit-0.15.1.tar.gz", hash = "sha256:e25bbf38843005246210a12982776f27f99cb9be67160e14434d0c0d21ee1e97", size = 180129, upload-time = "2026-07-17T01:48:04.562Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/13/bc/8c13eb66537dce1d2bd3a57132902f38d0e7f5bb46fa9f4daed9fe9d76ee/tomlkit-0.15.1-py3-none-any.whl", hash = "sha256:177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304", size = 49449, upload-time = "2026-07-17T01:48:05.728Z" },
 ]
 
 [[package]]

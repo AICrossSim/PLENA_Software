@@ -23,6 +23,7 @@ from decode_dse.software.benchmark_runner import (
     PUBLICATION_ROLES,
     STANDARD_WIKITEXT2_METRIC_ID,
     TASK_METRIC_ID,
+    SAMPLED_TASK_METRIC_ID,
 )
 from decode_dse.software.sweep_plan import (
     load_immutable_json,
@@ -396,8 +397,11 @@ class BenchmarkEvaluator:
         values = self.settings.get("decode_banks")
         if not isinstance(values, Mapping):
             raise ValueError("config.publication.decode_banks is required")
-        if set(values) != set(PUBLICATION_ROLES):
-            raise ValueError("publication decode banks must cover all four roles")
+        expected_roles = {item.role for item in self.contract.configurations}
+        if set(values) != expected_roles:
+            raise ValueError(
+                "publication decode banks must cover every contracted role"
+            )
         result = {}
         for configuration in self.contract.configurations:
             value = values[configuration.role]
@@ -492,7 +496,11 @@ class BenchmarkEvaluator:
                 "benchmark_metric_id": (
                     STANDARD_WIKITEXT2_METRIC_ID
                     if benchmark.name == "wikitext2"
-                    else TASK_METRIC_ID
+                    else (
+                        TASK_METRIC_ID
+                        if protocol.greedy
+                        else SAMPLED_TASK_METRIC_ID
+                    )
                 ),
                 "standard_handoff_token_source": (
                     "ground_truth" if benchmark.name == "wikitext2" else None
@@ -557,6 +565,25 @@ class BenchmarkEvaluator:
         ):
             raise ValueError("publication driver result binding mismatch")
         items = tuple(PublicationItemMetric.from_dict(item) for item in result["items"])
+        if protocol.enable_thinking and benchmark.name in {"ifeval", "gsm8k"}:
+            budget = dict(protocol.token_budgets)[benchmark.name]
+            invalid_generation = tuple(
+                item.item_id
+                for item in items
+                if (
+                    tuple(record[0] for record in item.generation_terminations)
+                    != protocol.paired_seeds
+                    or any(
+                        reason not in {"eos", "stop"} or generated > budget
+                        for _, generated, _, reason in item.generation_terminations
+                    )
+                )
+            )
+            if invalid_generation:
+                raise ValueError(
+                    "thinking evaluation lacks non-truncated generation evidence: "
+                    f"{invalid_generation[:3]}"
+                )
         evidence = PublicationSplitEvidence.from_dict(result["split_execution"])
         post_handoff_raw = result.get("post_handoff_split_execution")
         post_handoff_evidence = (
@@ -577,7 +604,11 @@ class BenchmarkEvaluator:
             "score_mode": (
                 "standard_teacher_forced_nll_plus_post_handoff_greedy_nll"
                 if benchmark.name == "wikitext2"
-                else "official_task_score"
+                else (
+                    "official_task_score"
+                    if protocol.greedy
+                    else "official_seeded_paired_task_score"
+                )
             ),
         }
         if result.get("semantic_audit") != expected_audit:

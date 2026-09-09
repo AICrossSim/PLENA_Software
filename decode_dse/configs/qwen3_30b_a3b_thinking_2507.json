@@ -1,0 +1,682 @@
+{
+  "_comment": "Decode-only precision sweep for Qwen3-30B-A3B-Thinking-2507 routed MoE over a restricted declared subspace. Exhaustive and unpruned within that subspace; see search.declared_exclusions.",
+  "model_name": "Qwen/Qwen3-30B-A3B-Thinking-2507",
+  "model_revision": "3ca25493489e939d65b4161677cc24154138d127",
+  "tokenizer_revision": "3ca25493489e939d65b4161677cc24154138d127",
+  "sim_model": "qwen3-30b-a3b-thinking-2507",
+  "model_architecture": {
+    "model_type": "qwen3_moe",
+    "hidden_size": 2048,
+    "intermediate_size": 6144,
+    "moe_intermediate_size": 768,
+    "num_hidden_layers": 48,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 4,
+    "head_dim": 128,
+    "vocab_size": 151936,
+    "tie_word_embeddings": false,
+    "attention_bias": false,
+    "use_qk_norm": true,
+    "num_experts": 128,
+    "num_experts_per_tok": 8,
+    "norm_topk_prob": true,
+    "decoder_sparse_step": 1,
+    "mlp_only_layers": []
+  },
+  "parameter_census": {
+    "schema_version": "qwen3-moe-parameter-census/v1",
+    "tie_word_embeddings": false,
+    "embedding_parameters": 311164928,
+    "lm_head_parameters": 311164928,
+    "attention_parameters_per_layer": 18874368,
+    "qk_norm_parameters_per_layer": 256,
+    "decoder_norm_parameters_per_layer": 4096,
+    "router_parameters_per_layer": 262144,
+    "expert_parameters_per_layer": 603979776,
+    "decoder_parameters_per_layer": 623120640,
+    "final_norm_parameters": 2048,
+    "total_parameters": 30532122624,
+    "prefill_model_excluding_lm_head_parameters": 30220957696,
+    "bf16_total_resident_bytes": 61064245248,
+    "prefill_model_excluding_lm_head_bf16_bytes": 60441915392,
+    "lm_head_bf16_bytes": 622329856
+  },
+  "model_placement": {
+    "policy": "single_device",
+    "device_count": 1,
+    "automatic_device_map": false
+  },
+  "runtime_requirements": {
+    "compute_capability": "sm_100",
+    "minimum_package_versions": {
+      "torch": "2.7.0",
+      "transformers": "5.5.0",
+      "datasets": "3.0.0",
+      "numpy": "1.26.0",
+      "nvidia-ml-py": "13.0.0"
+    },
+    "exact_package_versions": {
+      "transformers": "5.5.0"
+    }
+  },
+  "device": "cuda:0",
+  "dtype": "bfloat16",
+  "hf_cache_dir": "/data/models/sr1325_hf",
+  "local_files_only": true,
+  "trust_remote_code": false,
+  "evaluation_data": {
+    "dataset_name": "Salesforce/wikitext",
+    "dataset_config": "wikitext-2-raw-v1",
+    "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+    "split": "validation",
+    "text_column": "text",
+    "document_separator": "\n\n",
+    "cache_dir": "/home/sr1325/plena/datasets"
+  },
+  "executor": {
+    "sample_bundle": "workspace://inputs/qwen3_30b_a3b_thinking_2507_samples.json",
+    "prefill_artifact_root": "workspace://artifacts/prefill_bf16",
+    "admission_artifact_root": "workspace://artifacts/decode_admission",
+    "stack_validity_manifest": "workspace://stack_validity.json",
+    "layout_id": "packed-gqa-mlen512-block8-native-encoding",
+    "mase_src": "../mase/src",
+    "decode_microbatch_size": {
+      "numerical_screen": 16,
+      "hardware_validation": 8
+    },
+    "max_cpu_cache_gib": 24,
+    "artifact_policy": "content_addressed_recompute_per_format",
+    "artifact_space_safety_factor": 1.05,
+    "artifact_space_reserve_gib": 8,
+    "serialize_weight_bank_builds": true
+  },
+  "phase_contract": {
+    "prefill_precision": "BF16",
+    "prefill_kv_precision": "BF16",
+    "decode_query_length": 1,
+    "first_token_owner": "prefill",
+    "decode_kv_admission": "quantize_once"
+  },
+  "output_head_contract": {
+    "headline_location": "decode_local_mx_head",
+    "headline_precision": "profile_w_a_bf16_logits",
+    "headline_idealizations": [],
+    "profile_binding": "weight_activation_and_vector_format",
+    "logit_container_format": "BF16",
+    "bf16_container_precision_recovery": false,
+    "serving_selection": "streaming_topk20_topp0.95_minp0",
+    "diagnostic_selection": "argmax_lowest_token_id_on_tie",
+    "comparison_location": "external_bf16_service",
+    "comparison_evidence": "optional_measured_sensitivity"
+  },
+  "system_resource_boundary": {
+    "schema_version": "decode-local-head-resource-boundary/v1",
+    "budget_scope": "steady_state_decode_subsystem",
+    "reference_envelope": "A100x4",
+    "reference_envelope_role": "frozen_equal_resource_comparability_screen_not_gpu_baseline",
+    "local_head_resources": "included_weights_scales_hbm_traffic_matrix_vector_selection_collective_area_power_energy",
+    "local_head_additional_compute_area": "zero_existing_matrix_vector_units",
+    "prefill_scope": "separate_disaggregated_handoff_queue_sensitivity",
+    "external_head_service": "optional_nonblocking_sensitivity",
+    "allow_empty_frontier": true
+  },
+  "reference_workload": {
+    "batch": 4,
+    "input_seq": 512,
+    "output_seq": 32768
+  },
+  "serving_queue_campaign": {
+    "schema_version": "decode-serving-queue-campaign/v1",
+    "publication_contract_sealed": true,
+    "workload_buckets": [
+      {
+        "bucket_id": "p512_g512",
+        "prompt_tokens": 512,
+        "generation_tokens": 512
+      },
+      {
+        "bucket_id": "p4k_g4k",
+        "prompt_tokens": 4096,
+        "generation_tokens": 4096
+      },
+      {
+        "bucket_id": "p4k_g16k",
+        "prompt_tokens": 4096,
+        "generation_tokens": 16384
+      },
+      {
+        "bucket_id": "p16k_g32k",
+        "prompt_tokens": 16384,
+        "generation_tokens": 32768
+      },
+      {
+        "bucket_id": "p32k_g32k",
+        "prompt_tokens": 32768,
+        "generation_tokens": 32768
+      },
+      {
+        "bucket_id": "p128k_g8k_stress",
+        "prompt_tokens": 131072,
+        "generation_tokens": 8192
+      }
+    ],
+    "arrival_rates_per_s": [
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.25,
+      0.5,
+      1.0
+    ],
+    "arrival_seeds": [
+      20260725,
+      20260726,
+      20260727
+    ],
+    "request_count": 512,
+    "regimes": [
+      "fully_pipelined",
+      "back_pressure",
+      "host_buffered"
+    ],
+    "replica_pairs": [
+      {
+        "prefill_replicas": 1,
+        "decode_replicas": 1
+      },
+      {
+        "prefill_replicas": 1,
+        "decode_replicas": 2
+      },
+      {
+        "prefill_replicas": 2,
+        "decode_replicas": 1
+      },
+      {
+        "prefill_replicas": 2,
+        "decode_replicas": 2
+      }
+    ],
+    "queue_config": {
+      "link_ports": 4,
+      "kv_buffer_capacity_bytes": 68719476736,
+      "max_inflight_requests": 1024,
+      "slo": {
+        "ttft_s": 2.0,
+        "tpot_s": 0.05,
+        "e2e_s": null
+      },
+      "idle_power_w": {
+        "prefill": 120.0,
+        "decode": 100.0,
+        "link": 10.0
+      }
+    }
+  },
+  "search": {
+    "numerical_foundation_mlen": 1024,
+    "weight_w": [
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E2M1",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "kv": [
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "act_w": [
+      "MXINT4",
+      "MXINT8",
+      "E1M2",
+      "E3M4",
+      "E4M3",
+      "E5M2"
+    ],
+    "block": [
+      8
+    ],
+    "mixed_weight": false,
+    "front_fp_setting": [
+      [
+        6,
+        5
+      ],
+      [
+        8,
+        5
+      ]
+    ],
+    "vector_fp": [
+      "FP_E6M5",
+      "FP_E8M5"
+    ],
+    "include_vector_bf16_controls": true,
+    "include_bf16_reference": true,
+    "expected_quantized_profiles": 504,
+    "expected_vector_bf16_controls": 252,
+    "expected_total_profiles": 757,
+    "fp_setting_attention": true,
+    "quant_attn_matmuls": true,
+    "declared_exclusions": {
+      "weight_w": {
+        "MXINT2": "Measured prior evidence, Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709): every MXINT2 weight profile exceeded 100x relative perplexity (doomed guard), far beyond the relaxed 1.05 budget."
+      },
+      "act_w": {
+        "MXINT2": "Measured prior evidence, Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709): best relative perplexity with MXINT2 on the activation axis was 744.40x, beyond the relaxed 1.05 budget with at least a 1.07 exclusion margin.",
+        "E2M1": "Measured prior evidence, Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709): best relative perplexity with E2M1 on the activation axis was 1.2143x, beyond the relaxed 1.05 budget with at least a 1.07 exclusion margin."
+      },
+      "kv": {
+        "MXINT2": "WALL-CLOCK SCOPE RESTRICTION, not an accuracy-based exclusion. Removed to fit the three-GPU, seven-day budget; NOT claimed to fail any accuracy budget (same restriction as the Qwen3-32B study).",
+        "E2M1": "WALL-CLOCK SCOPE RESTRICTION, not an accuracy-based exclusion. Removed to fit the three-GPU, seven-day budget; NOT claimed to fail any accuracy budget (same restriction as the Qwen3-32B study)."
+      },
+      "vector_fp": {
+        "FP_E3M2": "Measured prior evidence, Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709): relative NLL 8.10986 holding W/A/KV at the best assignment, two orders of magnitude beyond the budget.",
+        "FP_E2M3": "Measured prior evidence, Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709): relative NLL 4.21983 holding W/A/KV at the best assignment.",
+        "FP_E4M7": "Measured prior evidence, Llama-3.1-8B numerical screen (3,585 profiles, BF16 reference mean NLL 2.52709): relative NLL 1.08597, beyond the relaxed 1.05 budget despite carrying more total bits than FP_E5M6.",
+        "FP_E5M6": "Measured on this checkpoint (two-document WikiText-2 forced-decode probe, uniform MXINT8 W/A/KV, 2048-token window; plena_task_eval/results/qwen30b/diagnostics/diag_decode_i8_e5m6.json): FP_E5M6 gives word perplexity 36.2095 against 9.3379 for FP_E8M5 on the same two documents, a 3.88x perplexity ratio that is beyond the relaxed 1.05 budget by two orders of magnitude of excess. Consistent with Qwen3-32B, where FP_E5M6 collapsed by 2.1e7x (PLENA_Qwen32B_Results/README.md section 1b): five exponent bits cannot cover the Qwen3 decode-phase activation range, six (FP_E6M5) can."
+      }
+    }
+  },
+  "software_search": "deterministic_exhaustive",
+  "search_budget": 757,
+  "sampler": "deterministic_grid",
+  "use_rotation": false,
+  "rotation_refinement_blocker": {
+    "schema_version": "decode-rotation-refinement-blocker/v1",
+    "selector_may_emit_rotation": false,
+    "reason": "Attention-only rotation is a separate measured ablation; it cannot enter the strict selector without its own merge, costs, and compiler/emulator evidence.",
+    "required_before_enable": [
+      "rotation_schedule",
+      "rotation_software_results",
+      "rotation_compiler_emulator_validity",
+      "rotation_merge_receipt",
+      "rotation_hardware_repricing"
+    ]
+  },
+  "rotation_ablation": {
+    "schema_version": "decode-attention-only-rotation-ablation/v1",
+    "method_id": "attention_only_selective_hadamard_rotation/v1",
+    "eligible_matmul_types": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "qk_matmul",
+      "av_matmul",
+      "kv_cache"
+    ],
+    "excluded_fused_expert_matmul_types": [
+      "down_proj",
+      "gate_proj",
+      "up_proj"
+    ],
+    "require_symmetric_kv": true,
+    "source_method": "gptq_erry",
+    "source_state": "succeeded",
+    "publication_rankable": false,
+    "selector_may_emit": false,
+    "required_cost_evidence": "paired_synchronized_b200_timing_and_power",
+    "remaining_hardware_gate": "compiler_emulator_and_plena_costs"
+  },
+  "fp_ppl_tol": 0.01,
+  "gptq": {
+    "nsamples": 128,
+    "seqlen": 2048,
+    "cali_batch_size": 8
+  },
+  "refinement": {
+    "schema_version": "decode-refinement-config/v1",
+    "require_symmetric_kv": true,
+    "sample_bundle": "workspace://refinement/inputs/samples.json",
+    "prefill_artifact_root": "workspace://refinement/artifacts/prefill_bf16",
+    "admission_artifact_root": "workspace://refinement/artifacts/decode_admission",
+    "calibration_artifact": "workspace://refinement/inputs/gptq_calibration.pt",
+    "calibration_receipt": "workspace://refinement/inputs/gptq_calibration.json",
+    "checkpoint_root": "workspace://refinement/checkpoints",
+    "calibration_samples": 128,
+    "calibration_sequence_length": 2048,
+    "calibration_batch_size": 8,
+    "calibration_seed": 20260725,
+    "sample_selection_seed": 20260725,
+    "gpu_min_free_mb": 90000,
+    "max_cpu_cache_gib": 24,
+    "calibration_data": {
+      "dataset_name": "Salesforce/wikitext",
+      "dataset_config": "wikitext-2-raw-v1",
+      "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+      "split": "train",
+      "text_column": "text",
+      "document_separator": "\n\n",
+      "cache_dir": "/home/sr1325/plena/datasets"
+    }
+  },
+  "publication": {
+    "chat_template_asset": "decode_dse/configs/publication_chat_template_qwen3_30b_a3b_thinking_2507.json",
+    "chat_template_sha256": "aebb52d7099cbaba93c574834d9a85ac971bac93c9bdabea4532122288f07590",
+    "benchmark_datasets": {
+      "wikitext2": {
+        "dataset_name": "Salesforce/wikitext",
+        "dataset_config": "wikitext-2-raw-v1",
+        "dataset_revision": "b08601e04326c79dfdd32d625aee71d232d685c3",
+        "split": "test",
+        "cache_dir": "/home/sr1325/plena/datasets",
+        "content_columns": [
+          "text"
+        ],
+        "id_column": null,
+        "source_item_count": 4358
+      },
+      "ifeval": {
+        "dataset_name": "google/IFEval",
+        "dataset_config": "default",
+        "dataset_revision": "39ed06ce3906b51290c6e95b7c697e928c8a7b00",
+        "split": "train",
+        "cache_dir": "/home/sr1325/plena/datasets",
+        "content_columns": [
+          "key",
+          "prompt",
+          "instruction_id_list",
+          "kwargs"
+        ],
+        "id_column": "key",
+        "source_item_count": 541
+      },
+      "gsm8k": {
+        "dataset_name": "openai/gsm8k",
+        "dataset_config": "main",
+        "dataset_revision": "e53f048856ff4f594e959d75785d2c2d37b678ee",
+        "split": "test",
+        "cache_dir": "/home/sr1325/plena/datasets",
+        "content_columns": [
+          "question",
+          "answer"
+        ],
+        "id_column": null,
+        "source_item_count": 1319
+      }
+    },
+    "thinking_mode": "required",
+    "enable_thinking": true,
+    "greedy": false,
+    "temperature": 0.6,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "paired_seeds": [
+      20260725,
+      20260726,
+      20260727
+    ],
+    "repetitions": 3,
+    "token_budgets": {
+      "wikitext2": 32768,
+      "ifeval": 32768,
+      "gsm8k": 32768,
+      "ruler": 8192
+    },
+    "output_head_location": "decode_local_mx_head",
+    "output_head_precision": "profile_w_a_bf16_logits"
+  },
+  "eval_ppl_nsamples": 32,
+  "eval_ppl_seqlen": 2048,
+  "tasks": [
+    "gsm8k",
+    "ifeval"
+  ],
+  "task_batch_size": 1,
+  "front_size": 10,
+  "hardware_space": {
+    "MLEN": [
+      1024
+    ],
+    "BLEN": [
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "HLEN": [
+      128
+    ],
+    "BATCH": [
+      1,
+      4,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256
+    ],
+    "HBM_CHANNELS": [
+      8,
+      16,
+      32
+    ],
+    "HBM_GENERATION": "HBM2",
+    "CHIP_COUNT": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "TP": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "KVP": [
+      1,
+      2,
+      4
+    ],
+    "LINK_PORTS": [
+      1,
+      2,
+      4
+    ],
+    "SRAM_POLICY": [
+      "streaming",
+      "projection_resident",
+      "kv_resident_25",
+      "kv_resident_50",
+      "kv_resident_75",
+      "kv_resident_100"
+    ],
+    "KV_HEAD_REUSE": [
+      false
+    ],
+    "DRAIN_OVERLAPPED": [
+      false
+    ],
+    "EXPERT_PARALLEL_MODE": [
+      "tensor_parallel",
+      "expert_id_parallel"
+    ],
+    "ALLOW_RANK_LOCAL_MLEN_PADDING": true,
+    "FP_SRAM_DEPTH": 512,
+    "RESOURCE_BUDGET": {
+      "reference_system": "A100x4",
+      "aggregate_area_limit_mm2": 3634.4,
+      "aggregate_hbm_capacity_limit_bytes": 320000000000,
+      "aggregate_hbm_bandwidth_limit_bytes_per_s": 8156000000000
+    }
+  },
+  "hbm_sensitivity": {
+    "schema_version": "decode-hbm-sensitivity",
+    "source_profile_count": 4,
+    "generations": [
+      "HBM2",
+      "HBM2E",
+      "HBM3",
+      "HBM3E",
+      "HBM4"
+    ],
+    "preserve_geometry_batch_channels": true,
+    "cross_generation_ranking": false
+  },
+  "gpu_baseline": {
+    "attention_implementation": "sdpa",
+    "warmup_steps": 16,
+    "measured_steps": 128,
+    "repetitions": 3,
+    "batch_sizes": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "precision": "BF16",
+    "q_len": 1,
+    "first_gpu_only": true,
+    "energy_meter_priority": [
+      "nvml_total_energy_counter",
+      "nvml_power_trace_trapezoidal"
+    ],
+    "power_trace_sample_interval_ms": 10
+  },
+  "publication_pipeline": {
+    "schema_version": "decode-publication-pipeline",
+    "artifacts": {
+      "admission_receipt": "workspace://admission_preparation.json",
+      "timing_evidence": "workspace://external/decode_timing_evidence.json",
+      "compiler_trace_artifacts": "workspace://external/compiler_trace_artifacts.json",
+      "request_memory_calibration": "simulator://analytic_models/disagg_serve/calibration_dma_requests.csv",
+      "head_service_calibration": null,
+      "head_service_resource_receipt": null,
+      "handoff_artifact": null,
+      "power_calibration": null,
+      "area_config": null,
+      "exact_dc_anchors": null,
+      "hardware_study": "workspace://hardware/exact_hardware_study.jsonl",
+      "refined_hardware_study": "workspace://hardware/refined_hardware_study.jsonl",
+      "refinement_validity": "workspace://refinement/validity.json",
+      "refinement_schedule": "workspace://refinement/schedule.json",
+      "refinement_promotion": "workspace://refinement/source_selection.json",
+      "refinement_results": "workspace://refinement/results",
+      "publication_configurations": "workspace://publication/inputs/configurations.json",
+      "publication_benchmarks": "workspace://publication/inputs/benchmarks.json",
+      "publication_chat_template": "workspace://publication/inputs/chat_template.json",
+      "publication_contract": "workspace://publication/contract.json",
+      "publication_results": "workspace://publication/results",
+      "final_selection": "workspace://publication/final_selection.json",
+      "packedkv_evidence": null,
+      "decode_analysis": null,
+      "figures": "workspace://publication/figures"
+    },
+    "resources": {
+      "stride": 1,
+      "runtime_hbm_reserve_bytes": 536870912,
+      "rtl_source_tree_sha256": null,
+      "refinement_enabled": true,
+      "refinement_execution": "four_logical_shards",
+      "refinement_decode_microbatch_size": 8,
+      "bootstrap_replicates": 2000,
+      "publication_enabled": false,
+      "publication_executor": "decode_dse.software.benchmark_evaluator:create_executor",
+      "publication_timing_tier": "stage_calibrated_analytic",
+      "study_parallel_workers": 192,
+      "figure_formats": [
+        "png",
+        "pdf",
+        "svg"
+      ]
+    }
+  },
+  "n_chips": 1,
+  "seed": 0,
+  "scratch_dir": "workspace://scratch",
+  "_scratch_comment": "Cross-process weight-bank construction locks and refinement checkpoints use this path.",
+  "gpu_min_free_mb": 100000,
+  "max_parallel_points": 4,
+  "compiler_trace_preflight": {
+    "schema_version": "decode-compiler-trace-preflight/v1",
+    "max_unique_family_artifacts": 64,
+    "max_unique_lowering_instantiations": 100000,
+    "max_lazy_trace_instantiations": 25000,
+    "max_projected_trace_bytes": 68719476736,
+    "max_context_timing_resolutions": 10000000,
+    "max_joined_identities": 10000000,
+    "max_joined_bytes": 68719476736,
+    "max_digest_updates": 20000000,
+    "projected_joined_row_bytes": 4096,
+    "digest_updates_per_joined_identity": 2
+  },
+  "numerical_only_execution": {
+    "schema_version": "decode-numerical-only-contract/v1",
+    "launcher": "python -m decode_dse.software.numerical_only",
+    "wrapper_commands": [
+      "numerical-plan",
+      "numerical-screen"
+    ],
+    "evidence_class": "measured_numerical_only_non_publication",
+    "required_shards": 4,
+    "allowed_stages": [
+      "preflight",
+      "numerical-screen"
+    ],
+    "strict_pipeline_remains_fail_closed": true,
+    "publication_rankable": false,
+    "hardware_rankable": false,
+    "selection_eligible": false
+  },
+  "router_trace_repricing": {
+    "schema_version": "decode-router-trace-repricing-contract/v1",
+    "batch_source": "hardware_space.BATCH",
+    "windowing": "consecutive_nonoverlapping_global_trace_steps",
+    "tail_policy": "drop_and_report_incomplete_final_window",
+    "aggregation_policy": "consecutive_nonoverlapping_windows_conservative_observed_max/v1",
+    "supported_override_fields": [
+      "moe_unique_experts_per_step",
+      "moe_routing_imbalance_factor"
+    ],
+    "resident_expert_storage": "all_128_experts",
+    "execution_scope": "legacy_aggregate_analytic_route_sensitivity_only",
+    "publication_rankable": false,
+    "hardware_rankable": false,
+    "selection_eligible": false
+  },
+  "doomed_ppl_abs": 100,
+  "doomed_ppl_ratio": 3,
+  "reference_chip": {
+    "MLEN": 1024,
+    "BLEN": 8,
+    "VLEN": 1024,
+    "HLEN": 128
+  },
+  "bw_model": "calibrated",
+  "runtime": {
+    "persistent": true,
+    "max_attempts": 3
+  },
+  "accuracy_budgets": {
+    "strict_relative_perplexity": 1.01,
+    "relaxed_relative_perplexity": 1.05
+  },
+  "publication_launch_blocker": {
+    "schema_version": "decode-publication-launch-blocker/v1",
+    "reason": "Publication decode banks, split-prefill input manifest, and audited benchmark driver are generated or bound after refinement and are not present in the base sweep config.",
+    "required_overlay_fields": [
+      "input_manifest",
+      "prefill_artifact_root",
+      "driver_output_root",
+      "driver",
+      "decode_banks"
+    ],
+    "launcher": "python -m decode_dse.software.publication_launch"
+  }
+}

@@ -6,8 +6,19 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
+from decode_dse.profiles import (
+    LOCAL_HEAD_ARGMAX_RULE,
+    LOCAL_HEAD_LOCATION,
+    LOCAL_HEAD_LOGITS_FORMAT,
+    LOCAL_HEAD_OUTPUT_RULE,
+    LOCAL_HEAD_SCHEMA,
+    LOCAL_HEAD_WEIGHT_METHOD,
+    local_head_matrix_family_contract,
+)
+
 # Attention vs FFN projections, split so each can carry an independent weight
-# width. Regexes match Llama and Qwen3 dense naming.
+# width.  The FFN selector covers both dense projection modules and the fused
+# Qwen3-MoE expert container; the router remains outside quantization.
 def parse_prec_token(tok: Any) -> tuple[str, Any]:
     """Parse a precision token into (format, width).
 
@@ -40,10 +51,14 @@ def parse_prec_token(tok: Any) -> tuple[str, Any]:
 
 
 _ATTN_LINEAR_RE = r"model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$"
-_FFN_LINEAR_RE = r"model\.layers\.\d+\.mlp\.(gate_proj|up_proj|down_proj)$"
+_FFN_LINEAR_RE = (
+    r"model\.layers\.\d+\.mlp\."
+    r"(gate_proj|up_proj|down_proj|experts)$"
+)
 _SELF_ATTN_RE = r"model\.layers\.\d+\.self_attn$"
 _MLP_RE = r"model\.layers\.\d+\.mlp$"
 _DECODER_LAYER_RE = r"model\.layers\.\d+$"
+_LM_HEAD_RE = r"lm_head$"
 _RMSNORM_RE = (
     r"(model\.layers\.\d+\.(input_layernorm|post_attention_layernorm|"
     r"self_attn\.(q_norm|k_norm))|model\.norm)$"
@@ -190,6 +205,149 @@ class DecodeQuantSpec:
             f"{kv}__a-{act}__b{self.weight_block}{fp}"
         )
 
+    @property
+    def local_head_contract(self) -> dict[str, Any]:
+        """Return the decode-chip LM-head binding derived from global W/A."""
+
+        weight_format = _format_token(self.w_fmt, self.attn_w)
+        activation_format = _format_token(self.act_fmt, self.act_w)
+        matrix_storage_format = _vector_token(self.fp_setting or "BF16")
+        family_contract = local_head_matrix_family_contract(
+            weight_format,
+            activation_format,
+            matrix_storage_format,
+        )
+        return {
+            "schema_version": LOCAL_HEAD_SCHEMA,
+            "location": LOCAL_HEAD_LOCATION,
+            "target_module": "lm_head",
+            "tie_word_embeddings_required": False,
+            "weight_format": weight_format,
+            "activation_format": activation_format,
+            "weight_format_source": "profile.weight_format",
+            "activation_format_source": "profile.activation_format",
+            "weight_method": LOCAL_HEAD_WEIGHT_METHOD,
+            # The sealed rotation ablation covers attention projections and
+            # attention stages only.  The local head remains the source
+            # profile's independently packed RTN bank for every refinement.
+            "weight_preconditioning": "none",
+            "block_size": self.weight_block,
+            "scale_format": "E8M0",
+            "scale_bits": _SCALE_BITS,
+            "accumulator_rule": _MATRIX_SEMANTICS["accumulator_rule"],
+            "operand_family_binding": family_contract[
+                "operand_family_binding"
+            ],
+            "operand_family_deployment_supported": family_contract[
+                "operand_family_deployment_supported"
+            ],
+            "hardware_bit_parity_verified": family_contract[
+                "hardware_bit_parity_verified"
+            ],
+            "numerical_oracle_rule": family_contract[
+                "numerical_oracle_rule"
+            ],
+            "partial_conversion_rule": family_contract[
+                "partial_conversion_rule"
+            ],
+            "partial_conversion_format": matrix_storage_format,
+            "mlen_partial_conversion_rounding": "round_to_nearest_even",
+            "cross_instruction_accumulation": _MATRIX_SEMANTICS[
+                "mxint_cross_instruction_accumulation"
+            ],
+            "matrix_instruction_k_partition": "MLEN",
+            "matrix_mlen": self.matrix_mlen,
+            "output_rule": LOCAL_HEAD_OUTPUT_RULE,
+            "matrix_semantics_output_rule": _MATRIX_SEMANTICS["output_rule"],
+            "arithmetic_chain": family_contract["arithmetic_chain"],
+            "matrix_storage_format": matrix_storage_format,
+            "matrix_output_format": matrix_storage_format,
+            "logit_container_format": LOCAL_HEAD_LOGITS_FORMAT,
+            "final_logits_format": LOCAL_HEAD_LOGITS_FORMAT,
+            "bf16_container_precision_recovery": False,
+            "greedy_selection_rule": LOCAL_HEAD_ARGMAX_RULE,
+            "offline_evaluation": {
+                "materialization": "full_bf16_logits",
+                "purpose": "teacher_forced_nll_and_accuracy",
+            },
+            "serving_selection": {
+                "materialization": "tiled_bf16_logits",
+                "full_batch_vocab_vsram_required": False,
+                "running_state": "top_k20_and_argmax_lowest_token_id",
+                "sample_probability_dtype": "FP32",
+                "top_k": 20,
+                "top_p": 0.95,
+                "min_p": 0.0,
+                "sampling_parameters_source": "publication_protocol",
+            },
+            "phase_ownership": {
+                "first_token_owner": "prefill",
+                "prefill_head_policy": "bf16",
+                "decode_query_length": 1,
+                "decode_head_policy": "profile_mx_matrix",
+            },
+        }
+
+
+@dataclass(frozen=True)
+class DecodeBindingExpectations:
+    """Architecture-derived module counts for a sealed decode weight bank."""
+
+    pattern_counts: tuple[int, int, int, int, int, int, int]
+    binding_targets: int
+    sealed_weight_modules: int
+    dense_layers: int
+    moe_layers: int
+
+
+def decode_binding_expectations(
+    model_architecture: dict[str, Any],
+) -> DecodeBindingExpectations:
+    """Return dense/MoE binding counts without assuming seven linears/layer."""
+
+    layers = int(model_architecture["num_hidden_layers"])
+    experts = int(model_architecture.get("num_experts", 1))
+    if experts > 1:
+        sparse_step = int(model_architecture.get("decoder_sparse_step", 1))
+        dense_only = {
+            int(index) for index in model_architecture.get("mlp_only_layers", ())
+        }
+        if sparse_step <= 0:
+            raise ValueError("decoder_sparse_step must be positive")
+        if any(index < 0 or index >= layers for index in dense_only):
+            raise ValueError("mlp_only_layers contains an invalid layer index")
+        moe_layers = sum(
+            index not in dense_only and (index + 1) % sparse_step == 0
+            for index in range(layers)
+        )
+    else:
+        moe_layers = 0
+    dense_layers = layers - moe_layers
+    ffn_targets = 3 * dense_layers + moe_layers
+    qk_norm = bool(
+        model_architecture.get(
+            "use_qk_norm",
+            str(model_architecture.get("model_type", "")).startswith("qwen3"),
+        )
+    )
+    rmsnorms = layers * (4 if qk_norm else 2) + 1
+    pattern_counts = (
+        layers,
+        4 * layers,
+        ffn_targets,
+        layers,
+        layers,
+        rmsnorms,
+        1,
+    )
+    return DecodeBindingExpectations(
+        pattern_counts=pattern_counts,
+        binding_targets=sum(pattern_counts),
+        sealed_weight_modules=4 * layers + ffn_targets + 1,
+        dense_layers=dense_layers,
+        moe_layers=moe_layers,
+    )
+
 
 # One 8-bit shared scale per MX block (E8M0)
 _SCALE_BITS = 8
@@ -237,6 +395,17 @@ def _wtok(fmt: str, width: Any) -> str:
     return f"E{width[0]}M{width[1]}"
 
 
+def _format_token(fmt: str, width: Any) -> str:
+    """Return the canonical profile token for one matrix operand."""
+
+    if width is None:
+        return "BF16"
+    if fmt == "mxint":
+        return f"MXINT{int(width)}"
+    e, m = _mxfp_exp_frac(width)
+    return f"E{e}M{m}"
+
+
 def _mxfp_exp_frac(width: Any) -> tuple[int, int]:
     """Parse an MXFP width token/tuple into (exponent_bits, frac_bits)."""
     if isinstance(width, str):
@@ -281,6 +450,30 @@ def _linear_decode(spec: DecodeQuantSpec, weight_width: Any) -> dict[str, Any]:
     if spec.gptq_weights:
         # The decode weight bank comes from GPTQ/rotation; don't RTN it again.
         cfg["gptq"] = True
+    return cfg
+
+
+def _local_head_decode(spec: DecodeQuantSpec) -> dict[str, Any]:
+    """Bind the untied local head to W/A while preserving BF16 logits."""
+
+    if spec.act_w is None:
+        raise ValueError("the local decode head requires an MX activation format")
+    if spec.weight_block != spec.act_block:
+        raise ValueError("local-head W/A operands require one shared MX block size")
+    cfg: dict[str, Any] = dict(
+        _weight_keys(spec.w_fmt, spec.attn_w, spec.weight_block)
+    )
+    cfg.update(_act_keys(spec.act_fmt, spec.act_w, spec.act_block))
+    cfg.update(
+        _matrix_contract(
+            spec.act_fmt,
+            spec.w_fmt,
+            spec.fp_setting or "BF16",
+            block_sizes=(spec.weight_block, spec.act_block),
+            matrix_mlen=spec.matrix_mlen,
+        )
+    )
+    cfg["local_head_contract"] = spec.local_head_contract
     return cfg
 
 
@@ -438,6 +631,12 @@ def build_decode_pass_args(
         }
         pass_args[_MLP_RE] = {"config": {"name": "minifloat", "decode": dict(fp)}}
         pass_args[_RMSNORM_RE] = {"config": {"name": "minifloat", "decode": dict(fp)}}
+
+    # The untied head follows the body W/A/vector formats and stores its
+    # rounded matrix outputs in the BF16 logit container.
+    pass_args[_LM_HEAD_RE] = {
+        "config": {"name": wname, "decode": _local_head_decode(spec)},
+    }
 
     # Calibrated weights (GPTQ, or rotation which runs GPTQ internally) need the
     # gptq block: it carries the calibration setup and the checkpoint dir.

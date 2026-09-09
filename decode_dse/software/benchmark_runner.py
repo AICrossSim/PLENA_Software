@@ -37,6 +37,7 @@ PUBLICATION_CHAT_TEMPLATE_SCHEMA = "decode-chat-template"
 PUBLICATION_RESULT_SCHEMA = "decode-publication-result"
 PUBLICATION_REPORT_SCHEMA = "decode-publication-report"
 PUBLICATION_ROLES = ("bf16", "uniform_i8", "uniform_i4", "pareto")
+_PUBLICATION_ROLE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,95}$")
 PUBLICATION_BENCHMARKS = ("wikitext2", "ifeval", "gsm8k", "ruler")
 RULER_LENGTHS = (4096, 8192, 16384, 32768)
 STANDARD_WIKITEXT2_METRIC_ID = (
@@ -44,6 +45,7 @@ STANDARD_WIKITEXT2_METRIC_ID = (
 )
 POST_HANDOFF_METRIC_ID = "post_handoff_greedy_conditioned_nll/v1"
 TASK_METRIC_ID = "cached_greedy_official_task_score/v1"
+SAMPLED_TASK_METRIC_ID = "cached_seeded_paired_official_task_score/v1"
 _IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40,64}$")
 
 
@@ -105,8 +107,8 @@ class PublicationConfiguration:
     validity: StackValidity
 
     def __post_init__(self) -> None:
-        if self.role not in PUBLICATION_ROLES:
-            raise ValueError(f"unsupported publication role {self.role!r}")
+        if not _PUBLICATION_ROLE.fullmatch(self.role):
+            raise ValueError(f"invalid publication role {self.role!r}")
         if self.role == "bf16":
             if (
                 not isinstance(self.profile, DecodePrecisionProfile)
@@ -784,8 +786,13 @@ class PublicationProtocol:
     greedy: bool
     temperature: float
     token_budgets: tuple[tuple[str, int], ...]
-    output_head_location: str = "decode_bf16_unmodeled"
-    output_head_precision: str = "BF16"
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    paired_seeds: tuple[int, ...] = (0,)
+    repetitions: int = 1
+    output_head_location: str = "decode_local_mx_head"
+    output_head_precision: str = "profile_w_a_bf16_logits"
 
     def __post_init__(self) -> None:
         for label, value in (
@@ -802,13 +809,51 @@ class PublicationProtocol:
         ):
             if not _IMMUTABLE_REVISION.fullmatch(value):
                 raise ValueError(f"{label} must be an immutable hash")
-        if self.thinking_mode != "disabled" or self.enable_thinking is not False:
-            raise ValueError(
-                "publication evaluation requires thinking to be disabled"
-            )
+        if self.thinking_mode not in {"disabled", "enabled", "required"}:
+            raise ValueError("thinking_mode must be disabled, enabled, or required")
+        expected_thinking = self.thinking_mode != "disabled"
+        if self.enable_thinking is not expected_thinking:
+            raise ValueError("thinking_mode and enable_thinking disagree")
+        if "thinking" in self.model_name.lower() and not expected_thinking:
+            raise ValueError("a thinking-only model cannot disable thinking")
         _sha256(self.chat_template_sha256, "chat_template_sha256")
-        if not self.greedy or self.temperature != 0.0:
-            raise ValueError("publication evaluation generation must be greedy with temperature zero")
+        seeds = tuple(int(seed) for seed in self.paired_seeds)
+        if (
+            self.repetitions <= 0
+            or len(seeds) != self.repetitions
+            or len(seeds) != len(set(seeds))
+            or any(seed < 0 for seed in seeds)
+        ):
+            raise ValueError(
+                "paired_seeds must contain one unique non-negative seed per repetition"
+            )
+        if self.greedy:
+            if (
+                self.temperature != 0.0
+                or self.top_p != 1.0
+                or self.top_k != 0
+                or self.min_p != 0.0
+                or self.repetitions != 1
+            ):
+                raise ValueError(
+                    "greedy generation requires temperature=0, top_p=1, "
+                    "top_k=0, min_p=0, and one repetition"
+                )
+        elif (
+            not expected_thinking
+            or not math.isfinite(self.temperature)
+            or self.temperature <= 0.0
+            or not math.isfinite(self.top_p)
+            or not 0.0 < self.top_p <= 1.0
+            or self.top_k <= 0
+            or not math.isfinite(self.min_p)
+            or not 0.0 <= self.min_p < 1.0
+            or self.repetitions < 2
+        ):
+            raise ValueError(
+                "sampled publication generation requires thinking, positive "
+                "temperature/top_k, valid top_p/min_p, and paired repetitions"
+            )
         budgets = tuple((str(name), int(value)) for name, value in self.token_budgets)
         if {name for name, _ in budgets} != set(PUBLICATION_BENCHMARKS):
             raise ValueError("token budgets must cover every publication evaluation benchmark")
@@ -816,17 +861,35 @@ class PublicationProtocol:
             raise ValueError("token budgets contain duplicates")
         if any(value <= 0 for _, value in budgets):
             raise ValueError("token budgets must be positive")
-        # Either placement is publishable, and both keep the head at BF16 -
-        # the accuracy protocol is unchanged by where the projection runs.
-        if (
+        if expected_thinking:
+            budget_by_name = dict(budgets)
+            minimums = {"ifeval": 4096, "gsm8k": 4096, "ruler": 8192}
+            undersized = {
+                name: budget_by_name[name]
+                for name, minimum in minimums.items()
+                if budget_by_name[name] < minimum
+            }
+            if undersized:
+                raise ValueError(
+                    "thinking evaluation budgets are below their minimums "
+                    f"{minimums}: "
+                    f"{undersized}"
+                )
+        canonical_head = (
+            self.output_head_location == "decode_local_mx_head"
+            and self.output_head_precision == "profile_w_a_bf16_logits"
+        )
+        legacy_head = (
             self.output_head_location
-            not in {"decode_bf16_unmodeled", "external_bf16_service"}
-            or self.output_head_precision != "BF16"
-        ):
+            in {"decode_bf16_unmodeled", "external_bf16_service"}
+            and self.output_head_precision == "BF16"
+        )
+        if not (canonical_head or legacy_head):
             raise ValueError(
-                "headline publication evaluation requires a BF16 output head"
+                "output-head location and precision binding are inconsistent"
             )
         object.__setattr__(self, "token_budgets", tuple(sorted(budgets)))
+        object.__setattr__(self, "paired_seeds", seeds)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -838,6 +901,11 @@ class PublicationProtocol:
             "enable_thinking": self.enable_thinking,
             "greedy": self.greedy,
             "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "min_p": self.min_p,
+            "paired_seeds": list(self.paired_seeds),
+            "repetitions": self.repetitions,
             "token_budgets": dict(self.token_budgets),
             "output_head_location": self.output_head_location,
             "output_head_precision": self.output_head_precision,
@@ -862,6 +930,11 @@ class PublicationProtocol:
             token_budgets=tuple(
                 (str(name), int(budget)) for name, budget in budgets.items()
             ),
+            top_p=float(value.get("top_p", 1.0)),
+            top_k=int(value.get("top_k", 0)),
+            min_p=float(value.get("min_p", 0.0)),
+            paired_seeds=tuple(int(seed) for seed in value.get("paired_seeds", (0,))),
+            repetitions=int(value.get("repetitions", 1)),
             output_head_location=str(value["output_head_location"]),
             output_head_precision=str(value["output_head_precision"]),
         )
@@ -879,12 +952,51 @@ class PublicationContract:
         if self.schema_version != PUBLICATION_CONTRACT_SCHEMA:
             raise ValueError("unsupported publication contract schema")
         configurations = tuple(self.configurations)
-        if tuple(item.role for item in configurations) != PUBLICATION_ROLES:
-            raise ValueError("publication evaluation configurations must be BF16/I8/I4/Pareto in order")
+        roles = tuple(item.role for item in configurations)
+        if len(roles) < 2 or roles[0] != "bf16" or len(roles) != len(set(roles)):
+            raise ValueError(
+                "publication configurations require one leading BF16 reference "
+                "and unique candidate roles"
+            )
+        if set(roles) == set(PUBLICATION_ROLES) and roles != PUBLICATION_ROLES:
+            raise ValueError("legacy BF16/I8/I4/Pareto roles must retain their order")
         ids = tuple(item.configuration_id for item in configurations)
         profile_ids = tuple(item.profile.profile_id for item in configurations)
         if len(ids) != len(set(ids)) or len(profile_ids) != len(set(profile_ids)):
             raise ValueError("publication evaluation configurations must be distinct")
+        if self.protocol.output_head_location == "decode_local_mx_head":
+            for item in configurations:
+                head = item.profile.local_head_contract
+                if (
+                    head.get("location") != "decode_chip"
+                    or head.get("target_module") != "lm_head"
+                    or head.get("tie_word_embeddings_required") is not False
+                    or head.get("logit_container_format") != "BF16"
+                    or head.get("bf16_container_precision_recovery") is not False
+                ):
+                    raise ValueError(
+                        "publication profile lacks the local output-head boundary"
+                    )
+                if item.role != "bf16" and (
+                    head.get("weight_format") != item.profile.weight_format
+                    or head.get("activation_format")
+                    != item.profile.activation_format
+                    or head.get("matrix_output_format")
+                    != item.profile.vector_format
+                ):
+                    raise ValueError(
+                        "publication output head differs from profile W/A/vector"
+                    )
+                selection = head.get("serving_selection")
+                if not self.protocol.greedy and (
+                    not isinstance(selection, Mapping)
+                    or selection.get("top_k") != self.protocol.top_k
+                    or selection.get("top_p") != self.protocol.top_p
+                    or selection.get("min_p") != self.protocol.min_p
+                ):
+                    raise ValueError(
+                        "publication sampling differs from streamed head selection"
+                    )
         configuration_by_id = {
             item.configuration_id: item for item in configurations
         }
@@ -994,6 +1106,7 @@ class PublicationItemMetric:
     token_count: int | None = None
     post_handoff_nll_sum: float | None = None
     post_handoff_token_count: int | None = None
+    generation_terminations: tuple[tuple[int, int, int, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.item_id:
@@ -1032,6 +1145,23 @@ class PublicationItemMetric:
             or self.post_handoff_token_count <= 0
         ):
             raise ValueError("post-handoff NLL result is invalid")
+        terminations = tuple(self.generation_terminations)
+        if terminations:
+            seeds = []
+            for seed, generated, reasoning, reason in terminations:
+                seeds.append(int(seed))
+                if (
+                    not score_mode
+                    or int(seed) < 0
+                    or int(generated) <= 0
+                    or not 0 <= int(reasoning) <= int(generated)
+                    or reason not in {"eos", "stop", "length"}
+                ):
+                    raise ValueError(
+                        "task generation termination evidence is invalid"
+                    )
+            if len(seeds) != len(set(seeds)):
+                raise ValueError("task generation termination seeds are duplicated")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1042,6 +1172,15 @@ class PublicationItemMetric:
             "token_count": self.token_count,
             "post_handoff_nll_sum": self.post_handoff_nll_sum,
             "post_handoff_token_count": self.post_handoff_token_count,
+            "generation_terminations": [
+                {
+                    "seed": seed,
+                    "generated_token_count": generated,
+                    "reasoning_token_count": reasoning,
+                    "finish_reason": reason,
+                }
+                for seed, generated, reasoning, reason in self.generation_terminations
+            ],
         }
 
     @classmethod
@@ -1071,6 +1210,15 @@ class PublicationItemMetric:
                 None
                 if value.get("post_handoff_token_count") is None
                 else int(value["post_handoff_token_count"])
+            ),
+            generation_terminations=tuple(
+                (
+                    int(record["seed"]),
+                    int(record["generated_token_count"]),
+                    int(record["reasoning_token_count"]),
+                    str(record["finish_reason"]),
+                )
+                for record in value.get("generation_terminations", ())
             ),
         )
 
@@ -1106,6 +1254,11 @@ class PublicationSplitEvidence:
             "greedy_cached_generation": (
                 TASK_METRIC_ID,
                 "prefill_greedy",
+                "prefill",
+            ),
+            "seeded_sampled_cached_generation": (
+                SAMPLED_TASK_METRIC_ID,
+                "prefill_sampled",
                 "prefill",
             ),
         }
@@ -1555,15 +1708,27 @@ class PublicationRunner:
                 ),
             }
         else:
+            expected_mode = (
+                "greedy_cached_generation"
+                if self.contract.protocol.greedy
+                else "seeded_sampled_cached_generation"
+            )
+            expected_metric = (
+                TASK_METRIC_ID
+                if self.contract.protocol.greedy
+                else SAMPLED_TASK_METRIC_ID
+            )
             if (
-                evaluation.evidence.mode != "greedy_cached_generation"
-                or evaluation.evidence.metric_id != TASK_METRIC_ID
+                evaluation.evidence.mode != expected_mode
+                or evaluation.evidence.metric_id != expected_metric
             ):
-                raise ValueError("task suites require cached greedy generation")
+                raise ValueError(
+                    "task suites require the contracted cached generation mode"
+                )
             if any(item.score is None for item in items):
                 raise ValueError("task suite returned NLL instead of scores")
             result = {
-                "metric_id": TASK_METRIC_ID,
+                "metric_id": expected_metric,
                 "score": sum(float(item.score) for item in items) / len(items),
                 "score_unit": "percentage_points",
             }
@@ -2082,6 +2247,7 @@ def build_publication_configuration_manifest(
     hardware_artifacts: Sequence[str | Path],
     merged_results_path: str | Path | None = None,
     publication_timing_tier: str,
+    candidate_selection_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Select accuracy configurations once and retain every hardware option."""
 
@@ -2134,14 +2300,55 @@ def build_publication_configuration_manifest(
         )
     ]
     selected_receipts = []
-    role_sources = (
-        ("uniform_i8", roles["uniform_mxint8"]),
-        ("uniform_i4", roles["uniform_mxint4"]),
-        ("pareto", roles["accuracy_constrained_deployment"]),
-    )
-    for role, source_profile_id in role_sources:
+    candidate_selection = None
+    if candidate_selection_path is None:
+        role_sources = (
+            ("uniform_i8", roles["uniform_mxint8"], None),
+            ("uniform_i4", roles["uniform_mxint4"], None),
+            ("pareto", roles["accuracy_constrained_deployment"], None),
+        )
+    else:
+        candidate_selection = load_immutable_json(candidate_selection_path)
+        records = candidate_selection.get("candidates")
+        if (
+            candidate_selection.get("schema_version")
+            != "decode-publication-candidate-selection/v1"
+            or candidate_selection.get("manifest_hash") != manifest.canonical_hash
+            or candidate_selection.get("schedule_hash") != schedule.canonical_hash
+            or not isinstance(records, list)
+            or not records
+        ):
+            raise ValueError("publication candidate selection provenance differs")
+        role_sources = tuple(
+            (
+                str(record.get("role", "")),
+                str(record.get("source_profile_id", "")),
+                (
+                    None
+                    if record.get("refinement_profile_id") is None
+                    else str(record["refinement_profile_id"])
+                ),
+            )
+            for record in records
+            if isinstance(record, Mapping)
+        )
+        candidate_roles = tuple(role for role, _, _ in role_sources)
+        if (
+            len(role_sources) != len(records)
+            or any(
+                not _PUBLICATION_ROLE.fullmatch(role)
+                or role == "bf16"
+                or not source_profile_id
+                for role, source_profile_id, _ in role_sources
+            )
+            or len(candidate_roles) != len(set(candidate_roles))
+        ):
+            raise ValueError("publication candidate roles are invalid or duplicated")
+    for role, source_profile_id, exact_profile_id in role_sources:
         candidates = []
         for entry in schedule_by_source.get(source_profile_id, ()):
+            if exact_profile_id is not None and entry.profile_id != exact_profile_id:
+                continue
             row = terminal_by_profile[entry.profile_id]
             result = row.get("result")
             if row.get("state") != "succeeded" or not isinstance(result, Mapping):
@@ -2183,13 +2390,15 @@ def build_publication_configuration_manifest(
                 "mean_token_nll": mean_nll,
                 "terminal_record_hash": row["record_hash"],
                 "selection_rule": (
-                    "minimum_successful_mean_token_nll_then_profile_id"
+                    "exact_deduplicated_candidate_selection"
+                    if exact_profile_id is not None
+                    else "minimum_successful_mean_token_nll_then_profile_id"
                 ),
             }
         )
 
     alternatives = []
-    for configuration, (_, source_profile_id) in zip(
+    for configuration, (_, source_profile_id, _) in zip(
         configurations[1:], role_sources
     ):
         alternatives.extend(
@@ -2217,6 +2426,11 @@ def build_publication_configuration_manifest(
         "base_manifest_hash": manifest.canonical_hash,
         "refinement_schedule_hash": schedule.canonical_hash,
         "source_selection_content_hash": source_selection["content_hash"],
+        "candidate_selection_content_hash": (
+            candidate_selection.get("content_hash")
+            if candidate_selection is not None
+            else None
+        ),
         "refinement_merge_content_hash": merge.receipt["content_hash"],
         "merged_results_sha256": merge.results_sha256,
         "selection_semantics": {
@@ -2257,8 +2471,11 @@ def load_publication_configuration_manifest(
         PublicationHardwareAlternative.from_dict(item)
         for item in value["hardware_alternatives"]
     )
-    if tuple(item.role for item in configurations) != PUBLICATION_ROLES:
-        raise ValueError("publication configuration roles are incomplete or reordered")
+    roles = tuple(item.role for item in configurations)
+    if len(roles) < 2 or roles[0] != "bf16" or len(roles) != len(set(roles)):
+        raise ValueError("publication configuration roles are invalid")
+    if set(roles) == set(PUBLICATION_ROLES) and roles != PUBLICATION_ROLES:
+        raise ValueError("legacy publication roles are reordered")
     configuration_by_id = {
         item.configuration_id: item for item in configurations
     }
@@ -2319,8 +2536,14 @@ def seal_publication_chat_template(
     publication = config.get("publication")
     if not isinstance(publication, Mapping):
         raise ValueError("config.publication is required")
-    if publication.get("enable_thinking") is not False:
-        raise ValueError("publication chat template requires thinking disabled")
+    enable_thinking = publication.get("enable_thinking")
+    if not isinstance(enable_thinking, bool):
+        raise ValueError("publication.enable_thinking must be a boolean")
+    thinking_mode = str(publication.get("thinking_mode", ""))
+    if (thinking_mode == "disabled") == enable_thinking:
+        raise ValueError("publication thinking_mode and enable_thinking disagree")
+    if "thinking" in str(config.get("model_name", "")).lower() and not enable_thinking:
+        raise ValueError("a thinking-only model cannot seal a disabled template")
     model_name = str(config.get("model_name", ""))
     model_revision = str(config.get("model_revision", ""))
     tokenizer_revision = str(config.get("tokenizer_revision", ""))
@@ -2346,7 +2569,7 @@ def seal_publication_chat_template(
             or source.get("model_name") != model_name
             or source.get("model_revision") != model_revision
             or source.get("tokenizer_revision") != tokenizer_revision
-            or source.get("enable_thinking") is not False
+            or source.get("enable_thinking") is not enable_thinking
             or not isinstance(source.get("chat_template"), str)
             or not source.get("chat_template")
         ):
@@ -2399,7 +2622,7 @@ def seal_publication_chat_template(
         "model_name": model_name,
         "model_revision": model_revision,
         "tokenizer_revision": tokenizer_revision,
-        "enable_thinking": False,
+        "enable_thinking": enable_thinking,
         "chat_template_sha256": template_hash,
         "chat_template": template,
         "source": source_receipt,
@@ -2421,6 +2644,13 @@ def build_configurations_parser() -> argparse.ArgumentParser:
         required=True,
     )
     parser.add_argument("--publication-timing-tier", required=True)
+    parser.add_argument(
+        "--candidate-selection",
+        help=(
+            "optional immutable deduplicated top-k/extrema/refinement selection; "
+            "omitting it preserves the legacy four-role study"
+        ),
+    )
     parser.add_argument("--output", required=True)
     return parser
 
@@ -2437,6 +2667,7 @@ def build_configurations_main(argv: Iterable[str] | None = None) -> int:
         merged_results_path=args.refinement_results,
         hardware_artifacts=tuple(args.hardware_artifact),
         publication_timing_tier=args.publication_timing_tier,
+        candidate_selection_path=args.candidate_selection,
     )
     output = write_immutable_json(args.output, manifest)
     load_publication_configuration_manifest(output)
@@ -2494,7 +2725,8 @@ def build_publication_contract(
         or template_asset.get("model_revision") != config.get("model_revision")
         or template_asset.get("tokenizer_revision")
         != config.get("tokenizer_revision")
-        or template_asset.get("enable_thinking") is not False
+        or template_asset.get("enable_thinking")
+        is not settings.get("enable_thinking")
         or not isinstance(template_asset.get("chat_template"), str)
         or not isinstance(template_asset.get("source"), Mapping)
     ):
@@ -2537,6 +2769,13 @@ def build_publication_contract(
             token_budgets=tuple(
                 (str(name), int(value)) for name, value in token_budgets.items()
             ),
+            top_p=float(settings.get("top_p", 1.0)),
+            top_k=int(settings.get("top_k", 0)),
+            min_p=float(settings.get("min_p", 0.0)),
+            paired_seeds=tuple(
+                int(seed) for seed in settings.get("paired_seeds", (0,))
+            ),
+            repetitions=int(settings.get("repetitions", 1)),
             output_head_location=str(
                 settings.get("output_head_location", "")
             ),
@@ -2597,6 +2836,7 @@ __all__ = [
     "RULER_LENGTHS",
     "STANDARD_WIKITEXT2_METRIC_ID",
     "TASK_METRIC_ID",
+    "SAMPLED_TASK_METRIC_ID",
     "PublicationBenchmark",
     "PublicationConfiguration",
     "PublicationContract",

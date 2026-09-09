@@ -250,6 +250,18 @@ class SweepManifest:
             "attention_bias",
             "use_qk_norm",
         }
+        if int(architecture.get("num_experts", 1)) > 1:
+            required_architecture.update(
+                {
+                    "model_type",
+                    "moe_intermediate_size",
+                    "num_experts",
+                    "num_experts_per_tok",
+                    "norm_topk_prob",
+                    "decoder_sparse_step",
+                    "mlp_only_layers",
+                }
+            )
         if set(architecture) != required_architecture:
             raise ValueError("manifest model architecture is incomplete")
         object.__setattr__(

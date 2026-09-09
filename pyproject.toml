@@ -5,13 +5,14 @@ requires-python = ">=3.11.9"
 dependencies = [
     "torch>=2.6",
     "torchvision",
-    "transformers>=4.55",
-    "lm-eval>=0.4",
+    "transformers==5.5.0",
+    "lm-eval[ifeval]==0.4.11",
     "datasets",
     "accelerate",
     "colorlog",
     "tqdm",
     "jsonargparse",
+    "tomlkit==0.15.1",
     "mase[mx-ptq]",
 ]
 
@@ -54,7 +55,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
 torchvision = { index = "pytorch-cu128" }
-mase = { git = "https://github.com/DeepWok/mase.git", branch = "sr1325/decode-phase-quant" }
+mase = { path = "../mase", editable = true }
 
 [tool.uv]
 no-build-isolation-package = ["fast-hadamard-transform"]
