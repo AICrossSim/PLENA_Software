@@ -16,12 +16,27 @@ from decode_dse.software.cache_artifacts import (
 )
 
 
+class PrefillDecodeView(Protocol):
+    """Prompt metadata required after K/V admission has been verified."""
+
+    artifact_id: str
+    attention_mask: tuple[tuple[int, ...], ...]
+    position_ids: tuple[tuple[int, ...], ...]
+    first_token: FirstTokenResult
+
+    @property
+    def batch_size(self) -> int: ...
+
+    @property
+    def cache_length(self) -> int: ...
+
+
 @dataclass(frozen=True)
 class ContinuationExample:
     """One independently cached document and its teacher-forced continuation."""
 
     document_id: str
-    prefill: PrefillArtifact
+    prefill: PrefillDecodeView
     decode_cache: DecodeCacheArtifact
     continuation_ids: tuple[int, ...]
 
@@ -389,6 +404,19 @@ def capture_bf16_prefill(
         raise ValueError("position_ids must match input_ids")
     device = input_ids.device
     cache_position = torch.arange(input_ids.shape[1], device=device)
+    token_offsets = torch.arange(input_ids.shape[1], device=device)[None, :]
+    last_indices = torch.where(
+        attention_mask.to(torch.bool),
+        token_offsets,
+        torch.full_like(token_offsets, -1),
+    ).amax(dim=-1)
+    if torch.any(last_indices < 0):
+        raise ValueError("each prompt must contain at least one active token")
+    logit_positions, row_logit_indices = torch.unique(
+        last_indices,
+        sorted=True,
+        return_inverse=True,
+    )
     model.eval()
     with torch.no_grad():
         output = model(
@@ -397,19 +425,18 @@ def capture_bf16_prefill(
             position_ids=position_ids,
             cache_position=cache_position,
             use_cache=True,
+            logits_to_keep=logit_positions,
         )
     logits = output.logits
-    if logits.ndim != 3 or logits.shape[:2] != input_ids.shape:
-        raise AssertionError("prefill logits must have shape [batch, sequence, vocabulary]")
-
-    token_offsets = torch.arange(input_ids.shape[1], device=device)[None, :]
-    last_indices = torch.where(
-        attention_mask.to(torch.bool), token_offsets, torch.full_like(token_offsets, -1)
-    ).amax(dim=-1)
-    if torch.any(last_indices < 0):
-        raise ValueError("each prompt must contain at least one active token")
+    expected_prefix = (input_ids.shape[0], logit_positions.numel())
+    if logits.ndim != 3 or logits.shape[:2] != expected_prefix:
+        raise AssertionError(
+            "prefill logits must contain each requested final active position"
+        )
+    if logits.dtype != torch.bfloat16:
+        raise TypeError("the BF16 prefill head must emit BF16 logits")
     batch_indices = torch.arange(input_ids.shape[0], device=device)
-    last_logits = logits[batch_indices, last_indices]
+    last_logits = logits[batch_indices, row_logit_indices]
     selection = "greedy"
     if expected_first_token_ids is None:
         first_tokens = last_logits.argmax(dim=-1)

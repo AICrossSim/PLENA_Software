@@ -608,6 +608,7 @@ class ExhaustiveSweepRunner:
         stage: str = "sweep",
         clock: Callable[[], float] = time.monotonic,
         emit_progress: Callable[[str], None] = print,
+        precomputed_outcomes: Mapping[str, EvaluationOutcome] | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
@@ -619,6 +620,18 @@ class ExhaustiveSweepRunner:
         self.clock = clock
         self.emit_progress = emit_progress
         self.entries = {entry.profile_id: entry for entry in manifest.entries}
+        self.precomputed_outcomes = dict(precomputed_outcomes or {})
+        unknown = set(self.precomputed_outcomes) - set(self.entries)
+        if unknown:
+            raise ValueError(
+                "precomputed outcomes reference unknown profiles: "
+                + ", ".join(sorted(unknown))
+            )
+        if any(
+            not isinstance(outcome, EvaluationOutcome)
+            for outcome in self.precomputed_outcomes.values()
+        ):
+            raise TypeError("precomputed outcomes must be EvaluationOutcome values")
 
     @contextmanager
     def _run_lock(self):
@@ -725,6 +738,61 @@ class ExhaustiveSweepRunner:
                 attempt=status.attempt,
                 result=pointer,
             )
+
+    def _install_precomputed(
+        self,
+        *,
+        store: ResultShardStore,
+        journal: StatusJournal,
+        completions: CompletionStore,
+    ) -> None:
+        """Install exact, content-bound outcomes before opening weight banks.
+
+        A precomputed row is admitted only for a never-attempted profile.  A
+        prior running/failed attempt is preserved for ordinary recovery/retry,
+        so reuse can never erase execution evidence.
+        """
+
+        if not self.precomputed_outcomes:
+            return
+        latest = journal.latest()
+        for entry in self.manifest.entries:
+            outcome = self.precomputed_outcomes.get(entry.profile_id)
+            if outcome is None or entry.profile_id in latest:
+                continue
+            validity = constrain_stack_validity(
+                entry.profile,
+                merge_stack_validity(entry.validity, outcome.validity),
+            )
+            if validity.software_valid is False:
+                raise ValueError("precomputed outcome cannot be software-invalid")
+            if validity.software_valid is None:
+                validity = validity.updated(software_valid=True)
+            safe_metrics, non_finite = _sanitize_result(outcome.metrics)
+            if non_finite:
+                raise NonFiniteResultError(non_finite)
+            running = journal.begin(entry.profile_id)
+            pointer = store.append(
+                entry,
+                attempt=running.attempt,
+                state="succeeded",
+                validity=validity,
+                result=safe_metrics,
+                artifacts=outcome.artifacts,
+                runtime_seconds=0.0,
+            )
+            completed = journal.complete(
+                entry.profile_id,
+                validity=validity,
+                result_path=pointer.journal_path,
+            )
+            completions.mark(
+                entry,
+                state="succeeded",
+                attempt=running.attempt,
+                result=pointer,
+            )
+            latest[entry.profile_id] = completed
 
     def _evaluate_entry(
         self,
@@ -876,6 +944,11 @@ class ExhaustiveSweepRunner:
             completions = CompletionStore(self.output_dir, self.manifest)
             initial_rows = len(store.records)
             self._recover(store, journal, completions)
+            self._install_precomputed(
+                store=store,
+                journal=journal,
+                completions=completions,
+            )
             remaining_limit = limit
             latest = journal.latest()
             initial_succeeded = sum(
@@ -894,6 +967,15 @@ class ExhaustiveSweepRunner:
                         status.state == "failed" and status.attempt >= self.max_attempts
                     )
                 )
+            }
+            # Entries with no journal status yet (every entry on a fresh
+            # invocation) are pending too; without them the required-bank
+            # count starts at zero and the pilot progress snapshot can never
+            # reconcile opened == required.
+            pending_ids |= {
+                entry.profile_id
+                for entry in self.manifest.entries
+                if entry.profile_id not in latest
             }
             required_weight_banks = tuple(
                 dict.fromkeys(

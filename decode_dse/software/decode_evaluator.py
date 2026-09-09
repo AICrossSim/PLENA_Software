@@ -29,6 +29,8 @@ from decode_dse.legality import StackValidity
 from decode_dse.manifest import SweepManifestEntry
 from decode_dse.profiles import (
     DECODE_FORMATS,
+    LOCAL_HEAD_OUTPUT_RULE,
+    LOCAL_HEAD_SCHEMA,
     PROFILE_KIND_BF16_REFERENCE,
     DecodePrecisionProfile,
     format_descriptor,
@@ -68,6 +70,7 @@ from decode_dse.software.cache_artifacts import (
     admit_prefill_cache,
     admit_prefill_cache_split,
     load_decode_cache_artifact,
+    load_prefill_decode_metadata,
     load_prefill_artifact,
     save_decode_cache_artifact,
 )
@@ -173,6 +176,30 @@ def _available_host_bytes() -> int:
     raise RuntimeError("MemAvailable is missing from /proc/meminfo")
 
 
+def _process_memory_observation() -> dict[str, int]:
+    """Return measured host availability and this worker's resident peaks."""
+
+    status = Path("/proc/self/status")
+    if not status.is_file():
+        raise RuntimeError("process memory cannot be measured")
+    fields: dict[str, int] = {}
+    for line in status.read_text(encoding="utf-8").splitlines():
+        name, separator, payload = line.partition(":")
+        if not separator or name not in {"VmRSS", "VmHWM"}:
+            continue
+        values = payload.strip().split()
+        if len(values) != 2 or values[1] != "kB":
+            raise RuntimeError(f"unsupported process-memory unit for {name}")
+        fields[name] = int(values[0]) * 1024
+    if set(fields) != {"VmRSS", "VmHWM"}:
+        raise RuntimeError("VmRSS/VmHWM are missing from /proc/self/status")
+    return {
+        "host_mem_available_bytes": _available_host_bytes(),
+        "process_rss_bytes": fields["VmRSS"],
+        "process_peak_rss_bytes": fields["VmHWM"],
+    }
+
+
 def _packed_tensor_disk_components(
     element_count: int,
     format_id: str,
@@ -275,17 +302,22 @@ def _pack_tensor_codes(codes: Any, width: int) -> bytes:
 
     if width <= 0 or width > 8:
         raise ValueError("element width must be in [1, 8]")
-    values = codes.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+    # Packing is exact integer work, so it runs wherever the codes already
+    # live and only the finished byte plane is brought back to the host. This
+    # keeps a GPU-side admission from paying a device-to-host copy per layer.
+    values = codes.detach().to(dtype=torch.int64).reshape(-1)
     if values.numel() == 0:
         return b""
     mask = (1 << width) - 1
     if torch.any((values < 0) | (values > mask)):
         raise ValueError("element code is outside its declared width")
-    positions = torch.arange(values.numel(), dtype=torch.int64) * width
+    positions = torch.arange(
+        values.numel(), dtype=torch.int64, device=values.device
+    ) * width
     byte_indices = torch.div(positions, 8, rounding_mode="floor")
     shifts = positions.remainder(8)
     byte_count = math.ceil(values.numel() * width / 8)
-    packed = torch.zeros(byte_count, dtype=torch.int64)
+    packed = torch.zeros(byte_count, dtype=torch.int64, device=values.device)
     packed.scatter_add_(
         0,
         byte_indices,
@@ -298,7 +330,7 @@ def _pack_tensor_codes(codes: Any, width: int) -> bytes:
             byte_indices[spills] + 1,
             values[spills] >> (8 - shifts[spills]),
         )
-    return packed.to(torch.uint8).numpy().tobytes(order="C")
+    return packed.to(torch.uint8).cpu().numpy().tobytes(order="C")
 
 
 def _uint8_bytes(values: Any) -> bytes:
@@ -306,13 +338,15 @@ def _uint8_bytes(values: Any) -> bytes:
 
     return (
         values.detach()
-        .to(device="cpu", dtype=torch.int64)
+        .to(dtype=torch.int64)
         .bitwise_and(0xFF)
         .to(torch.uint8)
         .reshape(-1)
+        .cpu()
         .numpy()
         .tobytes(order="C")
     )
+
 
 
 class MaseMXCacheConverter:
@@ -341,8 +375,15 @@ class MaseMXCacheConverter:
         if layout is None:
             raise ValueError(f"unsupported numerical cache layout {layout_id!r}")
         import torch
-
-        source = tensor.to_torch("cpu").contiguous()
+        
+        # Admission converts the whole BF16 prefill cache once per format, and
+        # at 64 decoder layers that block maths dominates the stage. The
+        # arithmetic is elementwise and device-agnostic, so it may be run on an
+        # accelerator; the packing below still needs host tensors, so anything
+        # computed here is brought back before it is serialised. Defaults to
+        # "cpu", which leaves existing studies bit-identical.
+        device = os.environ.get("PLENA_ADMISSION_DEVICE", "cpu")
+        source = tensor.to_torch(device).contiguous()
         if source.dtype != torch.bfloat16:
             raise TypeError("decode admission requires a BF16 source tensor")
         row_elements = int(layout.group("row_elements"))
@@ -420,7 +461,7 @@ class MaseMXCacheConverter:
             element_encoding = "MXFP_IEEE_LSB"
 
         numerical_payload = TensorPayload.from_torch(
-            numerical.permute(0, 2, 1, 3).contiguous().to(torch.bfloat16),
+            numerical.permute(0, 2, 1, 3).contiguous().to(torch.bfloat16).cpu(),
             dtype="bfloat16",
         )
         return QuantizedTensorPayload(
@@ -465,6 +506,7 @@ class DecodeWeightBank:
     quantization_guard: "DecodeWeightQuantizationGuard"
     build_seconds: float
     weight_method: str = "rtn"
+    resource_observation: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -779,17 +821,13 @@ def _validate_bank_structure(
     collapsed_linears: int,
     model_architecture: Mapping[str, Any],
 ) -> None:
-    layers = int(model_architecture["num_hidden_layers"])
-    qk_norm = bool(model_architecture.get("use_qk_norm", False))
-    rmsnorms = layers * (4 if qk_norm else 2) + 1
-    expected_pattern_counts = (
-        layers,
-        4 * layers,
-        3 * layers,
-        layers,
-        layers,
-        rmsnorms,
+    from decode_dse.software.precision_bindings import (
+        decode_binding_expectations,
     )
+
+    layers = int(model_architecture["num_hidden_layers"])
+    expectations = decode_binding_expectations(dict(model_architecture))
+    expected_pattern_counts = expectations.pattern_counts
     pattern_counts = tuple(
         sum(target.pattern_index == index for target in binding_plan.targets)
         for index in range(len(binding_plan.patterns))
@@ -799,8 +837,8 @@ def _validate_bank_structure(
             "decode binding coverage mismatch: "
             f"{pattern_counts} != {expected_pattern_counts}"
         )
-    expected_bindings = sum(expected_pattern_counts)
-    expected_linears = 7 * layers
+    expected_bindings = expectations.binding_targets
+    expected_linears = expectations.sealed_weight_modules
     if len(binding_plan.targets) != expected_bindings:
         raise RuntimeError(
             f"model requires exactly {expected_bindings} runtime bindings"
@@ -816,13 +854,108 @@ def _validate_bank_structure(
     }
     if layer_indices != set(range(layers)):
         raise RuntimeError("decoder-layer coverage is incomplete")
-    for name in ("model.embed_tokens", "lm_head"):
-        module = model.get_submodule(name)
-        weight = getattr(module, "weight", None)
+    _validate_local_head_structure(
+        model,
+        model_architecture,
+        quantized=True,
+    )
+
+
+def _validate_local_head_structure(
+    model: Any,
+    model_architecture: Mapping[str, Any],
+    *,
+    quantized: bool,
+) -> None:
+    """Validate untied embedding/head ownership and decode head semantics."""
+
+    if model_architecture.get("tie_word_embeddings") is not False:
+        raise RuntimeError("the target local-head contract requires untied weights")
+    embedding = model.get_submodule("model.embed_tokens")
+    head = model.get_submodule("lm_head")
+    embedding_weight = getattr(embedding, "weight", None)
+    head_weight = getattr(head, "weight", None)
+    for name, weight in (
+        ("model.embed_tokens", embedding_weight),
+        ("lm_head", head_weight),
+    ):
         if weight is None or str(weight.dtype) != "torch.bfloat16":
-            raise RuntimeError(f"{name} must remain a BF16 weight module")
-        if hasattr(module, "phase_q_config"):
-            raise RuntimeError(f"{name} must remain outside decode quantization")
+            raise RuntimeError(f"{name} must use BF16 tensor storage")
+    if embedding_weight.data_ptr() == head_weight.data_ptr():
+        raise RuntimeError("the target embedding and LM head must be untied")
+    if hasattr(embedding, "phase_q_config"):
+        raise RuntimeError("the embedding must remain outside decode quantization")
+    if not quantized:
+        if hasattr(head, "phase_q_config"):
+            raise RuntimeError("the BF16 reference head must remain unquantized")
+        return
+
+    from chop.nn.quantized.modules.phase_config import resolve_module_phase_config
+
+    phase = getattr(head, "phase_q_config", None)
+    if not isinstance(phase, Mapping):
+        raise RuntimeError("the quantized decode bank must bind the local LM head")
+    decode = resolve_module_phase_config(phase, "decode")
+    prefill = resolve_module_phase_config(phase, "prefill")
+    if prefill.get("bypass") is not True:
+        raise RuntimeError("the prefill-owned first-token head must stay BF16")
+    contract = decode.get("local_head_contract")
+    if not isinstance(contract, Mapping):
+        raise RuntimeError("the local LM-head runtime contract is missing")
+    required = {
+        "schema_version": LOCAL_HEAD_SCHEMA,
+        "location": "decode_chip",
+        "target_module": "lm_head",
+        "tie_word_embeddings_required": False,
+        "weight_format_source": "profile.weight_format",
+        "activation_format_source": "profile.activation_format",
+        "weight_method": "rtn",
+        "scale_format": "E8M0",
+        "scale_bits": 8,
+        "accumulator_rule": "plena_fixed16_16_accumulate_truncate",
+        "cross_instruction_accumulation": (
+            "signed_fixed16_16_wraparound"
+        ),
+        "matrix_instruction_k_partition": "MLEN",
+        "output_rule": LOCAL_HEAD_OUTPUT_RULE,
+        "matrix_semantics_output_rule": "truncate_to_vector_format",
+        "mlen_partial_conversion_rounding": "round_to_nearest_even",
+        "logit_container_format": "BF16",
+        "final_logits_format": "BF16",
+        "bf16_container_precision_recovery": False,
+        "greedy_selection_rule": "argmax_lowest_token_id_on_tie",
+    }
+    if any(contract.get(key) != value for key, value in required.items()):
+        raise RuntimeError("the local LM-head runtime contract differs")
+    if contract.get("weight_preconditioning") != "none":
+        raise RuntimeError("the local LM-head preconditioning differs")
+    if (
+        decode.get("output_format") != contract.get("matrix_output_format")
+        or decode.get("output_format") != contract.get("matrix_storage_format")
+        or decode.get("output_format") != contract.get("partial_conversion_format")
+        or decode.get("operand_family_binding")
+        != contract.get("operand_family_binding")
+        or not isinstance(contract.get("arithmetic_chain"), list)
+        or not contract["arithmetic_chain"]
+        or not isinstance(decode.get("matrix_mlen"), int)
+        or decode["matrix_mlen"] <= 0
+        or contract.get("matrix_mlen") != decode.get("matrix_mlen")
+        or decode.get("weight_block_size") != contract.get("block_size")
+        or decode.get("data_in_block_size") != contract.get("block_size")
+    ):
+        raise RuntimeError("the local LM-head matrix binding is inconsistent")
+    serving = contract.get("serving_selection")
+    offline = contract.get("offline_evaluation")
+    if (
+        not isinstance(serving, Mapping)
+        or serving.get("materialization") != "tiled_bf16_logits"
+        or serving.get("full_batch_vocab_vsram_required") is not False
+        or serving.get("running_state")
+        != "top_k20_and_argmax_lowest_token_id"
+        or not isinstance(offline, Mapping)
+        or offline.get("materialization") != "full_bf16_logits"
+    ):
+        raise RuntimeError("the local LM-head output boundary differs")
 
 
 class _DecodeCacheLRU:
@@ -831,6 +964,8 @@ class _DecodeCacheLRU:
             raise ValueError("decode-cache LRU capacity must be positive")
         self.capacity_bytes = capacity_bytes
         self.total_bytes = 0
+        self.peak_bytes = 0
+        self.peak_entries = 0
         self.values: OrderedDict[Path, tuple[DecodeCacheArtifact, int]] = OrderedDict()
 
     def get(self, path: Path) -> DecodeCacheArtifact:
@@ -846,11 +981,15 @@ class _DecodeCacheLRU:
         if size <= self.capacity_bytes:
             self.values[path] = (artifact, size)
             self.total_bytes += size
+            self.peak_bytes = max(self.peak_bytes, self.total_bytes)
+            self.peak_entries = max(self.peak_entries, len(self.values))
         return artifact
 
     def clear(self) -> None:
         self.values.clear()
         self.total_bytes = 0
+        self.peak_bytes = 0
+        self.peak_entries = 0
 
 
 def _load_stack_validity(
@@ -1263,6 +1402,7 @@ class DecodeEvaluator:
         }
         if set(records) != expected:
             raise ValueError("prefill index document coverage mismatch")
+        decode_metadata = {}
         for sample in self.samples:
             path = _prefill_path(self.prefill_root, sample.document_id)
             if not path.is_dir():
@@ -1289,6 +1429,16 @@ class DecodeEvaluator:
                 != record.get("preparation_device", {}).get("device_uuid")
             ):
                 raise ValueError("prefill artifact identity differs from its index")
+            metadata = load_prefill_decode_metadata(path)
+            if (
+                metadata.artifact_id != record.get("artifact_id")
+                or metadata.prompt_hash != sample.prompt_hash
+                or metadata.layer_count
+                != int(self.model_architecture["num_hidden_layers"])
+            ):
+                raise ValueError("prefill decode metadata differs from its index")
+            decode_metadata[sample.document_id] = metadata
+        self.prefill_decode_metadata = decode_metadata
 
     def seal_workspace_runtime_environment(
         self,
@@ -1821,9 +1971,17 @@ class DecodeEvaluator:
         initialize_numerical_runtime(self.runtime_seed)
         self._capture_current_runtime_environment()
         self._validate_device_label()
+        host_before = _process_memory_observation()
+        build_cuda_device = (
+            torch.device(self.device) if self.device.startswith("cuda") else None
+        )
+        if build_cuda_device is not None:
+            torch.cuda.reset_peak_memory_stats(build_cuda_device)
         model = None
         try:
+            lock_requested = time.perf_counter()
             with self._weight_bank_build_lock():
+                lock_acquired = time.perf_counter()
                 model = self._load_model()
                 if weight_format != "BF16":
                     from chop.passes.module.transforms.quantize.quantize import (
@@ -1832,6 +1990,7 @@ class DecodeEvaluator:
                     )
                     from decode_dse.software.precision_bindings import (
                         build_decode_pass_args,
+                        decode_binding_expectations,
                     )
 
                     representative = profile_to_decode_quant_spec(entries[0].profile)
@@ -1864,9 +2023,9 @@ class DecodeEvaluator:
                     binding_plan = build_decode_binding_plan(model, pass_args)
                     quantization_guard = DecodeWeightQuantizationGuard.capture(
                         binding_plan,
-                        expected_modules=(
-                            7 * int(self.model_architecture["num_hidden_layers"])
-                        ),
+                        expected_modules=decode_binding_expectations(
+                            dict(self.model_architecture)
+                        ).sealed_weight_modules,
                     )
                     _validate_bank_structure(
                         model,
@@ -1888,7 +2047,68 @@ class DecodeEvaluator:
                         binding_plan,
                         expected_modules=0,
                     )
+                    _validate_local_head_structure(
+                        model,
+                        self.model_architecture,
+                        quantized=False,
+                    )
+                serialized_build_finished = time.perf_counter()
             identity_guard = DecodeWeightBankIdentity.capture(model)
+            host_after = _process_memory_observation()
+            fused_expert_modules = tuple(
+                module
+                for module in model.modules()
+                if isinstance(getattr(module, "gate_up_proj", None), torch.Tensor)
+                and isinstance(getattr(module, "down_proj", None), torch.Tensor)
+                and module.gate_up_proj.ndim == 3
+                and module.down_proj.ndim == 3
+            )
+            fused_expert_parameter_bytes = sum(
+                int(parameter.numel() * parameter.element_size())
+                for module in fused_expert_modules
+                for parameter in (module.gate_up_proj, module.down_proj)
+            )
+            gpu_build = None
+            if build_cuda_device is not None:
+                properties = torch.cuda.get_device_properties(build_cuda_device)
+                gpu_build = {
+                    "total_device_bytes": int(properties.total_memory),
+                    "allocated_bytes_after_build": int(
+                        torch.cuda.memory_allocated(build_cuda_device)
+                    ),
+                    "reserved_bytes_after_build": int(
+                        torch.cuda.memory_reserved(build_cuda_device)
+                    ),
+                    "peak_allocated_bytes_during_build": int(
+                        torch.cuda.max_memory_allocated(build_cuda_device)
+                    ),
+                    "peak_reserved_bytes_during_build": int(
+                        torch.cuda.max_memory_reserved(build_cuda_device)
+                    ),
+                }
+            build_seconds = time.perf_counter() - build_started
+            resource_observation = {
+                "schema_version": "decode-weight-bank-resource-observation/v1",
+                "build_serialized_across_workers": bool(
+                    self.executor_config.get("serialize_weight_bank_builds", True)
+                ),
+                "host_before_build": host_before,
+                "host_after_build": host_after,
+                "gpu": gpu_build,
+                "fused_expert_module_count": len(fused_expert_modules),
+                "fused_expert_parameter_bytes": fused_expert_parameter_bytes,
+                "timing": {
+                    "pre_lock_setup_seconds": lock_requested - build_started,
+                    "lock_wait_seconds": lock_acquired - lock_requested,
+                    "serialized_build_seconds": (
+                        serialized_build_finished - lock_acquired
+                    ),
+                    "post_lock_validation_seconds": (
+                        build_seconds - (serialized_build_finished - build_started)
+                    ),
+                    "outer_open_seconds": build_seconds,
+                },
+            }
             yield DecodeWeightBank(
                 model=model,
                 device=torch.device(self.device),
@@ -1896,7 +2116,8 @@ class DecodeEvaluator:
                 binding_plan=binding_plan,
                 identity_guard=identity_guard,
                 quantization_guard=quantization_guard,
-                build_seconds=time.perf_counter() - build_started,
+                build_seconds=build_seconds,
+                resource_observation=resource_observation,
             )
         finally:
             del model
@@ -3112,6 +3333,7 @@ class DecodeEvaluator:
         self._native_append_quantized_tensor_checks = 0
         self._native_append_validation_seconds = 0.0
         binding = self._bind_profile(weight_bank, entry.profile)
+        host_before_evaluation = _process_memory_observation()
         cuda_device = weight_bank.device if weight_bank.device.type == "cuda" else None
         if cuda_device is not None:
             torch.cuda.reset_peak_memory_stats(cuda_device)
@@ -3134,9 +3356,7 @@ class DecodeEvaluator:
                 ]
                 examples = []
                 for sample in batch_samples:
-                    prefill = load_prefill_artifact(
-                        _prefill_path(self.prefill_root, sample.document_id)
-                    )
+                    prefill = self.prefill_decode_metadata[sample.document_id]
                     admitted = self.cache_lru.get(
                         kv_admission_cache.paths[sample.document_id]
                     )
@@ -3201,6 +3421,7 @@ class DecodeEvaluator:
         weight_bank.identity_guard.verify(weight_bank.model)
         weight_bank.quantization_guard.verify()
         current_runtime = self._capture_current_runtime_environment()
+        host_after_evaluation = _process_memory_observation()
         mean_nll = nll_sum / token_count
         perplexity = (
             math.exp(mean_nll) if mean_nll <= math.log(sys.float_info.max) else None
@@ -3270,12 +3491,34 @@ class DecodeEvaluator:
                     self.context.workspace_root / "admission_preparation.json"
                 ),
             },
+            "prefill_metadata_reuse": {
+                "policy": "verified_manifest_only_after_sealed_admission",
+                "bf16_kv_source_planes_reloaded_per_profile": False,
+                "metadata_entries": len(self.prefill_decode_metadata),
+                "admitted_kv_content_identity_preserved": True,
+            },
             "decode_microbatch": {
                 "configured_size": self.decode_microbatch_size,
                 "independent_cache_count": len(self.samples),
                 "equal_length_required": True,
             },
             "gpu_memory": gpu_memory,
+            "resource_observation": {
+                "schema_version": "decode-profile-resource-observation/v1",
+                "host_before_evaluation": host_before_evaluation,
+                "host_after_evaluation": host_after_evaluation,
+                "decode_cache_lru": {
+                    "configured_capacity_bytes": self.cache_lru.capacity_bytes,
+                    "resident_bytes_after_evaluation": self.cache_lru.total_bytes,
+                    "resident_entries_after_evaluation": len(
+                        self.cache_lru.values
+                    ),
+                    "peak_resident_bytes_this_weight_bank": (
+                        self.cache_lru.peak_bytes
+                    ),
+                    "peak_entries_this_weight_bank": self.cache_lru.peak_entries,
+                },
+            },
             "runtime_environment": runtime_environment,
             "weight_bank": {
                 "weight_format": weight_bank.weight_format,
@@ -3285,6 +3528,9 @@ class DecodeEvaluator:
                 "identity_fingerprint": weight_bank.identity_guard.fingerprint,
                 "structure_fingerprint": (
                     weight_bank.identity_guard.structure_fingerprint
+                ),
+                "resource_observation": dict(
+                    weight_bank.resource_observation or {}
                 ),
             },
             "sample_contract": self.context.sample_contract.to_dict(),

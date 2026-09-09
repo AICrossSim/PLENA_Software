@@ -328,6 +328,35 @@ class PrefillArtifact:
 
 
 @dataclass(frozen=True)
+class PrefillDecodeMetadata:
+    """Verified manifest-only fields needed by cached decode.
+
+    Decode consumes the separately admitted K/V artifact, so repeatedly
+    loading the source BF16 tensor payloads cannot affect its arithmetic.  This
+    view retains the content address and every prompt/first-token field used by
+    :class:`ContinuationExample` while avoiding redundant BF16 K/V reads for
+    every precision profile.
+    """
+
+    artifact_id: str
+    prompt_hash: str
+    attention_mask: tuple[tuple[int, ...], ...]
+    position_ids: tuple[tuple[int, ...], ...]
+    first_token: FirstTokenResult
+    layer_count: int
+    _batch_size: int
+    _cache_length: int
+
+    @property
+    def batch_size(self) -> int:
+        return self._batch_size
+
+    @property
+    def cache_length(self) -> int:
+        return self._cache_length
+
+
+@dataclass(frozen=True)
 class QuantizedTensorPayload:
     """Physical cache planes and the corresponding numerical tensor."""
 
@@ -753,6 +782,100 @@ def load_prefill_artifact(path: str | Path) -> PrefillArtifact:
     if artifact.artifact_id != manifest["artifact_id"]:
         raise ValueError("prefill artifact identity mismatch")
     return artifact
+
+
+def load_prefill_decode_metadata(path: str | Path) -> PrefillDecodeMetadata:
+    """Verify and load only the source-prefill fields consumed during decode.
+
+    The complete prefill tensor planes are independently verified when the
+    admission catalog is prepared.  Steady-state numerical evaluation reads
+    K/V from that admitted artifact; reading the BF16 source planes again for
+    every profile is therefore redundant.  The manifest content address still
+    binds those planes through their shapes and SHA-256 descriptors.
+    """
+
+    root = Path(path)
+    manifest = _load_json(root / "manifest.json")
+    if manifest.get("schema") != "plena.prefill":
+        raise ValueError("not a PLENA prefill artifact")
+    artifact_id = str(manifest.get("artifact_id", ""))
+    descriptor = dict(manifest)
+    descriptor.pop("artifact_id", None)
+    if not artifact_id or _sha256(_canonical_json(descriptor)) != artifact_id:
+        raise ValueError("prefill manifest identity mismatch")
+    if int(manifest.get("schema_version", -1)) != _PREFILL_SCHEMA:
+        raise ValueError("unsupported prefill manifest schema")
+
+    input_ids = _freeze_rows(manifest.get("input_ids", ()), "input_ids")
+    attention_mask = _freeze_rows(
+        manifest.get("attention_mask", ()),
+        "attention_mask",
+    )
+    position_ids = _freeze_rows(
+        manifest.get("position_ids", ()),
+        "position_ids",
+    )
+    if not (len(input_ids) == len(attention_mask) == len(position_ids)):
+        raise ValueError("prefill prompt tensors have different batch sizes")
+    if any(
+        len(ids) != len(mask) or len(ids) != len(position)
+        for ids, mask, position in zip(input_ids, attention_mask, position_ids)
+    ):
+        raise ValueError("prefill prompt tensors have different sequence lengths")
+    if any(value not in (0, 1) for row in attention_mask for value in row):
+        raise ValueError("prefill attention mask is invalid")
+    prompt_hash = str(manifest.get("prompt_hash", ""))
+    if prompt_hash != compute_prompt_hash(input_ids, attention_mask, position_ids):
+        raise ValueError("prefill prompt hash mismatch")
+
+    first_desc = manifest.get("first_token")
+    if not isinstance(first_desc, dict):
+        raise ValueError("prefill manifest lacks first-token metadata")
+    first = FirstTokenResult(
+        token_ids=tuple(first_desc.get("token_ids", ())),
+        selection=first_desc.get("selection"),
+        log_probabilities=(
+            tuple(first_desc["log_probabilities"])
+            if first_desc.get("log_probabilities") is not None
+            else None
+        ),
+    )
+    if len(first.token_ids) != len(input_ids):
+        raise ValueError("prefill first-token batch size mismatch")
+
+    layers = manifest.get("layers")
+    if not isinstance(layers, list) or not layers:
+        raise ValueError("prefill manifest has no K/V layer descriptors")
+    batch_size = len(input_ids)
+    cache_length = len(input_ids[0])
+    for index, layer in enumerate(layers):
+        if not isinstance(layer, dict):
+            raise TypeError(f"prefill layer {index} descriptor must be an object")
+        key = layer.get("key")
+        value = layer.get("value")
+        if not isinstance(key, dict) or not isinstance(value, dict):
+            raise ValueError(f"prefill layer {index} lacks K/V descriptors")
+        key_shape = tuple(int(size) for size in key.get("shape", ()))
+        value_shape = tuple(int(size) for size in value.get("shape", ()))
+        if (
+            key.get("dtype") != "bfloat16"
+            or value.get("dtype") != "bfloat16"
+            or key_shape != value_shape
+            or len(key_shape) != 4
+            or key_shape[0] != batch_size
+            or key_shape[-2] != cache_length
+        ):
+            raise ValueError(f"prefill layer {index} K/V geometry mismatch")
+    return PrefillDecodeMetadata(
+        artifact_id=artifact_id,
+        prompt_hash=prompt_hash,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        first_token=first,
+        layer_count=len(layers),
+        _batch_size=batch_size,
+        _cache_length=cache_length,
+    )
 
 
 def save_decode_cache_artifact(
