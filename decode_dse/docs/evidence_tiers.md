@@ -357,24 +357,38 @@ optimistic number.
 
 ## 9. Output-head boundary
 
-Where the BF16 LM head runs is a scope decision with its own evidence, declared
+Where the LM head runs is a scope decision with its own evidence, declared
 by `output_head_contract.headline_location` in the study config and resolved by
 `--output-head-location`.
 
 | Location | What the decode chip pays | Head cost evidence | Disclosure |
 | --- | --- | --- | --- |
-| `decode_bf16_unmodeled` (**headline**) | BF16 head weights in HBM capacity, head traffic every decode step | compute idealized - no measured instruction-level timing or energy signature | `local_bf16_head_compute_idealized` on every row |
-| `external_bf16_service` (comparison) | nothing past the final RMSNorm | measured reserved endpoint: repeated and holdout logits, link timing, component dynamic energy, leakage | none claimed |
+| `decode_local_mx_head` (**canonical decode headline**) | profile-W/A padded weights and scales, HBM traffic, matrix/vector/selection work, bounded logit/selector state and TP merge | profile-bound analytical breakdown plus content-addressed compiler structural receipt | numerical MLEN mismatch, body physical-padding gap, TP-layout gap, and compiler/RTL implementation state remain explicit blockers |
+| `external_bf16_service` (optional whole-service sensitivity) | nothing past the final RMSNorm | measured endpoint logits/head cost plus a content-addressed full prefill/head resource and deployed-interface receipt | unavailable when either optional receipt is absent; never blocks local decode ranking |
+| `decode_bf16_unmodeled` (analytic sensitivity) | BF16 head weights in HBM capacity, head traffic every decode step | compute idealized - no measured instruction-level timing or energy signature | `local_bf16_head_compute_idealized`; `whole_model.rankable=false` |
 
-Both are rankable, and both carry their location, service mode and scope
-idealizations in `metrics.output_head_boundary`. The idealization list is
-*derived* from the location rather than supplied, so a locally-headed row
-cannot be written without its disclosure, and the measured arm cannot borrow
-one. The composed system identity differs by construction
-(`decode-local-head-system-…` versus `decode-head-system-…`), so the two
-placements can never be confused for one another after the fact.
+All carry their location, service mode and scope idealizations in
+`metrics.output_head_boundary`. The local MX status is reconstructed from the
+row's exact profile ID, W/A/vector formats and numerical foundation MLEN; the
+cost breakdown reports cycles/time, padded resident and streamed bytes,
+algorithmic/executed/padding FLOPs, selector workspace, TP exchange and
+fractions of decoder TPOT/traffic/capacity. A compiler receipt proves structural
+bytes/events only and does not claim serving lowering, calibrated cycles, RTL
+parity, or publication validity.
 
-The external endpoint is reserved for the whole decode step, so its idle draw
+The service measurement uses a second GPU as instrumentation. Per-board raw
+dynamic readings are retained, but only endpoint dynamic and endpoint leakage
+enter the service. Strict request/response timing is recomposed from the bound
+PLENA-decoder-to-prefill interface; B200-to-B200 timing is not promoted. The
+endpoint-resource receipt counts exact config-derived BF16 prefill residency
+excluding the untied LM head, the calibrated head once, runtime reserve,
+aggregate compute-silicon area across all endpoint compute dies, installed HBM
+capacity/peak bandwidth, and decoder-interface link energy. Its absence makes
+only the external comparison unavailable. The local primary scope excludes
+prefill resources by definition: prefill owns prompt processing and the first
+token and is evaluated in the separate handoff/queue sensitivity.
+
+The external endpoint is reserved for the whole decode step, so its endpoint-only idle draw
 is charged across that step and dominates the whole-model energy ledger. The
 local boundary provisions no second device and therefore charges no external
 idle power - see `_whole_model_energy` in `hardware/evaluation.py`.

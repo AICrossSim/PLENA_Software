@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Protocol, Sequence
 from decode_dse.hardware.statistics import percentile, spearman_rank_correlation
 from decode_dse.hardware.lm_head_service import (
     DECODE_BF16_HEAD,
+    DECODE_MX_HEAD,
     EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
     OUTPUT_HEAD_IDEALIZATIONS,
@@ -90,12 +91,11 @@ def _bound_output_head_boundary(
     idealizations: Sequence[str],
     head_service_calibration_id: str | None,
 ) -> bool:
-    """Validate one output-head boundary and report whether it is identified.
+    """Validate one output-head boundary and report whether it is publishable.
 
-    Both placements must name themselves and their scope limits.  Only the
-    external service carries a measured head calibration identity: the
-    decode-local head is priced inside the decode chip's own ledger, so its
-    boundary is identified by the declared idealization instead.
+    Both placements must name themselves and their scope limits.  The local MX
+    boundary is publishable without a second endpoint identity because all of
+    its physical work is already charged to the decode subsystem.
     """
 
     if location not in OUTPUT_HEAD_LOCATIONS:
@@ -106,11 +106,17 @@ def _bound_output_head_boundary(
         )
     if location == EXTERNAL_BF16_HEAD:
         return bool(head_service_calibration_id)
+    if location == DECODE_MX_HEAD:
+        if head_service_calibration_id:
+            raise ValueError(
+                "the local MX head cannot carry a remote-service calibration"
+            )
+        return True
     if head_service_calibration_id:
         raise ValueError(
             "the decode-local head carries no head-service calibration"
         )
-    return True
+    return False
 
 
 class CalibrationEvidence(Protocol):
@@ -187,7 +193,7 @@ class ParetoPoint:
     #: Priced output-head placement.  The external service is measured and
     #: carries a head-service calibration identity; the decode-local head has
     #: no second endpoint and instead discloses its idealizations.
-    output_head_location: str = EXTERNAL_BF16_HEAD
+    output_head_location: str = DECODE_MX_HEAD
     output_head_idealizations: tuple[str, ...] = ()
     whole_model_rankable: bool = False
     energy_tier: str | None = None
@@ -1346,7 +1352,7 @@ class PublicationCandidate:
     head_service_calibration_id: str | None = None
     #: Priced output-head placement and the scope limits it discloses.  See
     #: ``ParetoPoint`` for the same contract at profile level.
-    output_head_location: str = EXTERNAL_BF16_HEAD
+    output_head_location: str = DECODE_MX_HEAD
     output_head_idealizations: tuple[str, ...] = ()
     whole_model_rankable: bool = False
     timing_mode: str = "rtl_serialized"
@@ -1673,7 +1679,7 @@ class FinalSelectionDecision:
     task_margin_points: float
     ruler_retention: float
     energy_tier: str | None = None
-    output_head_location: str = EXTERNAL_BF16_HEAD
+    output_head_location: str = DECODE_MX_HEAD
     bf16_reference_scope: str = BF16_REFERENCE_SCOPE
     schema_version: str = SELECTION_REPORT_SCHEMA
 
@@ -1717,7 +1723,7 @@ def select_final_deployment(
     calibration: CalibrationEvidence | None,
     timing_evidence: TimingCalibrationEvidence | None,
     head_service_evidence: HeadServiceEvidence | None = None,
-    output_head_location: str = EXTERNAL_BF16_HEAD,
+    output_head_location: str = DECODE_MX_HEAD,
     relative_ppl_limit: float = 0.01,
     task_margin_points: float = 2.0,
     ruler_retention: float = 0.98,
@@ -1726,11 +1732,9 @@ def select_final_deployment(
 ) -> FinalSelectionDecision:
     """Select the strongest available energy tier, then energy and TPOT.
 
-    ``output_head_location`` names the run's priced output-head boundary.  At
-    the external service the run must supply passing head-service evidence; at
-    the decode-local head there is no second endpoint, so head-service evidence
-    is neither supplied nor required and the candidates carry the local
-    boundary's declared idealizations instead.
+    ``output_head_location`` names the run's output-head boundary.  The local
+    MX head is the decode-only headline; external BF16 service evidence is
+    required only when that optional sensitivity is explicitly selected.
     """
 
     if output_head_location not in OUTPUT_HEAD_LOCATIONS:
@@ -1746,6 +1750,8 @@ def select_final_deployment(
     if len(identities) != len(set(identities)):
         raise ValueError("publication configurations must be distinct")
     global_failures: list[str] = []
+    if output_head_location == DECODE_BF16_HEAD:
+        global_failures.append("output_head_boundary_unmeasured")
     calibration_passed = False
     calibration_id = None
     if calibration is not None:
@@ -1778,18 +1784,21 @@ def select_final_deployment(
             global_failures.append("timing_evidence_mode")
         if not timing_evidence.passed:
             global_failures.append("timing_evidence_gate")
-    local_head = output_head_location == DECODE_BF16_HEAD
+    local_head = output_head_location in {
+        DECODE_BF16_HEAD,
+        DECODE_MX_HEAD,
+    }
     if head_service_evidence is None:
-        # Only the external arm depends on a measured remote endpoint.  The
-        # decode-local head prices the projection inside the decode chip, so
-        # demanding head-service evidence there would require evidence the
-        # configuration does not claim.
+        # Only the external publication arm consumes the measured endpoint.
+        # The local MX headline neither needs nor inherits that identity; the
+        # older unmodeled BF16 location is rejected by its own boundary gate.
         if not local_head:
             global_failures.append("head_service_evidence_missing")
         head_service_calibration_id = None
         head_service_provenance_id = None
     elif local_head:
-        global_failures.append("head_service_evidence_unexpected")
+        # Optional external evidence may accompany the local headline as a
+        # sensitivity.  It never supplies or changes the local system ID.
         head_service_calibration_id = None
         head_service_provenance_id = None
     else:
@@ -1848,7 +1857,7 @@ def select_final_deployment(
             )
             expected = (
                 local_head_system_calibration_id(power_id)
-                if local_head
+                if output_head_location == DECODE_MX_HEAD
                 else composite_system_calibration_id(
                     power_id,
                     head_service_calibration_id,
@@ -1896,8 +1905,11 @@ def select_final_deployment(
             and value.hardware_candidate
             and value.priced_evidence_complete
             and bound_system_identity(value)
-            and value.head_service_calibration_id
-            == head_service_calibration_id
+            and (
+                local_head
+                or value.head_service_calibration_id
+                == head_service_calibration_id
+            )
             and value.timing_evidence_id == timing_evidence_id
             and value.timing_mode == timing_mode
             for value in values

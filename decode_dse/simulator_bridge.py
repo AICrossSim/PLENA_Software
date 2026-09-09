@@ -299,6 +299,11 @@ class DecodeMetrics:
     step_composition: str = STEP_COMPOSITION
     execution_mode: str = "legacy_aggregate_bandwidth"
     compiler_trace_timing: dict[str, Any] | None = None
+    moe_workload: dict[str, Any] | None = None
+    local_output_head: dict[str, Any] | None = None
+    body_physical_layout: dict[str, Any] | None = None
+    slowest_rank_hbm_required_bytes: int | None = None
+    per_chip_hbm_capacity_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -504,8 +509,15 @@ class DecodeSimulator:
         elems = [dd.element_bits(w_fmt, aw), dd.element_bits(w_fmt, fw),
                  dd.element_bits(key_fmt, key_width),
                  dd.element_bits(value_fmt, value_width)]
+        activation_width = None
+        activation_element_bits = None
         if act_w is not None:
-            elems.append(dd.element_bits(act_fmt, _w(act_fmt, act_w)))
+            activation_width = _w(act_fmt, act_w)
+            activation_element_bits = dd.element_bits(
+                act_fmt,
+                activation_width,
+            )
+            elems.append(activation_element_bits)
         spec = dd.precision_from_components(
             dd.effective_bits(w_fmt, aw, block),
             dd.effective_bits(w_fmt, fw, block),
@@ -537,6 +549,26 @@ class DecodeSimulator:
             density_exp=self.DENSITY_EXP if density_exp is None else density_exp,
             block_size=block,
         )
+        if activation_width is not None and activation_element_bits is not None:
+            spec.update(
+                {
+                    "head_bits": spec["attn_bits"],
+                    "head_elem": spec["attn_elem"],
+                    "head_label": spec["attn_label"],
+                    "head_activation_bits": dd.effective_bits(
+                        act_fmt,
+                        activation_width,
+                        block,
+                    ),
+                    "head_activation_elem": activation_element_bits,
+                    "head_activation_label": dd.width_label(
+                        act_fmt,
+                        activation_width,
+                    ),
+                    "lm_head_quantized": False,
+                    "lm_head_top_k": 20,
+                }
+            )
         return Precision(
             spec,
             w_fmt,
@@ -585,6 +617,19 @@ class DecodeSimulator:
             density_exp=self.DENSITY_EXP if density_exp is None else density_exp,
             block_size=block,
         )
+        if act_bits is not None:
+            spec.update(
+                {
+                    "head_bits": spec["attn_bits"],
+                    "head_elem": spec["attn_elem"],
+                    "head_label": spec["attn_label"],
+                    "head_activation_bits": float(act_bits),
+                    "head_activation_elem": elems[-1],
+                    "head_activation_label": f"MXINT{elems[-1]}",
+                    "lm_head_quantized": False,
+                    "lm_head_top_k": 20,
+                }
+            )
         return Precision(
             spec, "mxint", "mxint",
             spec["attn_elem"], spec["ffn_elem"], spec["kv_elem"], block, spec["m_bits"],
@@ -1058,7 +1103,11 @@ class DecodeSimulator:
                     "compiler trace evidence differs from the bound DSE point"
                 )
         ledger = loop["physical_ledger"]
-        quantized_weights = ledger.weights.attention + ledger.weights.ffn_resident
+        quantized_weights = (
+            ledger.weights.attention
+            + ledger.weights.ffn_resident
+            + ledger.weights.lm_head_resident
+        )
         sram = ledger.sram
         return DecodeMetrics(
             tps=float(loop["tps"]),
@@ -1147,6 +1196,31 @@ class DecodeSimulator:
             compiler_trace_timing=(
                 dict(loop["compiler_trace_timing"])
                 if loop.get("compiler_trace_timing") is not None
+                else None
+            ),
+            moe_workload=(
+                dict(loop["moe_workload"])
+                if loop.get("moe_workload") is not None
+                else None
+            ),
+            local_output_head=(
+                dict(loop["local_output_head"])
+                if loop.get("local_output_head") is not None
+                else None
+            ),
+            body_physical_layout=(
+                dict(loop["body_physical_layout"])
+                if loop.get("body_physical_layout") is not None
+                else None
+            ),
+            slowest_rank_hbm_required_bytes=(
+                int(ledger.slowest_rank_hbm_required_bytes)
+                if ledger.slowest_rank_hbm_required_bytes is not None
+                else None
+            ),
+            per_chip_hbm_capacity_bytes=(
+                int(ledger.per_chip_hbm_capacity_bytes)
+                if ledger.per_chip_hbm_capacity_bytes is not None
                 else None
             ),
         )

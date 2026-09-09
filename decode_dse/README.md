@@ -41,16 +41,18 @@ single reference for every tier string this package emits.
 - Decode admission quantizes K/V once into the selected PackedKV format.
 - New `q_len=1` K/V entries are quantized directly into that format.
 - Admission time and energy belong to TTFT; cached decode contributes TPOT.
-- Embeddings remain BF16. The headline path executes the BF16 LM head **on the
-  decode chip**: its BF16 weights are charged to decode HBM capacity and its
-  projection traffic is re-read every decode step, exactly like every other
-  resident tensor. Only the head's *compute* is idealized - no measured
-  instruction-level timing or energy signature is bound to it - and every row
-  priced at this boundary carries the disclosure
-  `local_bf16_head_compute_idealized`.
-- The alternative placement, a calibrated reserved BF16 endpoint on the prefill
-  chip, remains fully supported as the **comparison arm** at its own measured
-  evidence tier. Both placements can be reported side by side.
+- Embeddings remain BF16. Cached `q_len=1` decode uses an untied, decode-local
+  MX LM head whose W/A formats follow the exact profile; its matrix numeric and
+  storage format is the profile vector format, followed by a BF16 logit
+  container with no precision recovery.
+- The serving path tile-streams logits through running top-k20/top-p0.95 state
+  (plus a deterministic lowest-token-id argmax diagnostic), rather than
+  reserving batch-by-vocabulary SRAM.
+- A decode-local BF16 head remains available as an analytic sensitivity. Its
+  BF16 weights and projection traffic are charged to decode HBM, but its
+  compute has no measured instruction-level timing or energy signature. Every
+  such row carries `local_bf16_head_compute_idealized` and is forced to
+  `whole_model.rankable=false`.
 
 The evaluator uses an immutable BF16 prefill artifact and a content-addressed
 admission catalog under the `content_addressed_recompute_per_format` persistence
@@ -254,7 +256,8 @@ Persisted (non-dry-run) planning additionally requires `--prompt-manifest`,
 produced by `sweep inputs samples`. The complete execution-host bring-up —
 repository layout, model/dataset staging, evidence-artifact production
 (`decode_timing_evidence.json`, the stack-validity stage reports, and the
-measured BF16 head service), and the full per-model launch order — is
+optional measured BF16 head-service sensitivity), and the full per-model
+launch order — is
 documented in `decode_dse/docs/server_setup.md`.
 
 The hardware evaluator optionally accepts `--handoff-artifact` for the E1
@@ -298,7 +301,7 @@ hardware/design_space.py             exact enumeration and factorized artifacts
 hardware/evaluation.py               simulator and power evaluation
 hardware/power_model.py              calibrated area and energy ingestion
 hardware/selection.py                Pareto promotion and final selection
-hardware/packedkv_claims.py          capacity-first PackedKV claim gate
+hardware/packedkv_claims.py          legacy remote-BF16 PackedKV ablation gate
 hardware/synthesis_anchor.py         selected-candidate DC/SAIF evidence
 hardware/admission_cost.py           decode-cache admission cost and evidence
 hardware/workload_events.py          decode event counts for dense decoders
@@ -455,18 +458,27 @@ Power and timing are rankable only after their holdout gates pass. BF16 is the
 software accuracy reference; it is not represented as a PLENA BF16 matrix-chip
 realization.
 
-The decode-local BF16 LM head is the rankable headline boundary. It is
-optimistic in exactly one named respect - the head's compute carries no
-measured cost evidence - and that idealization is recorded on every row it
-prices, in `metrics.output_head_boundary.scope_idealizations` and in the
-evaluator identity, so it can never be read as a modelled head. The external
-BF16 head service stays rankable at its measured tier as the comparison arm.
+The canonical comparison scope is the steady-state decode subsystem under the
+frozen A100x4 equal-resource envelope. `decode_local_mx_head` is included in
+that subsystem: MLEN-padded weight and scale planes, per-step HBM reads,
+matrix/vector/selection cycles, bounded SRAM state, TP candidate exchange,
+area, power, and energy all travel with each row. Its per-row breakdown is
+profile- and numerical-MLEN-bound. MLEN 2048/4096 rows retain analytic costs but
+cannot reuse MLEN-1024 accuracy evidence.
 
-Reserving a whole external endpoint dominates the energy ledger with that
-device's idle draw rather than with the projection itself, which is why the
-local boundary is the headline: it prices the projection where the model
-actually runs. A locally *quantized* LM head remains accuracy-only and cannot
-supply hardware costs or enter deployment selection.
+Strict admission remains fail-closed while two physical-shape gaps are open:
+body attention/expert matrices need shard-aware padding, and TP>1 heads need a
+per-rank vocab/hidden layout receipt. Such rows serialize
+`body_weight_physical_padding_unmodelled` and, for TP>1,
+`local_head_tp_sharded_physical_shape_unmodelled`; they remain useful projected
+sensitivity rows but cannot set
+`whole_model.strict_system_resource_boundary_valid=true`.
+
+The measured external BF16 prefill/head endpoint is preserved as an optional
+whole-service sensitivity. Its two receipts still bind endpoint timing,
+energy, residency, silicon area, HBM and deployed-interface scope without
+counting the instrumentation driver. Their absence never blocks the local
+decode study.
 
 HBM technology does not multiply the 3,585-point numerical manifest. Four
 selected native-datapath hardware profiles receive a separate 20-point
@@ -617,30 +629,36 @@ energy comparison.
 ### The `external/` evidence boundary
 
 `publication_pipeline` declares every post-accuracy input, output and resource
-choice. Three inputs live under the workspace `external/` boundary:
+choice. Two inputs are required under the workspace `external/` boundary and
+two more are an optional paired sensitivity:
 
 1. **Passing decode timing evidence.** Currently produced at the emulator tier
    (mode `emulator_serialized`), because RTL does not execute at the anchor
    geometry; the artifact carries `evidence_tier: emulator` and every consumer
    surfaces that tier. An RTL-tier artifact satisfies the same gate.
 2. **The full-model independent-request compiler trace set.**
-3. **The BF16 output-head service calibration**, which prices the comparison
-   arm.
+3. **Optional: the BF16 output-head service calibration.**
+4. **Optional: the BF16 output-head endpoint-resource receipt**, which accounts for the
+   prefill/head endpoint and binds deployment link timing/energy without the
+   instrumentation driver.
 
 The third cannot be produced by timing `lm_head` on the execution GPU. It
-describes a dedicated BF16 endpoint on the prefill chip, so the artifact
-requires measurements taken at that physical endpoint: repeated and holdout
-logits, remote-link request and response timing, component dynamic energy, and
-leakage. The first pipeline command validates it against the pinned model and
-every searched batch, and fails before any GPU sweep work if it is missing or
-incomplete. No component energy or link measurement is ever inferred from GPU
-timing.
+describes a dedicated BF16 service on the prefill endpoint, so the artifact
+requires repeated and holdout logits, endpoint head/selection timing,
+endpoint-only component dynamic energy, and endpoint leakage. The B200 driver
+remains raw instrumentation evidence; its dynamic energy and request/response
+timing cannot stand in for PLENA. The fourth artifact supplies cited/bound
+deployed-interface timing and decoder-interface energy, plus the complete
+physical resource boundary. If either optional file is supplied, both must be
+present and pipeline preflight validates the pair against the pinned model and
+every searched batch. Neither is required for the decode-local headline.
 
-The headline no longer depends on it: with `output_head_contract.headline_location`
-set to `decode_bf16_unmodeled` the study prices the head on the decode chip and
-records the service artifact beside it as the comparison arm. The evaluator
-takes the boundary from `--output-head-location`, defaulting to the contract
-the study config declares.
+The Qwen3-30B-A3B target sets
+`output_head_contract.headline_location=decode_local_mx_head`. The
+evaluator takes the boundary from `--output-head-location`, defaulting to the
+contract the study config declares. External evidence, when present, is
+recorded beside the local row as a nonblocking comparison and never supplies
+its system identity.
 
 ### Refinement and benchmarks
 

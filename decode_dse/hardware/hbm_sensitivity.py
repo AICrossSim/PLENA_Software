@@ -18,6 +18,7 @@ from decode_dse.hardware.design_space import (
 )
 from decode_dse.hardware.lm_head_service import (
     DECODE_BF16_HEAD,
+    DECODE_MX_HEAD,
     EXTERNAL_BF16_HEAD,
     HEAD_SERVICE_MODE,
     OUTPUT_HEAD_IDEALIZATIONS,
@@ -45,10 +46,14 @@ HBM_SENSITIVITY_GENERATIONS = (
 )
 HBM_SENSITIVITY_SOURCE_COUNT = 4
 HBM_SENSITIVITY_BASELINE = "HBM2"
-# The sensitivity inherits whichever output-head boundary the source study
-# priced.  Both placements are supported; only the external one carries a
-# measured head-service identity.
-HBM_SENSITIVITY_OUTPUT_HEADS = (DECODE_BF16_HEAD, EXTERNAL_BF16_HEAD)
+# The sensitivity inherits the source study's output-head boundary. Both
+# placements are representable; the fully priced local MX boundary is the
+# canonical decode-only source and the external endpoint remains optional.
+HBM_SENSITIVITY_OUTPUT_HEADS = (
+    DECODE_BF16_HEAD,
+    DECODE_MX_HEAD,
+    EXTERNAL_BF16_HEAD,
+)
 
 
 def _canonical_bytes(value: Mapping[str, Any]) -> bytes:
@@ -115,7 +120,10 @@ class HBMSensitivitySource:
         _require_sha256("hardware_result_hash", self.hardware_result_hash)
         if self.output_head_location not in HBM_SENSITIVITY_OUTPUT_HEADS:
             raise ValueError("output_head_location is unsupported")
-        local_head = self.output_head_location == DECODE_BF16_HEAD
+        local_head = self.output_head_location in {
+            DECODE_BF16_HEAD,
+            DECODE_MX_HEAD,
+        }
         if local_head:
             # There is no remote endpoint to identify at the local boundary.
             if any(
@@ -408,7 +416,7 @@ def build_hbm_sensitivity_schedule(
 def hbm_sensitivity_sources_from_hardware_rows(
     rows: Iterable[Mapping[str, Any]],
 ) -> tuple[HBMSensitivitySource, ...]:
-    """Extract four remote-head deployment points from verified hardware rows."""
+    """Extract four fixed-boundary deployment points from verified rows."""
 
     values = tuple(rows)
     if len(values) != HBM_SENSITIVITY_SOURCE_COUNT:
@@ -474,11 +482,11 @@ def hbm_sensitivity_sources_from_hardware_rows(
         )
         whole_energy = whole_model.get("calibrated_energy")
         head_location = str(
-            output_head.get("location", EXTERNAL_BF16_HEAD)
+            output_head.get("location", DECODE_MX_HEAD)
         )
         if head_location not in HBM_SENSITIVITY_OUTPUT_HEADS:
             raise ValueError("hardware row output-head location is unsupported")
-        local_head = head_location == DECODE_BF16_HEAD
+        local_head = head_location in {DECODE_BF16_HEAD, DECODE_MX_HEAD}
         if (
             whole_model.get("rankable") is not True
             or output_head.get("service_mode")

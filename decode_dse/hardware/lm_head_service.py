@@ -15,9 +15,17 @@ from decode_dse.hardware.statistics import (
     percentile,
     spearman_rank_correlation,
 )
+from decode_dse.profiles import local_head_matrix_family_contract
 
 HEAD_SERVICE_SCHEMA = "bf16-output-head-service"
 HEAD_SERVICE_MODE = "remote_bf16_head_dedicated"
+LOCAL_MX_HEAD_SCHEMA = "decode-local-mx-output-head/v2"
+LOCAL_MX_HEAD_MODE = "decode_local_mx_head"
+LOCAL_MX_HEAD_PRECISION_POLICY = "profile_w_a_bf16_logits"
+LOCAL_MX_HEAD_LOGIT_DTYPE = "BF16"
+LOCAL_MX_HEAD_SELECTION_POLICY = (
+    "streaming_topk20_topp0.95_with_argmax_diagnostic_lowest_id_ties"
+)
 #: Service mode of the decode-local BF16 output head.  The head's weights and
 #: its per-decode-step HBM traffic are charged to the decode chip's physical
 #: ledger exactly like every other resident tensor; only the head's *compute*
@@ -34,16 +42,21 @@ LOCAL_HEAD_IDEALIZATIONS: tuple[str, ...] = (
 # the head's compute; ``EXTERNAL_BF16_HEAD`` stops the decode ledger after the
 # final RMSNorm and prices the head from a measured remote service.
 DECODE_BF16_HEAD = "decode_bf16_unmodeled"
+DECODE_MX_HEAD = "decode_local_mx_head"
 EXTERNAL_BF16_HEAD = "external_bf16_service"
-OUTPUT_HEAD_LOCATIONS = frozenset({DECODE_BF16_HEAD, EXTERNAL_BF16_HEAD})
+OUTPUT_HEAD_LOCATIONS = frozenset(
+    {DECODE_BF16_HEAD, DECODE_MX_HEAD, EXTERNAL_BF16_HEAD}
+)
 #: Service mode implied by each output-head location.
 OUTPUT_HEAD_SERVICE_MODES: Mapping[str, str] = {
     DECODE_BF16_HEAD: LOCAL_HEAD_MODE,
+    DECODE_MX_HEAD: LOCAL_MX_HEAD_MODE,
     EXTERNAL_BF16_HEAD: HEAD_SERVICE_MODE,
 }
 #: Scope idealizations disclosed by each output-head location.
 OUTPUT_HEAD_IDEALIZATIONS: Mapping[str, tuple[str, ...]] = {
     DECODE_BF16_HEAD: LOCAL_HEAD_IDEALIZATIONS,
+    DECODE_MX_HEAD: (),
     EXTERNAL_BF16_HEAD: (),
 }
 HEAD_LOGIT_MAX_ABS_ERROR = 0.25
@@ -75,6 +88,7 @@ _PROTOCOL_FIELDS = {
     "request_fixed_latency_s",
     "response_fixed_latency_s",
     "link_energy_j_per_byte",
+    "link_dynamic_energy_scope",
     "duplex_schedule",
 }
 _SERVICE_FIELDS = {
@@ -226,13 +240,7 @@ def composite_system_calibration_id(
 
 
 def local_head_system_calibration_id(decoder_calibration_id: str) -> str:
-    """System identity for a decode chip that carries its own BF16 head.
-
-    There is no second endpoint to bind, so the system identity is the decoder
-    calibration plus the declared idealization.  Naming the idealization inside
-    the hash keeps a locally-headed system from ever colliding with a system
-    whose head was measured.
-    """
+    """System identity for the fully priced decode-local MX output head."""
 
     decoder_calibration_id = require_content_addressed_id(
         "decoder calibration",
@@ -241,8 +249,11 @@ def local_head_system_calibration_id(decoder_calibration_id: str) -> str:
     return "decode-local-head-system-" + _content_hash(
         {
             "decoder_calibration_id": decoder_calibration_id,
-            "service_mode": LOCAL_HEAD_MODE,
-            "idealizations": list(LOCAL_HEAD_IDEALIZATIONS),
+            "service_mode": LOCAL_MX_HEAD_MODE,
+            "precision_policy": LOCAL_MX_HEAD_PRECISION_POLICY,
+            "logit_dtype": LOCAL_MX_HEAD_LOGIT_DTYPE,
+            "selection_policy": LOCAL_MX_HEAD_SELECTION_POLICY,
+            "idealizations": [],
         }
     )
 
@@ -266,6 +277,861 @@ def local_head_boundary_status() -> dict[str, Any]:
         "service_location": "decode_chip",
         "required_batches": [],
     }
+
+
+def _local_mx_head_arithmetic(
+    weight_format: str,
+    activation_format: str,
+    vector_format: str,
+) -> tuple[bool, tuple[str, ...]]:
+    """Return the exact profile-bound matrix chain and deployment verdict."""
+
+    contract = local_head_matrix_family_contract(
+        weight_format,
+        activation_format,
+        vector_format,
+    )
+    return (
+        bool(contract["operand_family_deployment_supported"]),
+        tuple(str(item) for item in contract["arithmetic_chain"]),
+    )
+
+
+def _local_mx_head_family_contract(
+    weight_format: str,
+    activation_format: str,
+    vector_format: str,
+) -> dict[str, Any]:
+    """Return the canonical profile helper without duplicating its semantics."""
+
+    return dict(
+        local_head_matrix_family_contract(
+            weight_format,
+            activation_format,
+            vector_format,
+        )
+    )
+
+
+def local_mx_head_boundary_status(
+    *,
+    profile_id: str,
+    weight_format: str,
+    activation_format: str,
+    vector_format: str,
+    matrix_mlen: int,
+) -> dict[str, Any]:
+    """Return the exact, non-reusable contract for one local-head profile."""
+
+    require_content_addressed_id("profile_id", profile_id, prefix="dqp-")
+    for name, value in (
+        ("weight_format", weight_format),
+        ("activation_format", activation_format),
+        ("vector_format", vector_format),
+    ):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} must be non-empty")
+    family_contract = _local_mx_head_family_contract(
+        weight_format,
+        activation_format,
+        vector_format,
+    )
+    supported = bool(family_contract["operand_family_deployment_supported"])
+    arithmetic_chain = tuple(family_contract["arithmetic_chain"])
+    _positive_int(matrix_mlen, "matrix_mlen")
+    failures = [] if supported else [
+        "mixed_matrix_family_unsupported_without_trace_evidence"
+    ]
+    return {
+        "schema_version": LOCAL_MX_HEAD_SCHEMA,
+        "passed": supported,
+        "failures": failures,
+        "service_mode": LOCAL_MX_HEAD_MODE,
+        "service_location": "decode_chip",
+        "profile_id": profile_id,
+        "precision_policy": LOCAL_MX_HEAD_PRECISION_POLICY,
+        "weight_format": weight_format,
+        "activation_format": activation_format,
+        "numerical_matrix_mlen": matrix_mlen,
+        "scale_format": "E8M0",
+        "block_size": 8,
+        "accumulator_dtype": "signed_fixed16.16",
+        "operand_family_binding": family_contract["operand_family_binding"],
+        "numerical_oracle_rule": family_contract["numerical_oracle_rule"],
+        "partial_conversion_rule": family_contract[
+            "partial_conversion_rule"
+        ],
+        "operand_family_deployment_supported": supported,
+        "hardware_bit_parity_verified": family_contract[
+            "hardware_bit_parity_verified"
+        ],
+        "accumulation_chain": list(arithmetic_chain),
+        "matrix_numeric_format": vector_format,
+        "matrix_storage_format": vector_format,
+        "logit_container_format": LOCAL_MX_HEAD_LOGIT_DTYPE,
+        "bf16_container_precision_recovery": False,
+        "selection_policy": LOCAL_MX_HEAD_SELECTION_POLICY,
+        "tp_selection_merge": (
+            "topk20_gather_owner_then_u32_token_broadcast_charged"
+        ),
+        "serving_logits_materialization": "tile_streamed_not_full_vocab",
+        "offline_nll_logits_materialization": "full_vocab_allowed",
+        "weight_source": "profile_weight_format",
+        "activation_source": "profile_activation_format",
+        "uses_existing_matrix_units": True,
+        "uses_existing_vector_units": True,
+        "additional_compute_area_mm2": 0.0,
+        "idealizations": [],
+    }
+
+
+def local_mx_head_status_valid(
+    value: Mapping[str, Any],
+    *,
+    profile_id: str | None = None,
+    weight_format: str | None = None,
+    activation_format: str | None = None,
+    vector_format: str | None = None,
+    matrix_mlen: int | None = None,
+) -> bool:
+    """Return whether a serialized local-head contract is exact and complete."""
+
+    try:
+        resolved = {
+            "profile_id": profile_id or str(value["profile_id"]),
+            "weight_format": weight_format or str(value["weight_format"]),
+            "activation_format": (
+                activation_format or str(value["activation_format"])
+            ),
+            "vector_format": vector_format or str(
+                value["matrix_numeric_format"]
+            ),
+            "matrix_mlen": matrix_mlen or int(
+                value["numerical_matrix_mlen"]
+            ),
+        }
+        return dict(value) == local_mx_head_boundary_status(**resolved)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def local_mx_head_breakdown_valid(
+    value: Mapping[str, Any],
+    *,
+    profile_id: str | None = None,
+    weight_format: str | None = None,
+    activation_format: str | None = None,
+    vector_format: str | None = None,
+    matrix_mlen: int | None = None,
+    require_passed: bool = True,
+) -> bool:
+    """Validate the per-row physical cost decomposition of the local head."""
+
+    try:
+        if set(value) != {
+            "schema_version",
+            "passed",
+            "failures",
+            "operator",
+            "profile_id",
+            "numerical_matrix_mlen",
+            "candidate_matrix_mlen",
+            "numerical_matrix_mlen_exact_match",
+            "batch_geometry",
+            "padding_preparation",
+            "precision_policy",
+            "weight_format",
+            "activation_format",
+            "weight_element_bits",
+            "weight_effective_bits",
+            "activation_element_bits",
+            "activation_effective_bits",
+            "block_size",
+            "scale_format",
+            "accumulator_dtype",
+            "operand_family_binding",
+            "numerical_oracle_rule",
+            "partial_conversion_rule",
+            "operand_family_deployment_supported",
+            "hardware_bit_parity_verified",
+            "accumulation_chain",
+            "matrix_numeric_format",
+            "matrix_storage_format",
+            "logit_container_format",
+            "bf16_container_precision_recovery",
+            "selection",
+            "cycles_per_batch_step",
+            "time_s_per_batch_step",
+            "hbm_read_bytes_per_batch_step",
+            "resident_bytes",
+            "algorithmic_flops_per_batch_step",
+            "flops_per_batch_step",
+            "padding_flops_per_batch_step",
+            "fractions",
+            "topology",
+            "compiler_lowering_receipt",
+            "compiler_lowering_blocker",
+        }:
+            return False
+        if (
+            value["schema_version"] != "decode-local-mx-head-breakdown/v3"
+            or not isinstance(value["passed"], bool)
+            or not isinstance(value["failures"], list)
+            or value["operator"] != "decode_lm_head"
+            or not isinstance(value["profile_id"], str)
+            or not _CONTENT_ADDRESSED_ID.fullmatch(value["profile_id"])
+            or not value["profile_id"].startswith("dqp-")
+            or value["precision_policy"] != LOCAL_MX_HEAD_PRECISION_POLICY
+            or value["block_size"] != 8
+            or value["scale_format"] != "E8M0"
+            or value["accumulator_dtype"] != "signed_fixed16.16"
+            or value["matrix_storage_format"]
+            != value["matrix_numeric_format"]
+            or value["logit_container_format"] != "BF16"
+            or value["bf16_container_precision_recovery"] is not False
+            or not isinstance(value["weight_format"], str)
+            or not value["weight_format"]
+            or not isinstance(value["activation_format"], str)
+            or not value["activation_format"]
+        ):
+            return False
+        expected_profile_id = profile_id or value["profile_id"]
+        expected_weight = weight_format or value["weight_format"]
+        expected_activation = activation_format or value["activation_format"]
+        expected_vector = vector_format or value["matrix_numeric_format"]
+        expected_mlen = matrix_mlen or value["numerical_matrix_mlen"]
+        family_contract = _local_mx_head_family_contract(
+            expected_weight,
+            expected_activation,
+            expected_vector,
+        )
+        supported = bool(
+            family_contract["operand_family_deployment_supported"]
+        )
+        expected_chain = tuple(family_contract["arithmetic_chain"])
+        if (
+            value["profile_id"] != expected_profile_id
+            or value["weight_format"] != expected_weight
+            or value["activation_format"] != expected_activation
+            or value["matrix_numeric_format"] != expected_vector
+            or value["numerical_matrix_mlen"] != expected_mlen
+            or value["operand_family_binding"]
+            != family_contract["operand_family_binding"]
+            or value["numerical_oracle_rule"]
+            != family_contract["numerical_oracle_rule"]
+            or value["partial_conversion_rule"]
+            != family_contract["partial_conversion_rule"]
+            or value["operand_family_deployment_supported"] is not supported
+            or value["hardware_bit_parity_verified"]
+            is not family_contract["hardware_bit_parity_verified"]
+            or value["accumulation_chain"] != list(expected_chain)
+        ):
+            return False
+        numerical_mlen = _positive_int(
+            value["numerical_matrix_mlen"],
+            "numerical_matrix_mlen",
+        )
+        candidate_mlen = _positive_int(
+            value["candidate_matrix_mlen"],
+            "candidate_matrix_mlen",
+        )
+        exact_mlen = numerical_mlen == candidate_mlen
+        if value["numerical_matrix_mlen_exact_match"] is not exact_mlen:
+            return False
+        batch_geometry = value["batch_geometry"]
+        if (
+            not isinstance(batch_geometry, Mapping)
+            or set(batch_geometry)
+            != {"active_rows", "physical_rows", "zero_padded_rows"}
+        ):
+            return False
+        active_rows = _positive_int(
+            batch_geometry["active_rows"], "active_rows"
+        )
+        physical_rows = _positive_int(
+            batch_geometry["physical_rows"], "physical_rows"
+        )
+        padded_rows = _nonnegative_int(
+            batch_geometry["zero_padded_rows"], "zero_padded_rows"
+        )
+        if physical_rows != active_rows + padded_rows:
+            return False
+        padding = value["padding_preparation"]
+        if (
+            not isinstance(padding, Mapping)
+            or set(padding)
+            != {
+                "schedule",
+                "weight_padding",
+                "activation_zero_fill_elements_per_rank",
+                "activation_zero_fill_vector_events_per_rank",
+                "activation_zero_fill_cycles_per_rank",
+                "padded_vocab_mask",
+                "slowest_serving_rank",
+                "padded_vocab_mask_by_tp_rank",
+                "padded_vocab_mask_elements_slowest_rank",
+                "padded_vocab_mask_vector_events_slowest_rank",
+                "padded_vocab_mask_cycles_slowest_rank",
+                "padded_vocab_mask_elements_system",
+                "padded_vocab_mask_vector_events_system",
+                "padded_vocab_mask_cycles_system",
+                "analytic_cycles_charged",
+                "compiler_lowered",
+            }
+            or padding["schedule"]
+            != "v_basic_full_width_chunks_before_matrix_and_selection"
+            or padding["weight_padding"]
+            != "offline_zero_fill_included_in_head_hbm_planes"
+            or padding["padded_vocab_mask"] != "negative_infinity"
+            or padding["analytic_cycles_charged"] is not True
+            or padding["compiler_lowered"] is not False
+        ):
+            return False
+        for name in (
+            "activation_zero_fill_elements_per_rank",
+            "activation_zero_fill_vector_events_per_rank",
+            "activation_zero_fill_cycles_per_rank",
+            "padded_vocab_mask_elements_slowest_rank",
+            "padded_vocab_mask_vector_events_slowest_rank",
+            "padded_vocab_mask_cycles_slowest_rank",
+            "padded_vocab_mask_elements_system",
+            "padded_vocab_mask_vector_events_system",
+            "padded_vocab_mask_cycles_system",
+        ):
+            _nonnegative_int(padding[name], name)
+        activation_padding_elements = padding[
+            "activation_zero_fill_elements_per_rank"
+        ]
+        activation_padding_events = padding[
+            "activation_zero_fill_vector_events_per_rank"
+        ]
+        if activation_padding_events != math.ceil(
+            activation_padding_elements / candidate_mlen
+        ):
+            return False
+        rank_masks = padding["padded_vocab_mask_by_tp_rank"]
+        if not isinstance(rank_masks, list) or not rank_masks:
+            return False
+        normalized_rank_masks: list[dict[str, int]] = []
+        for rank_mask in rank_masks:
+            if not isinstance(rank_mask, Mapping) or set(rank_mask) != {
+                "rank",
+                "logical_vocab",
+                "physical_vocab",
+                "elements",
+                "vector_events",
+                "cycles",
+            }:
+                return False
+            rank = _nonnegative_int(rank_mask["rank"], "rank")
+            logical_vocab = _positive_int(
+                rank_mask["logical_vocab"], "logical_vocab"
+            )
+            physical_vocab = _positive_int(
+                rank_mask["physical_vocab"], "physical_vocab"
+            )
+            elements = _nonnegative_int(rank_mask["elements"], "elements")
+            events = _nonnegative_int(
+                rank_mask["vector_events"], "vector_events"
+            )
+            event_cycles = _nonnegative_int(rank_mask["cycles"], "cycles")
+            if (
+                physical_vocab < logical_vocab
+                or physical_vocab
+                != math.ceil(logical_vocab / candidate_mlen) * candidate_mlen
+                or elements != active_rows * (physical_vocab - logical_vocab)
+                or events != math.ceil(elements / candidate_mlen)
+                or (events == 0) != (elements == 0)
+                or (event_cycles == 0) != (events == 0)
+            ):
+                return False
+            normalized_rank_masks.append(
+                {
+                    "rank": rank,
+                    "logical_vocab": logical_vocab,
+                    "physical_vocab": physical_vocab,
+                    "elements": elements,
+                    "vector_events": events,
+                    "cycles": event_cycles,
+                }
+            )
+        if (
+            padding["padded_vocab_mask_elements_system"]
+            < padding["padded_vocab_mask_elements_slowest_rank"]
+            or padding["padded_vocab_mask_vector_events_system"]
+            < padding["padded_vocab_mask_vector_events_slowest_rank"]
+            or padding["padded_vocab_mask_cycles_system"]
+            < padding["padded_vocab_mask_cycles_slowest_rank"]
+        ):
+            return False
+        receipt = value["compiler_lowering_receipt"]
+        receipt_blocker = value["compiler_lowering_blocker"]
+        if exact_mlen and isinstance(receipt, Mapping):
+            if receipt_blocker is not None:
+                return False
+            receipt_body = dict(receipt)
+            receipt_hash = receipt_body.pop("contract_sha256", None)
+            receipt_profile = receipt.get("profile")
+            receipt_geometry = receipt.get("matrix_geometry")
+            receipt_numeric = receipt.get("numeric_semantics")
+            receipt_identity = receipt.get("numerical_identity")
+            receipt_validity = receipt.get("validity")
+            receipt_blockers = receipt.get("blockers")
+            if (
+                receipt.get("schema_version")
+                != "plena-local-lm-head-lowering/v1"
+                or receipt.get("operation") != "decode_lm_head"
+                or receipt.get("profile_id") != value["profile_id"]
+                or receipt.get("profile_sha256")
+                != value["profile_id"].removeprefix("dqp-")
+                or receipt_hash != _content_hash(receipt_body)
+                or not isinstance(receipt_profile, Mapping)
+                or receipt_profile.get("weight_format")
+                != value["weight_format"]
+                or receipt_profile.get("activation_format")
+                != value["activation_format"]
+                or receipt_profile.get("vector_format")
+                != value["matrix_numeric_format"]
+                or not isinstance(receipt_geometry, Mapping)
+                or receipt_geometry.get("mlen") != candidate_mlen
+                or not isinstance(receipt_identity, Mapping)
+                or receipt_identity.get("profile_id") != value["profile_id"]
+                or receipt_identity.get("mlen") != candidate_mlen
+                or receipt.get("numerical_identity_sha256")
+                != _content_hash(receipt_identity)
+                or not isinstance(receipt_numeric, Mapping)
+                or receipt_numeric.get("matrix_k_partition") != "MLEN"
+                or receipt_numeric.get("partial_conversion")
+                != "round_each_mlen_partial_to_profile.vector_format"
+                or receipt_numeric.get("partial_rounding")
+                != "round_to_nearest_even_to_profile.vector_format"
+                or receipt_numeric.get("cross_instruction_accumulator")
+                != "signed_fixed16_16_wraparound"
+                or receipt_numeric.get("matrix_numeric_format")
+                != "profile.vector_format"
+                or receipt_numeric.get("matrix_storage_format")
+                != "profile.vector_format"
+                or receipt_numeric.get("matrix_writeout_numeric_format")
+                != "profile.vector_format"
+                or receipt_numeric.get("logit_container_format") != "BF16"
+                or receipt_numeric.get("bf16_reference_writeout_rounding")
+                != "mantissa_truncation"
+                or receipt_numeric.get("no_per_stage_bf16_matrix_switch")
+                is not True
+                or receipt_numeric.get("precision_recovery") is not False
+                or not isinstance(receipt_validity, Mapping)
+                or not isinstance(
+                    receipt_validity.get("publication_valid"), bool
+                )
+                or not isinstance(receipt_blockers, list)
+                or any(
+                    not isinstance(item, str) or not item
+                    for item in receipt_blockers
+                )
+                or (
+                    receipt_validity["publication_valid"] is False
+                    and not receipt_blockers
+                )
+            ):
+                return False
+            receipt_model = receipt.get("model_geometry")
+            if (
+                not isinstance(receipt_model, Mapping)
+                or receipt_model.get("active_batch") != active_rows
+                or receipt_model.get("physical_batch") != physical_rows
+                or receipt_model.get("zero_padded_batch_rows") != padded_rows
+            ):
+                return False
+        elif exact_mlen:
+            if (
+                receipt is not None
+                or receipt_blocker
+                != "tensor_parallel_local_head_compiler_lowering_unavailable"
+            ):
+                return False
+        elif (
+            receipt is not None
+            or receipt_blocker
+            != (
+                "numerical_matrix_mlen_mismatch_no_profile_bound_"
+                "compiler_receipt"
+            )
+        ):
+            return False
+        failures = value["failures"]
+        allowed_failures = {
+            "body_weight_physical_padding_unmodelled",
+            "local_head_tp_sharded_physical_shape_unmodelled",
+            "compiler_trace_head_stage_breakdown_unavailable",
+            "legacy_ideal_parallelism_omits_global_topk_merge",
+            "mixed_matrix_family_unsupported_without_trace_evidence",
+            "numerical_matrix_mlen_mismatch",
+        }
+        if (
+            any(not isinstance(item, str) for item in failures)
+            or len(failures) != len(set(failures))
+            or not set(failures).issubset(allowed_failures)
+            or value["passed"] is not (not failures)
+            or (
+                supported
+                == (
+                    "mixed_matrix_family_unsupported_without_trace_evidence"
+                    in failures
+                )
+            )
+            or (
+                exact_mlen
+                == ("numerical_matrix_mlen_mismatch" in failures)
+            )
+            or (require_passed and failures)
+        ):
+            return False
+        for name in (
+            "weight_element_bits",
+            "activation_element_bits",
+            "algorithmic_flops_per_batch_step",
+            "flops_per_batch_step",
+        ):
+            if (
+                isinstance(value[name], bool)
+                or not isinstance(value[name], int)
+                or value[name] <= 0
+            ):
+                return False
+        padding_flops = _nonnegative_int(
+            value["padding_flops_per_batch_step"],
+            "padding_flops_per_batch_step",
+        )
+        if value["flops_per_batch_step"] != (
+            value["algorithmic_flops_per_batch_step"] + padding_flops
+        ):
+            return False
+        for name in ("weight_effective_bits", "activation_effective_bits"):
+            if _positive_float(value[name], name) < value[
+                name.replace("effective", "element")
+            ]:
+                return False
+        selection = value["selection"]
+        if (
+            not isinstance(selection, Mapping)
+            or set(selection)
+            != {
+                "serving_policy",
+                "diagnostic_policy",
+                "full_vocab_logits_materialized",
+                "top_k",
+                "top_p",
+                "min_p",
+                "logit_tile_bytes_per_chip",
+                "state_bytes_per_chip",
+                "workspace_bytes_per_chip",
+                "distributed_merge",
+            }
+            or selection["serving_policy"]
+            != "streaming_topk20_topp0.95_minp0"
+            or selection["diagnostic_policy"]
+            != "argmax_lowest_token_id_on_tie"
+            or selection["full_vocab_logits_materialized"] is not False
+            or selection["top_k"] != 20
+            or selection["top_p"] != 0.95
+            or selection["min_p"] != 0.0
+        ):
+            return False
+        for name in (
+            "logit_tile_bytes_per_chip",
+            "state_bytes_per_chip",
+            "workspace_bytes_per_chip",
+        ):
+            _positive_int(selection[name], name)
+        if selection["workspace_bytes_per_chip"] != (
+            selection["logit_tile_bytes_per_chip"]
+            + selection["state_bytes_per_chip"]
+        ):
+            return False
+        merge = selection["distributed_merge"]
+        if (
+            not isinstance(merge, Mapping)
+            or set(merge)
+            != {
+                "mode",
+                "candidate_pair_bytes",
+                "candidate_count_per_rank_per_sequence",
+                "aggregate_link_bytes_per_batch_step",
+                "slowest_path_serialization_time_s",
+                "charged_to_system_collective_energy",
+            }
+            or merge["mode"]
+            != "tp_topk20_gather_owner_then_u32_token_broadcast"
+            or merge["candidate_pair_bytes"] != 8
+            or merge["candidate_count_per_rank_per_sequence"] != 20
+            or merge["charged_to_system_collective_energy"] is not True
+        ):
+            return False
+        link_bytes = _nonnegative_float(
+            merge["aggregate_link_bytes_per_batch_step"],
+            "aggregate_link_bytes_per_batch_step",
+        )
+        link_time = _nonnegative_float(
+            merge["slowest_path_serialization_time_s"],
+            "slowest_path_serialization_time_s",
+        )
+        cycles = value["cycles_per_batch_step"]
+        if not isinstance(cycles, Mapping) or set(cycles) != {
+            "matrix_slowest_rank",
+            "selection_slowest_rank",
+            "argmax_diagnostic_slowest_rank",
+            "activation_zero_fill_per_rank",
+            "padded_vocab_mask_slowest_rank",
+            "padded_vocab_mask_system",
+            "serving_slowest_rank",
+        }:
+            return False
+        for name in (
+            "matrix_slowest_rank",
+            "selection_slowest_rank",
+            "argmax_diagnostic_slowest_rank",
+        ):
+            _positive_float(cycles[name], name)
+        for name in (
+            "activation_zero_fill_per_rank",
+            "padded_vocab_mask_slowest_rank",
+            "padded_vocab_mask_system",
+        ):
+            _nonnegative_int(cycles[name], name)
+        if (
+            cycles["activation_zero_fill_per_rank"]
+            != padding["activation_zero_fill_cycles_per_rank"]
+            or cycles["padded_vocab_mask_slowest_rank"]
+            != padding["padded_vocab_mask_cycles_slowest_rank"]
+            or cycles["padded_vocab_mask_system"]
+            != padding["padded_vocab_mask_cycles_system"]
+        ):
+            return False
+        serving_cycles = _positive_float(
+            cycles["serving_slowest_rank"],
+            "serving_slowest_rank",
+        )
+        # A passing v3 receipt is selection-eligible, so its serving total must
+        # conserve every charged slowest-rank component.  Failed legacy
+        # projections may use an undisclosed compatibility divisor and remain
+        # inspectable only through ``require_passed=False``; they cannot rank.
+        if value["passed"] and not math.isclose(
+            serving_cycles,
+            float(cycles["matrix_slowest_rank"])
+            + float(cycles["selection_slowest_rank"])
+            + float(cycles["activation_zero_fill_per_rank"])
+            + float(cycles["padded_vocab_mask_slowest_rank"]),
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            return False
+        timing = value["time_s_per_batch_step"]
+        if (
+            not isinstance(timing, Mapping)
+            or set(timing)
+            != {
+                "compute_slowest_rank",
+                "hbm_slowest_rank",
+                "local_roofline",
+                "distributed_selection_collective",
+                "isolated_head_with_collective",
+                "scope",
+            }
+            or timing["scope"]
+            != "local_roofline_plus_dependency_bound_tp_selection_merge"
+        ):
+            return False
+        compute_time = _positive_float(
+            timing["compute_slowest_rank"],
+            "compute_slowest_rank",
+        )
+        hbm_time = _positive_float(
+            timing["hbm_slowest_rank"],
+            "hbm_slowest_rank",
+        )
+        roofline = _positive_float(
+            timing["local_roofline"],
+            "local_roofline",
+        )
+        collective = _nonnegative_float(
+            timing["distributed_selection_collective"],
+            "distributed_selection_collective",
+        )
+        isolated = _positive_float(
+            timing["isolated_head_with_collective"],
+            "isolated_head_with_collective",
+        )
+        if (
+            not math.isclose(roofline, max(compute_time, hbm_time), rel_tol=1e-12)
+            or not math.isclose(collective, link_time, rel_tol=1e-12)
+            or not math.isclose(isolated, roofline + collective, rel_tol=1e-12)
+            or (link_bytes == 0.0) != (collective == 0.0)
+        ):
+            return False
+        hbm = value["hbm_read_bytes_per_batch_step"]
+        if not isinstance(hbm, Mapping) or set(hbm) != {
+            "aggregate_system_before_overfetch",
+            "aggregate_system_after_overfetch",
+            "slowest_rank_after_overfetch",
+        }:
+            return False
+        before = _positive_float(
+            hbm["aggregate_system_before_overfetch"],
+            "aggregate_system_before_overfetch",
+        )
+        after = _positive_float(
+            hbm["aggregate_system_after_overfetch"],
+            "aggregate_system_after_overfetch",
+        )
+        rank = _positive_float(
+            hbm["slowest_rank_after_overfetch"],
+            "slowest_rank_after_overfetch",
+        )
+        if after < before or rank > after:
+            return False
+        resident = value["resident_bytes"]
+        if not isinstance(resident, Mapping) or set(resident) != {
+            "aggregate_system",
+            "element_plane",
+            "scale_plane",
+            "bf16_plane",
+        }:
+            return False
+        aggregate = _positive_int(
+            resident["aggregate_system"],
+            "aggregate_system",
+        )
+        element = _positive_int(resident["element_plane"], "element_plane")
+        scale = _positive_int(resident["scale_plane"], "scale_plane")
+        if resident["bf16_plane"] != 0 or aggregate != element + scale:
+            return False
+        fractions = value["fractions"]
+        if not isinstance(fractions, Mapping) or set(fractions) != {
+            "isolated_roofline_time_over_decoder_tpot",
+            "hbm_read_over_decoder_traffic",
+            "resident_over_decoder_capacity",
+        }:
+            return False
+        for name, raw in fractions.items():
+            fraction = _positive_float(raw, name)
+            if fraction > 1.0:
+                return False
+        topology = value["topology"]
+        if not isinstance(topology, Mapping) or set(topology) != {
+            "tp",
+            "kvp",
+            "chip_count",
+        }:
+            return False
+        tp = _positive_int(topology["tp"], "tp")
+        kvp = _positive_int(topology["kvp"], "kvp")
+        chips = _positive_int(topology["chip_count"], "chip_count")
+        has_receipt = isinstance(receipt, Mapping)
+        footprint = (
+            receipt.get("hbm_footprint")
+            if exact_mlen and has_receipt
+            else None
+        )
+        receipt_selection = (
+            receipt.get("selection")
+            if exact_mlen and has_receipt
+            else None
+        )
+        receipt_tp = (
+            receipt_selection.get("tensor_parallel")
+            if isinstance(receipt_selection, Mapping)
+            else None
+        )
+        body_layout_missing = (
+            "body_weight_physical_padding_unmodelled" in failures
+        )
+        head_tp_layout_missing = (
+            "local_head_tp_sharded_physical_shape_unmodelled" in failures
+        )
+        if (
+            tp * kvp != chips
+            or (head_tp_layout_missing and not body_layout_missing)
+            or (
+                body_layout_missing
+                and head_tp_layout_missing != (tp > 1)
+            )
+        ):
+            return False
+        expected_mask_ranks = 1 if body_layout_missing else tp
+        mask_replicas = 1 if body_layout_missing else kvp
+        if (
+            len(normalized_rank_masks) != expected_mask_ranks
+            or [value["rank"] for value in normalized_rank_masks]
+            != list(range(expected_mask_ranks))
+        ):
+            return False
+        slowest_serving_rank = _nonnegative_int(
+            padding["slowest_serving_rank"], "slowest_serving_rank"
+        )
+        if slowest_serving_rank >= expected_mask_ranks:
+            return False
+        slowest_mask = normalized_rank_masks[slowest_serving_rank]
+        if (
+            padding["padded_vocab_mask_elements_slowest_rank"]
+            != slowest_mask["elements"]
+            or padding["padded_vocab_mask_vector_events_slowest_rank"]
+            != slowest_mask["vector_events"]
+            or padding["padded_vocab_mask_cycles_slowest_rank"]
+            != slowest_mask["cycles"]
+            or padding["padded_vocab_mask_elements_system"]
+            != mask_replicas
+            * sum(value["elements"] for value in normalized_rank_masks)
+            or padding["padded_vocab_mask_vector_events_system"]
+            != mask_replicas
+            * sum(value["vector_events"] for value in normalized_rank_masks)
+            or padding["padded_vocab_mask_cycles_system"]
+            != mask_replicas
+            * sum(value["cycles"] for value in normalized_rank_masks)
+        ):
+            return False
+        event_costs = {
+            value["cycles"] / value["vector_events"]
+            for value in normalized_rank_masks
+            if value["vector_events"]
+        }
+        activation_events = padding[
+            "activation_zero_fill_vector_events_per_rank"
+        ]
+        activation_cycles = padding["activation_zero_fill_cycles_per_rank"]
+        if activation_events:
+            event_costs.add(activation_cycles / activation_events)
+        elif activation_cycles:
+            return False
+        if len(event_costs) > 1 or any(
+            not float(cost).is_integer() or cost <= 0 for cost in event_costs
+        ):
+            return False
+        if exact_mlen:
+            if tp == 1:
+                if (
+                    not has_receipt
+                    or receipt_blocker is not None
+                    or not isinstance(footprint, Mapping)
+                    or footprint.get("weight_data_bytes") * kvp != element
+                    or footprint.get("scale_bytes") * kvp != scale
+                    or not isinstance(receipt_tp, Mapping)
+                    or receipt_tp.get("ranks") != tp
+                    or receipt_tp.get(
+                        "required_local_candidates_per_rank_per_row"
+                    )
+                    != 20
+                    or receipt_tp.get("selected_token_broadcast") is not True
+                ):
+                    return False
+            elif (
+                has_receipt
+                or receipt_blocker
+                != "tensor_parallel_local_head_compiler_lowering_unavailable"
+            ):
+                return False
+        return True
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 def _positive_float(value: Any, name: str) -> float:
@@ -848,6 +1714,22 @@ class BF16HeadServiceStatus:
                 if calibration is not None
                 else None
             ),
+            "cost_scope": (
+                {
+                    "dynamic_energy": "endpoint_only",
+                    "leakage": "endpoint_only",
+                    "link_dynamic_energy": calibration.protocol[
+                        "link_dynamic_energy_scope"
+                    ],
+                    "measurement_link_timing": (
+                        "instrumentation_driver_to_endpoint_not_deployment"
+                    ),
+                    "measurement_driver_dynamic_included": False,
+                    "measurement_driver_leakage_included": False,
+                }
+                if calibration is not None
+                else None
+            ),
             "numerical_policy": (
                 {
                     "mac_input_dtype": calibration.service[
@@ -898,6 +1780,19 @@ def head_service_status_valid(value: Mapping[str, Any]) -> bool:
             or not _SHA256.fullmatch(
                 str(value.get("head_weight_sha256", ""))
             )
+            or value.get("cost_scope")
+            != {
+                "dynamic_energy": "endpoint_only",
+                "leakage": "endpoint_only",
+                "link_dynamic_energy": (
+                    "endpoint_receive_transmit_incremental_only"
+                ),
+                "measurement_link_timing": (
+                    "instrumentation_driver_to_endpoint_not_deployment"
+                ),
+                "measurement_driver_dynamic_included": False,
+                "measurement_driver_leakage_included": False,
+            }
         ):
             return False
         require_content_addressed_id(
@@ -1057,6 +1952,11 @@ def _parse_calibration(
         "link_energy_j_per_byte",
     ):
         _positive_float(protocol[name], name)
+    if (
+        protocol["link_dynamic_energy_scope"]
+        != "endpoint_receive_transmit_incremental_only"
+    ):
+        raise ValueError("head-service link energy must be endpoint-only")
     for name in ("request_fixed_latency_s", "response_fixed_latency_s"):
         _nonnegative_float(protocol[name], name)
 
@@ -1182,6 +2082,50 @@ def _parse_calibration(
         )
     ):
         raise ValueError("head-service toolchain provenance is invalid")
+    resolution = provenance["measurement_resolution"]
+    if not isinstance(resolution, Mapping):
+        raise ValueError("head-service measurement resolution is invalid")
+    idle_power = resolution.get("idle_power_w")
+    if (
+        not isinstance(idle_power, Mapping)
+        or set(idle_power) != {"driver", "endpoint", "total"}
+    ):
+        raise ValueError("head-service idle-power provenance is incomplete")
+    driver_idle = _positive_float(idle_power["driver"], "driver idle power")
+    endpoint_idle = _positive_float(
+        idle_power["endpoint"], "endpoint idle power"
+    )
+    total_idle = _positive_float(idle_power["total"], "total idle power")
+    if not math.isclose(
+        total_idle,
+        driver_idle + endpoint_idle,
+        rel_tol=1e-9,
+        abs_tol=1e-9,
+    ):
+        raise ValueError("head-service idle-power provenance does not conserve")
+    service_leakage = _positive_float(
+        resolution.get("service_leakage_power_w"),
+        "service leakage power",
+    )
+    if (
+        resolution.get("service_leakage_scope") != "endpoint_only"
+        or resolution.get("measurement_driver_idle_role")
+        != "instrumentation_only_not_deployed"
+        or resolution.get("measurement_driver_leakage_included") is not False
+        or not math.isclose(
+            service_leakage,
+            endpoint_idle,
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+        or not math.isclose(
+            service_leakage,
+            float(service["leakage_power_w"]),
+            rel_tol=1e-9,
+            abs_tol=1e-9,
+        )
+    ):
+        raise ValueError("head-service leakage attribution is not endpoint-only")
 
     raw_measurements = body["measurements"]
     if not isinstance(raw_measurements, list):
@@ -1537,10 +2481,16 @@ __all__ = [
     "HEAD_VALIDATION_TOPK",
     "HeadServiceMeasurement",
     "DECODE_BF16_HEAD",
+    "DECODE_MX_HEAD",
     "EXTERNAL_BF16_HEAD",
     "LOCAL_HEAD_COMPUTE_IDEALIZATION",
     "LOCAL_HEAD_IDEALIZATIONS",
     "LOCAL_HEAD_MODE",
+    "LOCAL_MX_HEAD_LOGIT_DTYPE",
+    "LOCAL_MX_HEAD_MODE",
+    "LOCAL_MX_HEAD_PRECISION_POLICY",
+    "LOCAL_MX_HEAD_SCHEMA",
+    "LOCAL_MX_HEAD_SELECTION_POLICY",
     "OUTPUT_HEAD_IDEALIZATIONS",
     "OUTPUT_HEAD_LOCATIONS",
     "OUTPUT_HEAD_SERVICE_MODES",
@@ -1548,6 +2498,9 @@ __all__ = [
     "head_service_status_valid",
     "local_head_boundary_status",
     "local_head_system_calibration_id",
+    "local_mx_head_boundary_status",
+    "local_mx_head_breakdown_valid",
+    "local_mx_head_status_valid",
     "load_bf16_head_service_artifact",
     "require_content_addressed_id",
 ]

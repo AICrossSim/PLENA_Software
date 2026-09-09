@@ -8,11 +8,15 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
-PROFILE_SCHEMA = "decode-precision-profile"
+LEGACY_PROFILE_SCHEMA = "decode-precision-profile"
+PROFILE_SCHEMA = "decode-precision-profile/v2"
 MATRIX_SEMANTICS_SCHEMA = "plena-matrix-semantics"
+NUMERICAL_ORACLE_SCHEMA = "plena-mase-matrix-oracle/v1"
+LOCAL_HEAD_SCHEMA = "decode-local-head-precision/v1"
 MX_BLOCK_SIZE = 8
 MX_SCALE_FORMAT = "E8M0"
 MX_SCALE_BITS = 8
+FOUNDATION_MATRIX_MLEN = 1024
 MXINT_MATRIX_RULE = "block8_range_safe_scale_widened_mac_max_shift16_rne_vector"
 MXFP_MATRIX_RULE = "product_cast_to_m_fp_then_fixed16_16_bank"
 MIXED_MATRIX_RULE = "deployment_unsupported_without_trace_evidence"
@@ -27,6 +31,9 @@ MATRIX_INSTRUCTION_K_PARTITION = "MLEN"
 QK_LOGICAL_K_PARTITION = "HLEN"
 MXINT_PARTIAL_CONVERSION = "per_mm_ic_integer_reduction_to_vector_storage_fp"
 MXINT_CROSS_INSTRUCTION_ACCUMULATION = "signed_fixed16_16_wraparound"
+NUMERICAL_PARTIAL_RULE = (
+    "quantized_operands_fp32_matmul_per_mlen_rne_vector_then_fixed16_16_bank"
+)
 
 MXINT_FORMATS = ("MXINT2", "MXINT4", "MXINT8")
 MXFP_FORMATS = ("E1M2", "E2M1", "E3M4", "E4M3", "E5M2")
@@ -53,12 +60,14 @@ PROFILE_KINDS = (
 DEFAULT_WEIGHT_OPERATORS = (
     "attention_linear",
     "ffn_linear",
+    "decode_lm_head",
 )
 DEFAULT_ACTIVATION_OPERATORS = (
     "attention_linear",
     "ffn_linear",
     "qk_matmul",
     "pv_matmul",
+    "decode_lm_head",
 )
 DEFAULT_KV_OPERATORS = (
     "kv_cache",
@@ -78,8 +87,34 @@ DEFAULT_VECTOR_OPERATORS = (
 )
 DEFAULT_BF16_OPERATORS = (
     "embedding",
+)
+BF16_REFERENCE_WEIGHT_OPERATORS = (
+    "attention_linear",
+    "ffn_linear",
+)
+BF16_REFERENCE_ACTIVATION_OPERATORS = (
+    "attention_linear",
+    "ffn_linear",
+    "qk_matmul",
+    "pv_matmul",
+)
+BF16_REFERENCE_BF16_OPERATORS = (
+    "embedding",
     "lm_head",
 )
+LEGACY_WEIGHT_OPERATORS = BF16_REFERENCE_WEIGHT_OPERATORS
+LEGACY_ACTIVATION_OPERATORS = BF16_REFERENCE_ACTIVATION_OPERATORS
+LEGACY_BF16_OPERATORS = BF16_REFERENCE_BF16_OPERATORS
+
+LOCAL_HEAD_LOCATION = "decode_chip"
+LOCAL_HEAD_WEIGHT_METHOD = "rtn"
+LOCAL_HEAD_LOGITS_FORMAT = "BF16"
+LOCAL_HEAD_ARGMAX_RULE = "argmax_lowest_token_id_on_tie"
+LOCAL_HEAD_OUTPUT_RULE = (
+    "family_specific_per_mlen_to_profile_vector_then_fixed16_16_wrap_then_profile_vector_truncate_bf16_store"
+)
+LOCAL_HEAD_FIRST_TOKEN_OWNER = "prefill"
+LOCAL_HEAD_DECODE_QUERY_LENGTH = 1
 
 
 @dataclass(frozen=True)
@@ -291,6 +326,65 @@ class MatrixSemanticsContract:
 MATRIX_SEMANTICS = MatrixSemanticsContract()
 
 
+def local_head_matrix_family_contract(
+    weight_format: str,
+    activation_format: str,
+    matrix_storage_format: str,
+) -> dict[str, Any]:
+    """Return the family-specific MX partial-conversion contract."""
+
+    weight_family = format_descriptor(weight_format).family
+    activation_family = format_descriptor(activation_format).family
+    families = (activation_family, weight_family)
+    if families == ("mxint", "mxint"):
+        return {
+            "operand_family_binding": MATRIX_SEMANTICS.mxint_rule,
+            "numerical_oracle_rule": NUMERICAL_PARTIAL_RULE,
+            "partial_conversion_rule": NUMERICAL_PARTIAL_RULE,
+            "operand_family_deployment_supported": True,
+            "hardware_bit_parity_verified": False,
+            "arithmetic_chain": [
+                "block8_mxint_quantized_operands_materialized_in_fp32",
+                "fp32_matmul_reduction_per_mlen_partition",
+                f"each_mlen_reduction_rne_to_{matrix_storage_format}_storage_fp",
+                "signed_fixed16_16_cross_instruction_accumulate_wrap",
+                f"truncate_to_{matrix_storage_format}_matrix_writeout",
+                "store_already_rounded_values_in_bf16_logit_container",
+            ],
+        }
+    if families == ("mxfp", "mxfp"):
+        return {
+            "operand_family_binding": MATRIX_SEMANTICS.mxfp_rule,
+            "numerical_oracle_rule": NUMERICAL_PARTIAL_RULE,
+            "partial_conversion_rule": NUMERICAL_PARTIAL_RULE,
+            "operand_family_deployment_supported": True,
+            "hardware_bit_parity_verified": False,
+            "arithmetic_chain": [
+                "block8_mxfp_quantized_operands_materialized_in_fp32",
+                "fp32_matmul_reduction_per_mlen_partition",
+                f"each_mlen_reduction_rne_to_{matrix_storage_format}_storage_fp",
+                "signed_fixed16_16_cross_instruction_accumulate_wrap",
+                f"truncate_to_{matrix_storage_format}_matrix_writeout",
+                "store_already_rounded_values_in_bf16_logit_container",
+            ],
+        }
+    return {
+        "operand_family_binding": MATRIX_SEMANTICS.mixed_family_rule,
+        "numerical_oracle_rule": NUMERICAL_PARTIAL_RULE,
+        "partial_conversion_rule": NUMERICAL_PARTIAL_RULE,
+        "operand_family_deployment_supported": False,
+        "hardware_bit_parity_verified": False,
+        "arithmetic_chain": [
+            "mixed_family_block8_quantized_operands_materialized_in_fp32",
+            "fp32_matmul_reduction_per_mlen_partition",
+            f"each_mlen_reduction_rne_to_{matrix_storage_format}_storage_fp",
+            "signed_fixed16_16_cross_instruction_accumulate_wrap",
+            f"truncate_to_{matrix_storage_format}_matrix_writeout",
+            "store_already_rounded_values_in_bf16_logit_container",
+        ],
+    }
+
+
 @dataclass(frozen=True)
 class DecodePrecisionProfile:
     """Immutable numerical contract shared by every decode subsystem."""
@@ -301,6 +395,7 @@ class DecodePrecisionProfile:
     key_format: str
     value_format: str
     vector_format: str
+    matrix_mlen: int = FOUNDATION_MATRIX_MLEN
     block_size: int = MX_BLOCK_SIZE
     scale_format: str = MX_SCALE_FORMAT
     scale_bits: int = MX_SCALE_BITS
@@ -316,12 +411,21 @@ class DecodePrecisionProfile:
     schema_version: str = PROFILE_SCHEMA
 
     def __post_init__(self) -> None:
-        if self.schema_version != PROFILE_SCHEMA:
+        if self.schema_version not in {PROFILE_SCHEMA, LEGACY_PROFILE_SCHEMA}:
             raise ValueError(f"unsupported profile schema {self.schema_version!r}")
         if self.kind not in PROFILE_KINDS:
             raise ValueError(f"unsupported profile kind {self.kind!r}")
         if self.block_size != MX_BLOCK_SIZE:
             raise ValueError(f"decode sweep requires block size {MX_BLOCK_SIZE}")
+        if (
+            isinstance(self.matrix_mlen, bool)
+            or not isinstance(self.matrix_mlen, int)
+            or self.matrix_mlen <= 0
+            or self.matrix_mlen % self.block_size
+        ):
+            raise ValueError(
+                "matrix_mlen must be a positive multiple of the MX block size"
+            )
         if self.method != "rtn":
             raise ValueError("the exhaustive sweep foundation requires RTN")
         if self.key_format != self.value_format:
@@ -338,6 +442,42 @@ class DecodePrecisionProfile:
             raise ValueError("profile and matrix-semantics accumulator rules differ")
         if self.matrix_semantics.output_rule != self.output_rule:
             raise ValueError("profile and matrix-semantics output rules differ")
+
+        if self.schema_version == LEGACY_PROFILE_SCHEMA:
+            required_coverage = (
+                LEGACY_WEIGHT_OPERATORS,
+                LEGACY_ACTIVATION_OPERATORS,
+                DEFAULT_KV_OPERATORS,
+                DEFAULT_VECTOR_OPERATORS,
+                LEGACY_BF16_OPERATORS,
+            )
+        elif self.kind == PROFILE_KIND_BF16_REFERENCE:
+            required_coverage = (
+                BF16_REFERENCE_WEIGHT_OPERATORS,
+                BF16_REFERENCE_ACTIVATION_OPERATORS,
+                DEFAULT_KV_OPERATORS,
+                DEFAULT_VECTOR_OPERATORS,
+                BF16_REFERENCE_BF16_OPERATORS,
+            )
+        else:
+            required_coverage = (
+                DEFAULT_WEIGHT_OPERATORS,
+                DEFAULT_ACTIVATION_OPERATORS,
+                DEFAULT_KV_OPERATORS,
+                DEFAULT_VECTOR_OPERATORS,
+                DEFAULT_BF16_OPERATORS,
+            )
+        actual_coverage = (
+            self.weight_operators,
+            self.activation_operators,
+            self.kv_operators,
+            self.vector_operators,
+            self.bf16_operators,
+        )
+        if actual_coverage != required_coverage:
+            raise ValueError(
+                "operator coverage differs from the selected profile schema"
+            )
 
         if self.kind == PROFILE_KIND_BF16_REFERENCE:
             if any(
@@ -414,14 +554,193 @@ class DecodePrecisionProfile:
             vector_format="BF16",
             scale_format="NONE",
             scale_bits=0,
+            weight_operators=BF16_REFERENCE_WEIGHT_OPERATORS,
+            activation_operators=BF16_REFERENCE_ACTIVATION_OPERATORS,
+            bf16_operators=BF16_REFERENCE_BF16_OPERATORS,
         )
 
     @property
     def kv_format(self) -> str:
         return self.key_format
 
-    def to_dict(self) -> dict[str, Any]:
+    @property
+    def numerical_oracle_contract(self) -> dict[str, Any]:
+        """Describe the executable MASE oracle without relabelling it as RTL.
+
+        The quantizers materialize block-scaled operands as FP32 tensors.  The
+        oracle then evaluates one FP32 matmul for every MLEN partition, rounds
+        that partial to the selected vector format, crosses the signed 16.16
+        bank, and truncates the final writeout.  This is the accuracy model; it
+        is not evidence of bit parity with either matrix-family RTL pipeline.
+        """
+
+        if self.kind == PROFILE_KIND_BF16_REFERENCE:
+            return {
+                "schema_version": NUMERICAL_ORACLE_SCHEMA,
+                "implementation": "torch.nn.functional.linear_bf16_reference",
+                "rule": "backend_bf16_reference",
+                "matrix_mlen": None,
+                "operand_materialization_dtype": "BF16",
+                "partition_reduction_dtype": "backend_defined",
+                "partial_rounding": "backend_defined",
+                "partial_to_accumulator": "not_applicable",
+                "cross_partition_accumulation": "not_applicable",
+                "final_writeout": "BF16",
+                "hardware_bit_parity_verified": False,
+            }
         return {
+            "schema_version": NUMERICAL_ORACLE_SCHEMA,
+            "implementation": (
+                "chop.nn.quantized.functional.matrix.plena_matrix_product"
+            ),
+            "rule": NUMERICAL_PARTIAL_RULE,
+            "matrix_mlen": self.matrix_mlen,
+            "operand_materialization_dtype": "FP32",
+            "partition_reduction_dtype": "FP32",
+            "partial_rounding": "round_to_nearest_even_to_profile.vector_format",
+            "partial_to_accumulator": "truncate_toward_zero_to_signed_fixed16_16",
+            "cross_partition_accumulation": (
+                "signed_fixed16_16_wraparound_after_each_partition"
+            ),
+            "final_writeout": "truncate_to_profile.vector_format",
+            "hardware_bit_parity_verified": False,
+        }
+
+    @property
+    def local_head_contract(self) -> dict[str, Any]:
+        """Return the exact untied local output-head numerical boundary."""
+
+        bf16_reference = self.kind == PROFILE_KIND_BF16_REFERENCE
+        legacy_bf16_head = self.schema_version == LEGACY_PROFILE_SCHEMA
+        bf16_head = bf16_reference or legacy_bf16_head
+        matrix_storage_format = (
+            LOCAL_HEAD_LOGITS_FORMAT if bf16_head else self.vector_format
+        )
+        family_contract = (
+            {
+                "operand_family_binding": "backend_bf16_reference",
+                "numerical_oracle_rule": "backend_bf16_reference",
+                "partial_conversion_rule": "backend_bf16_reference",
+                "operand_family_deployment_supported": True,
+                "hardware_bit_parity_verified": False,
+                "arithmetic_chain": [
+                    "backend_bf16_linear",
+                    "bf16_logits",
+                ],
+            }
+            if bf16_head
+            else local_head_matrix_family_contract(
+                self.weight_format,
+                self.activation_format,
+                matrix_storage_format,
+            )
+        )
+        return {
+            "schema_version": LOCAL_HEAD_SCHEMA,
+            "location": LOCAL_HEAD_LOCATION,
+            "target_module": "lm_head",
+            "tie_word_embeddings_required": False,
+            "weight_format": "BF16" if bf16_head else self.weight_format,
+            "activation_format": "BF16" if bf16_head else self.activation_format,
+            "weight_format_source": (
+                "bf16_reference"
+                if bf16_reference
+                else "legacy_bf16_operator_coverage"
+                if legacy_bf16_head
+                else "profile.weight_format"
+            ),
+            "activation_format_source": (
+                "bf16_reference"
+                if bf16_reference
+                else "legacy_bf16_operator_coverage"
+                if legacy_bf16_head
+                else "profile.activation_format"
+            ),
+            "weight_method": (
+                "bf16_reference" if bf16_head else LOCAL_HEAD_WEIGHT_METHOD
+            ),
+            "weight_preconditioning": "none",
+            "block_size": 0 if bf16_head else self.block_size,
+            "scale_format": "NONE" if bf16_head else self.scale_format,
+            "scale_bits": 0 if bf16_head else self.scale_bits,
+            "accumulator_rule": (
+                "backend_bf16_reference"
+                if bf16_head
+                else self.accumulator_rule
+            ),
+            "operand_family_binding": family_contract[
+                "operand_family_binding"
+            ],
+            "operand_family_deployment_supported": family_contract[
+                "operand_family_deployment_supported"
+            ],
+            "hardware_bit_parity_verified": family_contract[
+                "hardware_bit_parity_verified"
+            ],
+            "numerical_oracle_rule": family_contract[
+                "numerical_oracle_rule"
+            ],
+            "partial_conversion_rule": family_contract[
+                "partial_conversion_rule"
+            ],
+            "partial_conversion_format": matrix_storage_format,
+            "mlen_partial_conversion_rounding": (
+                "backend_defined" if bf16_head else "round_to_nearest_even"
+            ),
+            "cross_instruction_accumulation": (
+                "backend_bf16_reference"
+                if bf16_head
+                else self.matrix_semantics.mxint_cross_instruction_accumulation
+            ),
+            "matrix_instruction_k_partition": (
+                "backend_bf16_reference"
+                if bf16_head
+                else self.matrix_semantics.matrix_instruction_k_partition
+            ),
+            "matrix_mlen": None if bf16_head else self.matrix_mlen,
+            "output_rule": (
+                "backend_bf16_linear_output"
+                if bf16_head
+                else LOCAL_HEAD_OUTPUT_RULE
+            ),
+            "matrix_semantics_output_rule": (
+                "backend_bf16_reference" if bf16_head else self.output_rule
+            ),
+            "arithmetic_chain": family_contract["arithmetic_chain"],
+            "matrix_storage_format": matrix_storage_format,
+            "matrix_output_format": matrix_storage_format,
+            "logit_container_format": LOCAL_HEAD_LOGITS_FORMAT,
+            "final_logits_format": LOCAL_HEAD_LOGITS_FORMAT,
+            "bf16_container_precision_recovery": False,
+            "greedy_selection_rule": LOCAL_HEAD_ARGMAX_RULE,
+            "offline_evaluation": {
+                "materialization": "full_bf16_logits",
+                "purpose": "teacher_forced_nll_and_accuracy",
+            },
+            "serving_selection": {
+                "materialization": "tiled_bf16_logits",
+                "full_batch_vocab_vsram_required": False,
+                "running_state": "top_k20_and_argmax_lowest_token_id",
+                "sample_probability_dtype": "FP32",
+                "top_k": 20,
+                "top_p": 0.95,
+                "min_p": 0.0,
+                "sampling_parameters_source": "publication_protocol",
+            },
+            "phase_ownership": {
+                "first_token_owner": LOCAL_HEAD_FIRST_TOKEN_OWNER,
+                "prefill_head_policy": "bf16",
+                "decode_query_length": LOCAL_HEAD_DECODE_QUERY_LENGTH,
+                "decode_head_policy": (
+                    "bf16_reference"
+                    if bf16_head
+                    else "profile_mx_matrix"
+                ),
+            },
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        value = {
             "schema_version": self.schema_version,
             "kind": self.kind,
             "weight_format": self.weight_format,
@@ -444,16 +763,40 @@ class DecodePrecisionProfile:
                 "bf16": list(self.bf16_operators),
             },
         }
+        if self.schema_version == PROFILE_SCHEMA:
+            value["matrix_mlen"] = self.matrix_mlen
+            value["numerical_oracle"] = self.numerical_oracle_contract
+            value["local_head"] = self.local_head_contract
+        return value
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "DecodePrecisionProfile":
-        expected_fields = set(cls.quantized(
-            "MXINT4", "MXINT4", "MXINT4", "FP_E3M2"
-        ).to_dict())
+        schema_version = value.get("schema_version")
+        if schema_version == PROFILE_SCHEMA:
+            expected_fields = set(
+                cls.quantized(
+                    "MXINT4", "MXINT4", "MXINT4", "FP_E3M2"
+                ).to_dict()
+            )
+        elif schema_version == LEGACY_PROFILE_SCHEMA:
+            expected_fields = set(
+                cls(
+                    kind=PROFILE_KIND_QUANTIZED,
+                    weight_format="MXINT4",
+                    activation_format="MXINT4",
+                    key_format="MXINT4",
+                    value_format="MXINT4",
+                    vector_format="FP_E3M2",
+                    weight_operators=LEGACY_WEIGHT_OPERATORS,
+                    activation_operators=LEGACY_ACTIVATION_OPERATORS,
+                    bf16_operators=LEGACY_BF16_OPERATORS,
+                    schema_version=LEGACY_PROFILE_SCHEMA,
+                ).to_dict()
+            )
+        else:
+            raise ValueError(f"unsupported profile schema {schema_version!r}")
         if set(value) != expected_fields:
             raise ValueError("profile fields differ from the schema")
-        if value["schema_version"] != PROFILE_SCHEMA:
-            raise ValueError(f"unsupported profile schema {value['schema_version']!r}")
         coverage = value["operator_coverage"]
         if not isinstance(coverage, Mapping) or set(coverage) != {
             "weight",
@@ -474,14 +817,19 @@ class DecodePrecisionProfile:
                 raise TypeError(f"operator_coverage.{field} must be a string list")
             return tuple(items)
 
-        return cls(
-            schema_version=str(value["schema_version"]),
+        profile = cls(
+            schema_version=str(schema_version),
             kind=str(value["kind"]),
             weight_format=str(value["weight_format"]),
             activation_format=str(value["activation_format"]),
             key_format=str(value["key_format"]),
             value_format=str(value["value_format"]),
             vector_format=str(value["vector_format"]),
+            matrix_mlen=(
+                int(value["matrix_mlen"])
+                if schema_version == PROFILE_SCHEMA
+                else FOUNDATION_MATRIX_MLEN
+            ),
             block_size=int(value["block_size"]),
             scale_format=str(value["scale_format"]),
             scale_bits=int(value["scale_bits"]),
@@ -497,6 +845,17 @@ class DecodePrecisionProfile:
             vector_operators=operators("vector"),
             bf16_operators=operators("bf16"),
         )
+        if (
+            schema_version == PROFILE_SCHEMA
+            and value["numerical_oracle"] != profile.numerical_oracle_contract
+        ):
+            raise ValueError("matrix numerical-oracle contract differs")
+        if (
+            schema_version == PROFILE_SCHEMA
+            and value["local_head"] != profile.local_head_contract
+        ):
+            raise ValueError("local-head precision contract differs from the profile")
+        return profile
 
     @property
     def canonical_json(self) -> str:
@@ -689,9 +1048,18 @@ __all__ = [
     "ACCUMULATOR_RULE",
     "FIXED_ACCUMULATOR_FRACTION_BITS",
     "FIXED_ACCUMULATOR_INTEGER_BITS",
+    "FOUNDATION_MATRIX_MLEN",
     "FORMAT_DESCRIPTORS",
     "MATRIX_SEMANTICS",
     "MATRIX_SEMANTICS_SCHEMA",
+    "NUMERICAL_ORACLE_SCHEMA",
+    "NUMERICAL_PARTIAL_RULE",
+    "LOCAL_HEAD_SCHEMA",
+    "LOCAL_HEAD_LOCATION",
+    "LOCAL_HEAD_WEIGHT_METHOD",
+    "LOCAL_HEAD_LOGITS_FORMAT",
+    "LOCAL_HEAD_ARGMAX_RULE",
+    "LOCAL_HEAD_OUTPUT_RULE",
     "MIXED_MATRIX_RULE",
     "M_FP_FORMAT_BINDING",
     "MATRIX_STORAGE_FP_BINDING",
@@ -710,6 +1078,7 @@ __all__ = [
     "PROFILE_KIND_BF16_REFERENCE",
     "PROFILE_KIND_QUANTIZED",
     "PROFILE_KIND_VECTOR_BF16_CONTROL",
+    "LEGACY_PROFILE_SCHEMA",
     "PROFILE_SCHEMA",
     "VECTOR_FORMATS",
     "VECTOR_FP_FORMATS",
