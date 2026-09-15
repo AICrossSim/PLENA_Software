@@ -12,7 +12,7 @@ set -euo pipefail
 
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-1.5B}"
 DEVICE="${DEVICE:-cuda:0}"
-QUANT_CONFIG="${QUANT_CONFIG:-quant_eval/configs/llama_mxint4.toml}"
+QUANT_CONFIG="${QUANT_CONFIG:-quant_eval/configs/llama_mxint8.toml}"
 TASKS="${TASKS:-gsm8k}"
 PREFILL_WIDTH="${PREFILL_WIDTH:-16}"
 DECODE_WIDTH="${DECODE_WIDTH:-16}"

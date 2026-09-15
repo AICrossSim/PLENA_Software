@@ -16,7 +16,7 @@ Example — with MXINT4 KV-cache quantization:
     python -m quant_eval.cli.eval_llada \\
         --tasks gsm8k --num_fewshot 0 \\
         --model llada_dist \\
-        --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=32,use_cache=True,quant_config='quant_eval/configs/llama_mxint4.toml'
+        --model_args model_path='GSAI-ML/LLaDA-8B-Instruct',gen_length=256,steps=256,block_length=32,use_cache=True,quant_config='quant_eval/configs/llama_mxint8.toml'
 """
 
 # Import to trigger @register_model("llada_dist")

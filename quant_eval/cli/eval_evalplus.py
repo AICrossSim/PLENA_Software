@@ -14,7 +14,7 @@ Example:
 
     python -m quant_eval.cli.eval_evalplus \\
         --model_name unsloth/Llama-3.2-1B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --dataset humaneval \\
         --greedy \\
         --evalplus_output_dir logs/evalplus
@@ -47,7 +47,7 @@ def main(
     dataset: str = "humaneval",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
-    quant_config: Union[str, None] = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: Union[str, None] = "quant_eval/configs/llama_mxint8.toml",
     model_parallel: bool = False,
     batch_size: int = 1,
     greedy: bool = False,

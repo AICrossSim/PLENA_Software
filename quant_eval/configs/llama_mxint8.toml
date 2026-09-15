@@ -1,4 +1,8 @@
-# LLaMA MXInt4: attention + MLP projections
+# LLaMA MXInt8 (W8A8): attention + MLP projections
+#
+# Every block below uses 8-bit weights and 8-bit activations with a
+# block size of 32 (MXInt8). Attention projections also quantise the
+# bias to 8 bits.
 
 by = "regex_name"
 

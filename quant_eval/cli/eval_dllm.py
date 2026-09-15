@@ -17,7 +17,7 @@ Example — quantized:
 
     python -m quant_eval.cli.eval_dllm \\
         --model_name Efficient-Large-Model/Fast_dLLM_v2_1.5B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --tasks gsm8k
 """
 

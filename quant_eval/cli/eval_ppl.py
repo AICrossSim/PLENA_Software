@@ -13,7 +13,7 @@ Example — quantized:
 
     python -m quant_eval.cli.eval_ppl \\
         --model_name unsloth/Llama-3.2-1B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml
+        --quant_config quant_eval/configs/llama_mxint8.toml
 """
 
 from typing import Union

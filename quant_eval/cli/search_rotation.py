@@ -14,7 +14,7 @@ Example:
 
     python -m quant_eval.cli.search_rotation \\
         --model_name unsloth/Llama-3.2-1B \\
-        --base_config quant_eval/configs/llama_mxint4.toml \\
+        --base_config quant_eval/configs/llama_mxint8.toml \\
         --calib_data wikitext2 \\
         --calib_nsamples 128 \\
         --output_json checkpoints/rotation_decisions.json
