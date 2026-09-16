@@ -356,7 +356,7 @@ def main(
         if model_parallel:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 device_map="auto",
                 trust_remote_code=True,
             )
@@ -364,7 +364,7 @@ def main(
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 trust_remote_code=True,
             ).to(device_id)
         model.eval()
@@ -419,7 +419,7 @@ def main(
         if model_parallel:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 device_map="auto",
                 trust_remote_code=True,
             )
@@ -428,7 +428,7 @@ def main(
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 trust_remote_code=True,
             ).to(device_id)
             server_device = device_id
