@@ -8,7 +8,7 @@ Example:
 
     python -m quant_eval.cli.eval_lm \\
         --model_name unsloth/Llama-3.2-1B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --tasks arc_easy,hellaswag,winogrande \\
         --limit 500
 """
@@ -40,7 +40,7 @@ def main(
     tasks: Union[str, list[str]] = "wikitext",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
-    quant_config: Union[str, None] = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: Union[str, None] = "quant_eval/configs/llama_mxint8.toml",
     model_parallel: bool = False,
     seqlen: int = 2048,
     batch_size: Union[int, str] = 64,

@@ -18,7 +18,7 @@ Example:
     python -m quant_eval.cli.eval_osworld \\
         --model_name Qwen/Qwen2.5-7B-Instruct \\
         --osworld_path quant_eval/benchmarks/OSWorld \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --domain chrome --max_steps 15
 """
 

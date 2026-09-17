@@ -23,7 +23,7 @@ Example:
 
     python -m quant_eval.cli.eval_phase_bfcl \\
         --model_name Qwen/Qwen2.5-1.5B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --prefill_attn_width 4 --prefill_ffn_width 4 \\
         --decode_attn_width  8 --decode_ffn_width  8 \\
         --bfcl_test_categories web_search_base \\
@@ -599,7 +599,7 @@ def main(
     model_name:  str = "Qwen/Qwen3-8B-FC",
     device_id:   str = "cuda:0",
     dtype:       str = "bfloat16",
-    quant_config: str = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: str = "quant_eval/configs/llama_mxint8.toml",
     model_parallel: bool = False,
     # ── BFCL settings ──────────────────────────────────────────────────────
     bfcl_test_categories: Union[list[str], None] = None,

@@ -15,7 +15,7 @@ Example — disaggregated W4 prefill / W8 decode:
 
     python -m quant_eval.cli.eval_phase_lm \\
         --model_name Qwen/Qwen2.5-1.5B \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --prefill_attn_width 4 --prefill_ffn_width 4 \\
         --decode_attn_width  8 --decode_ffn_width  8 \\
         --tasks gsm8k --limit 200
@@ -49,7 +49,7 @@ def main(
     tasks: Union[str, list[str]] = "wikitext",
     device_id: str = "cuda:0",
     dtype: str = "bfloat16",
-    quant_config: str = "quant_eval/configs/llama_mxint4.toml",
+    quant_config: str = "quant_eval/configs/llama_mxint8.toml",
     model_parallel: bool = False,
     seqlen: int = 2048,
     batch_size: Union[int, str] = 64,

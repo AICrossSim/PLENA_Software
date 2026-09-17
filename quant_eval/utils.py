@@ -118,7 +118,7 @@ def setup_model(model_name, model_parallel, dtype, device, attn_implementation="
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=dtype,
+        dtype=dtype,
         attn_implementation=attn_implementation,
         trust_remote_code=True,
     )

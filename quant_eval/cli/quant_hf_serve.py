@@ -24,7 +24,7 @@ Usage:
 Example:
     python -m quant_eval.cli.quant_hf_serve \\
         --model_name Qwen/Qwen3-8B-FC \\
-        --quant_config quant_eval/configs/llama_mxint4.toml \\
+        --quant_config quant_eval/configs/llama_mxint8.toml \\
         --prefill_attn_width 4 --prefill_ffn_width 4 \\
         --decode_attn_width  8 --decode_ffn_width  8 \\
         --host 127.0.0.1 --port 8915
@@ -356,7 +356,7 @@ def main(
         if model_parallel:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 device_map="auto",
                 trust_remote_code=True,
             )
@@ -364,7 +364,7 @@ def main(
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 trust_remote_code=True,
             ).to(device_id)
         model.eval()
@@ -419,7 +419,7 @@ def main(
         if model_parallel:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 device_map="auto",
                 trust_remote_code=True,
             )
@@ -428,7 +428,7 @@ def main(
         else:
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch_dtype,
+                dtype=torch_dtype,
                 trust_remote_code=True,
             ).to(device_id)
             server_device = device_id
