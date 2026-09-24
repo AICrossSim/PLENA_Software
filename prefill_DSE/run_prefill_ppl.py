@@ -148,14 +148,22 @@ def _model_lifecycle(cfg: dict[str, Any]) -> str:
 
 def _decode_weight_residency(cfg: dict[str, Any]) -> str:
     residency = str(cfg.get("runtime", {}).get("decode_weight_residency", "disk_reload")).lower()
-    if residency not in {"disk_reload", "gpu_dual"}:
+    if residency not in {"disk_reload", "host_cached", "gpu_dual"}:
         raise ValueError(
-            f"runtime.decode_weight_residency must be 'disk_reload' or 'gpu_dual', got {residency!r}"
-    )
+            "runtime.decode_weight_residency must be 'disk_reload', "
+            f"'host_cached', or 'gpu_dual', got {residency!r}"
+        )
     runtime = cfg.get("runtime", {})
     if residency == "gpu_dual":
         if str(runtime.get("decode_weight_mode", "fp")).lower() != "fp":
             raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.decode_weight_mode='fp'.")
+    elif residency == "host_cached" and str(
+        runtime.get("decode_weight_mode", "fp")
+    ).lower() != "fp":
+        raise ValueError(
+            "runtime.decode_weight_residency='host_cached' requires "
+            "runtime.decode_weight_mode='fp'."
+        )
     return residency
 
 

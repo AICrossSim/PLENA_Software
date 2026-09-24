@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from typing import Union
 import gc
+import hashlib
+import json
+from pathlib import Path
 import shutil
 import time
 
@@ -21,7 +24,7 @@ from quant_eval.cli.eval_phase_bfcl import (
     _mark_gptq_projection_configs,
     _normalize_device_id,
 )
-from quant_eval.eval import evaluate_perplexity
+from quant_eval.eval.eval_ppl import evaluate_perplexity_with_kl
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.eval.unified_mx import apply_qwen3_gptq_cache_unified_wrappers, apply_unified_mx_wrappers
 from quant_eval.precision import (
@@ -44,6 +47,39 @@ from quant_eval.utils import (
 
 logger = get_logger(__name__)
 set_logging_verbosity("debug")
+
+
+def _stable_fingerprint(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _model_reference_fingerprint(model_name: str, model) -> str:
+    config = model.config
+    fields = (
+        "model_type",
+        "vocab_size",
+        "hidden_size",
+        "intermediate_size",
+        "moe_intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "num_experts",
+        "num_experts_per_tok",
+    )
+    return _stable_fingerprint({
+        "model_name": str(model_name),
+        "config": {name: getattr(config, name, None) for name in fields},
+    })
+
+
+def _tokenizer_reference_fingerprint(tokenizer) -> str:
+    return _stable_fingerprint({
+        "name_or_path": getattr(tokenizer, "name_or_path", None),
+        "vocab_size": len(tokenizer),
+        "special_tokens_map": getattr(tokenizer, "special_tokens_map", {}),
+    })
 
 
 def _legacy_mx_config(width: int, block_size: int) -> dict:
@@ -130,6 +166,15 @@ def main(
     model_family: str = "qwen3",
     seqlen: int = 1024,
     max_samples: int | None = 64,
+    ppl_reference_mode: str = "none",
+    ppl_reference_dir: str | None = None,
+    ppl_kl_samples: int = 64,
+    ppl_profile_id: str = "default",
+    ppl_progress_path: str | None = None,
+    ppl_kl_position_block_size: int = 8,
+    ppl_profiles: list[dict] | None = None,
+    ppl_results_root: str | None = None,
+    ppl_output_path: str | None = None,
     # GPTQ cache/config. Defaults are load-only to avoid rerunning GPTQ in PPL diagnostics.
     gptq_dataset: str | None = None,
     gptq_nsamples: int = 32,
@@ -142,6 +187,8 @@ def main(
     gptq_cali_batch_size: int = 1,
     gptq_max_layers: int | None = None,
     gptq_device_map_aware: bool = False,
+    gptq_cpu_staged: bool = False,
+    gptq_cache_only: bool = False,
     gptq_cache_dir: str | None = None,
     gptq_cache_mode: str = "require",
     # Legacy phase widths.
@@ -173,6 +220,24 @@ def main(
     model_family = model_family.lower()
     qwen_model_family = model_family in {"qwen3", "qwen3_moe"}
 
+    if gptq_cpu_staged:
+        if model_parallel:
+            raise ValueError("gptq_cpu_staged requires model_parallel=False.")
+        if gptq_device_map_aware:
+            raise ValueError("gptq_cpu_staged is incompatible with gptq_device_map_aware.")
+        if not gptq_cache_only:
+            raise ValueError("gptq_cpu_staged is supported only with gptq_cache_only=True.")
+    if gptq_cache_only:
+        normalized_cache_mode = str(gptq_cache_mode or "off").lower()
+        if normalized_cache_mode not in {"auto", "refresh", "require"}:
+            raise ValueError(
+                "gptq_cache_only requires gptq_cache_mode auto, refresh, or require."
+            )
+        if not gptq_cache_dir:
+            raise ValueError("gptq_cache_only requires gptq_cache_dir.")
+        if not gptq_dataset:
+            raise ValueError("gptq_cache_only requires gptq_dataset.")
+
     quant_config_is_none = quant_config is None or str(quant_config).strip().lower() in {"", "none", "fp", "false"}
     if quant_config_is_none:
         quant_config = "none"
@@ -193,13 +258,20 @@ def main(
         if decode_weight_residency != "disk_reload":
             raise ValueError("--decode_weight_residency is only meaningful for quantized runs.")
     decode_weight_residency = str(decode_weight_residency or "disk_reload").lower()
-    if decode_weight_residency not in {"disk_reload", "gpu_dual"}:
+    if decode_weight_residency not in {"disk_reload", "host_cached", "gpu_dual"}:
         raise ValueError(
-            "decode_weight_residency must be 'disk_reload' or 'gpu_dual', "
+            "decode_weight_residency must be 'disk_reload', 'host_cached', "
+            "or 'gpu_dual', "
             f"got {decode_weight_residency!r}."
         )
-    if decode_weight_residency == "gpu_dual" and decode_weight_mode != "fp":
-        raise ValueError("decode_weight_residency='gpu_dual' requires decode_weight_mode='fp'.")
+    if (
+        decode_weight_residency in {"host_cached", "gpu_dual"}
+        and decode_weight_mode != "fp"
+    ):
+        raise ValueError(
+            f"decode_weight_residency={decode_weight_residency!r} requires "
+            "decode_weight_mode='fp'."
+        )
 
     decode_weight_policy = {"weight_mode": "fp", "bypass": True} if decode_weight_mode == "fp" else {}
     decode_nonlinear_policy = {"bypass": True} if decode_weight_mode == "fp" else {}
@@ -264,6 +336,11 @@ def main(
     print(f"  Weights   : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
     if gptq_dataset:
         print(f"  GPTQ      : dataset={gptq_dataset}, cache={gptq_cache_mode}@{gptq_cache_dir}")
+    if gptq_cache_only:
+        print(
+            "  Cache only: enabled"
+            + (f" (CPU staged on {device_id})" if gptq_cpu_staged else "")
+        )
     print(f"  Prefill   : attn={prefill['display']} ffn={prefill['ffn_display']}")
     print(f"  Decode    : {decode_weight_mode} (unused for teacher-forcing PPL unless seq_len==1)")
     print(f"  Weight res: {decode_weight_residency}")
@@ -278,12 +355,26 @@ def main(
     transformers.set_seed(0)
     dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     torch_dtype = dtype_map.get(dtype, torch.bfloat16)
+    reference_mode = str(ppl_reference_mode or "none").lower()
     tokenizer, model = setup_model(
         model_name,
         model_parallel,
         dtype=torch_dtype,
         device=device_id if not model_parallel else None,
-        attn_implementation="eager" if not quant_config_is_none else "sdpa",
+        attn_implementation=(
+            "eager"
+            if (not quant_config_is_none or reference_mode in {"write", "compare"})
+            else "sdpa"
+        ),
+        layer_balanced_device_map=bool(
+            model_parallel
+            and qwen_model_family
+            and (
+                decode_weight_residency in {"host_cached", "gpu_dual"}
+                or gptq_device_map_aware
+            )
+        ),
+        cpu_staged=bool(gptq_cpu_staged),
     )
     model.eval()
 
@@ -326,6 +417,7 @@ def main(
             cali_batch_size=gptq_cali_batch_size,
             max_layers=gptq_max_layers,
             device_map_aware=bool(gptq_device_map_aware),
+            cpu_staged=bool(gptq_cpu_staged),
         )
         gptq_cache = None
         try:
@@ -351,12 +443,50 @@ def main(
                         gptq_config=resolved_gptq_config,
                         total_layers=len(model.model.layers),
                     )
-                    cache_hit = gptq_cache.prepare(model)
+                    cache_hit = gptq_cache.prepare(
+                        model,
+                        load_on_hit=not gptq_cache_only,
+                    )
                     gptq_cache_info = gptq_cache.summary()
                     if cache_hit:
                         pass_args.pop("gptq", None)
                     else:
                         resolved_gptq_config["checkpoint_dir"] = str(gptq_cache.cache_path)
+
+            if gptq_cache_only:
+                if resolved_gptq_config is None or gptq_cache is None:
+                    raise RuntimeError(
+                        "Cache-only GPTQ requires a resolved GPTQ config and disk cache."
+                    )
+                started = time.time()
+                if not gptq_cache.hit:
+                    from chop.passes.module.transforms.gptq import run_gptq
+
+                    run_gptq(model, resolved_gptq_config)
+                    gptq_cache.finalize()
+                    gptq_cache_info = gptq_cache.summary()
+                results = {
+                    "gptq_cache_only": True,
+                    "gptq_cpu_staged": bool(gptq_cpu_staged),
+                    "gptq_cache": gptq_cache_info,
+                    "elapsed_sec": time.time() - started,
+                    "model_name": model_name,
+                    "model_family": model_family,
+                }
+                if ppl_output_path:
+                    output_path = Path(ppl_output_path).expanduser().resolve()
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_text(
+                        json.dumps(results, indent=2, sort_keys=True), encoding="utf-8"
+                    )
+                if log_dir:
+                    save_results(log_dir, results)
+                logger.info(
+                    "GPTQ cache-only stage complete in %.1fs: %s",
+                    results["elapsed_sec"],
+                    gptq_cache_info.get("path"),
+                )
+                return results
 
             t0 = time.time()
             qwen_cache_fast_path = bool(
@@ -377,7 +507,10 @@ def main(
             if codesign_tokens_enabled or qwen_model_family:
                 qwen3_moe_experts_config = None
                 if model_family == "qwen3_moe" and prefill["mlp"]:
-                    qwen3_moe_experts_config = {**prefill["ffn"], **prefill["mlp"]}
+                    qwen3_moe_experts_config = {
+                        "act": prefill["ffn"],
+                        "nonlinear": prefill["mlp"],
+                    }
                 t_unified = time.time()
                 wrapper_kwargs = {
                     "qwen3_attention_config": prefill["attn"] if model_family == "qwen3" else None,
@@ -419,14 +552,21 @@ def main(
         if decode_weight_mode == "fp":
             switch_kwargs["model_name"] = model_name
             switch_kwargs["weight_residency"] = decode_weight_residency
+            if decode_weight_residency in {"disk_reload", "host_cached"}:
+                quant_checkpoint_dir = gptq_cache_info.get("path")
+                if quant_checkpoint_dir:
+                    switch_kwargs["quant_checkpoint_dir"] = quant_checkpoint_dir
         t_switch = time.time()
         switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
         switch.enable()
         logger.info("Phase switch setup complete in %.1fs", time.time() - t_switch)
         logger.info("\n%s", switch.summary())
 
-    try:
-        results = evaluate_perplexity(
+    model_fingerprint = _model_reference_fingerprint(model_name, model)
+    tokenizer_fingerprint = _tokenizer_reference_fingerprint(tokenizer)
+
+    def _evaluate_profile(profile_name: str, progress: str | None) -> dict:
+        return evaluate_perplexity_with_kl(
             model=model,
             tokenizer=tokenizer,
             dataset_name=dataset,
@@ -435,7 +575,65 @@ def main(
             max_length=seqlen,
             max_samples=max_samples,
             verbose=True,
+            reference_mode=reference_mode,
+            reference_dir=ppl_reference_dir,
+            kl_samples=ppl_kl_samples,
+            model_fingerprint=model_fingerprint,
+            tokenizer_fingerprint=tokenizer_fingerprint,
+            profile_id=profile_name,
+            progress_path=progress,
+            kl_position_block_size=ppl_kl_position_block_size,
         )
+
+    try:
+        if ppl_profiles:
+            if switch is None:
+                raise ValueError("ppl_profiles requires a quantized run with phase switching enabled.")
+            if not ppl_results_root:
+                raise ValueError("ppl_results_root is required when ppl_profiles is set.")
+            results_root = Path(ppl_results_root).expanduser().resolve()
+            results_root.mkdir(parents=True, exist_ok=True)
+            profile_results = []
+            for profile in ppl_profiles:
+                profile_name = str(profile["profile_id"])
+                profile_prefill = _resolve_phase_precision(
+                    phase=f"profile {profile_name}",
+                    act=str(profile["act"]),
+                    kv=str(profile["kv"]),
+                    fp=str(profile["fp_setting"]),
+                    legacy_attn=_legacy_mx_config(prefill_attn_width, prefill_attn_block_size),
+                    legacy_ffn=_legacy_mx_config(prefill_ffn_width, prefill_ffn_block_size),
+                    dse_mx_block_size=dse_mx_block_size,
+                    model_family=model_family,
+                    enable_qwen_default_precision=True,
+                )
+                profile_phase = {
+                    "attn": profile_prefill["attn"],
+                    "ffn": profile_prefill["ffn"],
+                    "mlp": profile_prefill["mlp"],
+                    "rms_norm": profile_prefill["rms_norm"],
+                }
+                switch.apply_phase("prefill", profile_phase)
+                profile_dir = results_root / profile_name
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                profile_result = _evaluate_profile(
+                    profile_name,
+                    str(profile_dir / "chunks.jsonl"),
+                )
+                profile_result.update({
+                    "profile_id": profile_name,
+                    "act": profile["act"],
+                    "kv": profile["kv"],
+                    "fp_setting": profile["fp_setting"],
+                    "phase_config": profile_phase,
+                })
+                (profile_dir / "results.json").write_text(
+                    json.dumps(profile_result, indent=2, sort_keys=True), encoding="utf-8"
+                )
+                profile_results.append(profile_result)
+            results = {"profiles": profile_results}
+        else:
+            results = _evaluate_profile(ppl_profile_id, ppl_progress_path)
     finally:
         if switch is not None:
             switch.disable()
@@ -455,13 +653,39 @@ def main(
         "decode_weight_mode": decode_weight_mode,
         "decode_weight_residency": decode_weight_residency,
         "gptq_device_map_aware": bool(gptq_device_map_aware),
+        "gptq_cpu_staged": bool(gptq_cpu_staged),
+        "gptq_cache_only": bool(gptq_cache_only),
         "gptq_cache": gptq_cache_info,
+        "ppl_reference_mode": reference_mode,
+        "ppl_reference_dir": ppl_reference_dir,
+        "ppl_kl_samples": int(ppl_kl_samples),
+        "ppl_profile_id": ppl_profile_id,
+        "ppl_progress_path": ppl_progress_path,
+        "ppl_profiles": ppl_profiles,
+        "ppl_results_root": ppl_results_root,
+        "ppl_output_path": ppl_output_path,
     })
+    if ppl_output_path:
+        output_path = Path(ppl_output_path).expanduser().resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(results, indent=2, sort_keys=True), encoding="utf-8"
+        )
     if log_dir:
         save_results(log_dir, results)
     print("\nResults:")
-    for key in ("ppl", "nll", "num_tokens", "nsamples"):
-        print(f"  {key}: {results[key]}")
+    if "profiles" in results:
+        for profile in results["profiles"]:
+            print(
+                f"  {profile['profile_id']}: ppl={profile['ppl']:.4f}, "
+                f"kl={profile['kl_nats_per_token']}, top1={profile['top1_agreement']}"
+            )
+    else:
+        for key in (
+            "ppl", "nll", "num_tokens", "nsamples",
+            "kl_nats_per_token", "top1_agreement", "kl_tokens",
+        ):
+            print(f"  {key}: {results[key]}")
     return results
 
 
