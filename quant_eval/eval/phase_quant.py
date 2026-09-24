@@ -44,11 +44,21 @@ whatever value was set at model-load time — no silent reset to defaults.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, nullcontext
+from functools import partial
+import logging
+import os
+from pathlib import Path
+import time
+
 import torch
 from torch import nn
-from functools import partial
 
 from chop.nn.quantizers._minifloat_mx import MinifloatMeta, minifloat_quantizer_sim
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +118,7 @@ _ATTN_BYPASS_ATTRS = (
 )
 
 _VALID_WEIGHT_MODES = {"quantized", "fp"}
-_VALID_WEIGHT_RESIDENCIES = {"disk_reload", "gpu_dual"}
+_VALID_WEIGHT_RESIDENCIES = {"disk_reload", "host_cached", "gpu_dual"}
 
 
 def _set_attention_bypass_attrs(wrapper: nn.Module, bypass: bool) -> None:
@@ -279,6 +289,15 @@ def _apply_nonlinear_config(module: nn.Module, overrides: dict) -> None:
     if module.__class__.__name__.endswith(("RMSNormMinifloat", "RMSNormMinifloatUnified")):
         _rebuild_rmsnorm_minifloat_quantizers(module)
 
+
+def _apply_expert_activation_config(module: nn.Module, overrides: dict) -> None:
+    """Update routed expert ACT precision without touching FP_SETTING."""
+    config = getattr(module, "act_config", None)
+    if not isinstance(config, dict) or not overrides:
+        return
+    config.pop("bypass", None)
+    config.update({k: v for k, v in overrides.items() if k != "weight_mode"})
+
 # ---------------------------------------------------------------------------
 # Layer-type classification helpers
 # ---------------------------------------------------------------------------
@@ -421,18 +440,9 @@ class PhaseLayerAutoSwitch:
 
     Architecture
     ────────────
-    Unlike PhaseAutoSwitch (one hook on the top-level model that sets all
-    MX layers at once), this class registers a hook on each attention and
-    FFN submodule individually.  Each hook:
-
-      1. Reads the current phase from a shared ``_phase`` cell that is
-         updated by a single lightweight top-level hook (same seq_len
-         detection logic as the original).
-      2. Looks up the (phase, layer_type) config and patches only the MX
-         layers that are *direct children* of that submodule.
-
-    This avoids the N-submodule × M-MX-layer cross-product walk on every
-    forward pass — each hook only touches the MX layers it owns.
+    A top-level hook detects phase changes from the input sequence length.
+    Per-submodule hooks then apply the active attention/FFN configuration to
+    the MX layers owned by that submodule.
 
     Layer-type classification
     ─────────────────────────
@@ -493,6 +503,7 @@ class PhaseLayerAutoSwitch:
         ffn_keywords:  tuple[str, ...] = _DEFAULT_FFN_KEYWORDS,
         model_name: str | None = None,
         weight_residency: str = "disk_reload",
+        quant_checkpoint_dir: str | None = None,
     ):
         """
         Args:
@@ -506,6 +517,14 @@ class PhaseLayerAutoSwitch:
                            weight width stays fixed at whatever the load-time
                            quant pass produced; activation / attention /
                            KV-cache config mutation still works.
+            weight_residency: ``disk_reload`` keeps one active GPU weight set;
+                           when a GPTQ layer cache is available it automatically
+                           uses the retained mmap/page-cache I/O fast path,
+                           otherwise files are reopened for each switch.
+                           ``host_cached`` explicitly requires that fast path;
+                           ``gpu_dual`` retains both weight sets on GPU.
+            quant_checkpoint_dir: Per-layer GPTQ cache used to restore prefill
+                           weights after FP decode. Required by ``host_cached``.
         """
         self.model = model
         self.phase_configs = phase_configs
@@ -514,23 +533,36 @@ class PhaseLayerAutoSwitch:
         self.ffn_keywords  = ffn_keywords
         self.model_name = model_name
         self.weight_residency = str(weight_residency or "disk_reload").lower()
+        self.quant_checkpoint_dir = (
+            Path(quant_checkpoint_dir).expanduser().resolve()
+            if quant_checkpoint_dir
+            else None
+        )
         if self.weight_residency not in _VALID_WEIGHT_RESIDENCIES:
             raise ValueError(
                 f"Unsupported weight_residency={weight_residency!r}; expected one of "
                 f"{sorted(_VALID_WEIGHT_RESIDENCIES)}."
             )
+        self._host_handle_stack = ExitStack()
+        self._host_safetensor_handles: dict[str, object] = {}
         self._fp_weight_requested = self._phase_configs_request_fp_weight()
         if self._fp_weight_requested and model_name is None:
             raise ValueError(
                 "PhaseLayerAutoSwitch requires model_name when any phase "
                 "config sets weight_mode='fp'."
             )
-        if self.weight_residency == "gpu_dual" and not self._fp_weight_requested:
-            raise ValueError("weight_residency='gpu_dual' requires at least one phase with weight_mode='fp'.")
+        if (
+            self.weight_residency in {"host_cached", "gpu_dual"}
+            and not self._fp_weight_requested
+        ):
+            raise ValueError(
+                f"weight_residency={self.weight_residency!r} requires at least "
+                "one phase with weight_mode='fp'."
+            )
 
-        # Shared mutable cell — updated by the top-level phase-detection hook,
-        # read by every per-submodule hook.  A one-element list is used so
-        # closures can mutate it without 'nonlocal'.
+        # Shared mutable cell updated by the top-level phase-detection hook and
+        # read by each per-submodule hook. A one-element list lets closures
+        # mutate it without ``nonlocal``.
         self._phase: list[str] = ["prefill"]
 
         self._hook_handles: list = []
@@ -548,6 +580,7 @@ class PhaseLayerAutoSwitch:
         # exact runtime state without re-running GPTQ.
         self._quant_weight_cache: dict[int, dict[str, object]] = {}
         self._fp_weight_active: set[int] = set()
+        self._fp_expert_active: set[int] = set()
 
         # id(mx_module) -> full dotted name, for safetensors tensor-key lookup
         # during the disk-backed weight re-quant path.
@@ -560,6 +593,52 @@ class PhaseLayerAutoSwitch:
         self.attn_wrappers = _find_quant_attention_wrappers(model)
         self.mlp_wrappers = _find_quant_mlp_wrappers(model)
         self.rmsnorm_wrappers = _find_minifloat_rmsnorm_wrappers(model)
+        self.expert_weight_wrappers = [
+            (name, module)
+            for name, module in self.mlp_wrappers
+            if all(
+                hasattr(module, attr)
+                for attr in (
+                    "gate_up_proj",
+                    "down_proj",
+                    "allocate_fp_weight_backup",
+                    "copy_fp_expert_tensor",
+                    "set_use_fp_weight",
+                )
+            )
+        ]
+        self._fp_expert_weight_requested = bool(self.expert_weight_wrappers) and any(
+            _normalize_weight_mode((by_layer or {}).get("ffn") or {}) == "fp"
+            for by_layer in self.phase_configs.values()
+            if isinstance(by_layer, dict)
+        )
+        if (
+            self._fp_expert_weight_requested
+            and self.weight_residency in {"disk_reload", "host_cached"}
+            and self.quant_checkpoint_dir is None
+        ):
+            raise ValueError(
+                "Qwen3-MoE FP decode with disk/host-backed residency requires "
+                "quant_checkpoint_dir so packed GPTQ expert tensors can be restored."
+            )
+        if self.quant_checkpoint_dir is not None and not self.quant_checkpoint_dir.is_dir():
+            raise FileNotFoundError(
+                f"quant_checkpoint_dir does not exist: {self.quant_checkpoint_dir}"
+            )
+        if self.weight_residency == "host_cached" and self.quant_checkpoint_dir is None:
+            raise ValueError(
+                "weight_residency='host_cached' requires quant_checkpoint_dir; "
+                "otherwise restoring prefill weights would require a full anonymous CPU copy."
+            )
+        # A complete GPTQ layer cache lets disk_reload use the same efficient
+        # file-backed implementation as host_cached without changing its GPU
+        # memory contract: only the currently active weight set remains on GPU.
+        # Evaluators pass this path only after cache preparation succeeds.
+        self._retained_file_cache_enabled = bool(
+            self._fp_weight_requested
+            and self.weight_residency in {"disk_reload", "host_cached"}
+            and self.quant_checkpoint_dir is not None
+        )
         self._original_attn_configs: dict[str, dict[str, object]] = {}
         for name, wrapper in self.attn_wrappers:
             snap: dict[str, object] = {"bypass_attrs": {}}
@@ -575,6 +654,11 @@ class PhaseLayerAutoSwitch:
         self._original_mlp_configs: dict[str, dict] = {
             name: dict(getattr(module, "q_config", {}) or {})
             for name, module in self.mlp_wrappers
+        }
+        self._original_mlp_act_configs: dict[str, dict] = {
+            name: dict(getattr(module, "act_config", {}) or {})
+            for name, module in self.mlp_wrappers
+            if hasattr(module, "act_config")
         }
         self._original_rmsnorm_configs: dict[str, dict] = {
             name: dict(getattr(module, "q_config", {}) or {})
@@ -597,7 +681,15 @@ class PhaseLayerAutoSwitch:
                 f"Could not locate HF safetensors for model_name={model_name!r}; "
                 "weight_mode='fp' cannot load original decode weights."
             )
-        if self._fp_weight_requested and self.weight_residency == "gpu_dual":
+        if self._retained_file_cache_enabled:
+            if self.weight_residency == "disk_reload":
+                logger.info(
+                    "Auto-enabling retained mmap/page-cache fast path for "
+                    "disk_reload because GPTQ cache is available: %s",
+                    self.quant_checkpoint_dir,
+                )
+            self._prepare_host_cached_sources()
+        elif self._fp_weight_requested and self.weight_residency == "gpu_dual":
             self._materialize_gpu_dual_fp_weights()
 
     def _phase_requests_fp_weight(self, phase: str) -> bool:
@@ -667,6 +759,144 @@ class PhaseLayerAutoSwitch:
             )
             return None
 
+    def _open_safetensor(self, path: str | Path):
+        """Open a safetensors source, optionally retaining its mmap."""
+        from safetensors import safe_open
+
+        resolved = str(Path(path).expanduser().resolve())
+        if not self._retained_file_cache_enabled:
+            return safe_open(resolved, framework="pt")
+        handle = self._host_safetensor_handles.get(resolved)
+        if handle is None:
+            handle = self._host_handle_stack.enter_context(
+                safe_open(resolved, framework="pt")
+            )
+            self._host_safetensor_handles[resolved] = handle
+        return nullcontext(handle)
+
+    @staticmethod
+    def _advise_page_cache(path: Path) -> None:
+        """Ask Linux to retain/read the file through its reclaimable page cache."""
+        advice = getattr(os, "POSIX_FADV_WILLNEED", None)
+        if advice is None or not hasattr(os, "posix_fadvise"):
+            return
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            os.posix_fadvise(fd, 0, 0, advice)
+        except OSError as exc:
+            logger.debug("Page-cache advice failed for %s: %s", path, exc)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _prepare_host_cached_sources(self) -> None:
+        """Retain checkpoint mmaps and issue non-blocking Linux cache hints.
+
+        This deliberately does not clone tensors into anonymous CPU memory.
+        The mapped pages remain reclaimable by Linux under memory pressure.
+        """
+        started = time.perf_counter()
+        paths = {
+            Path(path).expanduser().resolve()
+            for path in (self._shard_map or {}).values()
+        }
+        if self.quant_checkpoint_dir is not None:
+            paths.update(
+                path.resolve()
+                for path in self.quant_checkpoint_dir.glob(
+                    "quantized_model_layer_*.safetensors"
+                )
+            )
+        missing = [path for path in paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                f"host_cached source does not exist: {missing[0]}"
+            )
+
+        apparent_bytes = 0
+        try:
+            for path in sorted(paths):
+                apparent_bytes += path.stat().st_size
+                self._advise_page_cache(path)
+                with self._open_safetensor(path):
+                    pass
+        except Exception:
+            self._close_host_cached_sources()
+            raise
+        logger.info(
+            "Prepared retained mmap/page-cache fast path for %d safetensors files "
+            "(%.1f GiB apparent) in %.1fs; requested residency=%s",
+            len(paths),
+            apparent_bytes / (1024 ** 3),
+            time.perf_counter() - started,
+            self.weight_residency,
+        )
+
+    @staticmethod
+    def _copy_job_bytes(job: tuple[torch.Tensor, torch.Tensor]) -> int:
+        target, _ = job
+        return target.numel() * target.element_size()
+
+    def _copy_host_cached_jobs(
+        self,
+        jobs: list[tuple[torch.Tensor, torch.Tensor]],
+        *,
+        label: str,
+    ) -> None:
+        """Copy mmap-backed tensors concurrently, with one stream per device.
+
+        Jobs targeting the same GPU remain ordered. Different GPUs copy in
+        parallel so a sharded model can use all available host-to-device links.
+        """
+        if not jobs:
+            return
+        by_device: dict[str, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        for target, source in jobs:
+            by_device.setdefault(str(target.device), []).append((target, source))
+
+        def _copy_device_group(
+            group: list[tuple[torch.Tensor, torch.Tensor]],
+        ) -> None:
+            device = group[0][0].device
+            if device.type == "cuda":
+                torch.cuda.set_device(device)
+            with torch.no_grad():
+                for target, source in group:
+                    target.copy_(source, non_blocking=False)
+
+        started = time.perf_counter()
+        if len(by_device) == 1:
+            _copy_device_group(next(iter(by_device.values())))
+        else:
+            with ThreadPoolExecutor(
+                max_workers=len(by_device),
+                thread_name_prefix="plena-host-copy",
+            ) as executor:
+                futures = [
+                    executor.submit(_copy_device_group, group)
+                    for group in by_device.values()
+                ]
+                for future in futures:
+                    future.result()
+        total_bytes = sum(self._copy_job_bytes(job) for job in jobs)
+        logger.info(
+            "retained file cache %s copied %.1f GiB across %d device(s) in %.1fs",
+            label,
+            total_bytes / (1024 ** 3),
+            len(by_device),
+            time.perf_counter() - started,
+        )
+
+    def _close_host_cached_sources(self) -> None:
+        if not self._host_safetensor_handles:
+            return
+        count = len(self._host_safetensor_handles)
+        self._host_safetensor_handles.clear()
+        self._host_handle_stack.close()
+        self._host_handle_stack = ExitStack()
+        logger.info("Closed %d retained safetensors mappings", count)
+
     # ------------------------------------------------------------------
     # Index construction (called once at __init__)
     # ------------------------------------------------------------------
@@ -702,8 +932,6 @@ class PhaseLayerAutoSwitch:
 
         # Sort by name length descending so the most-specific parent wins.
         classified.sort(key=lambda t: len(t[0]), reverse=True)
-        classified_names = [n for n, _ in classified]
-
         # Assign each MX layer to its most-specific classified parent.
         for mx_name, mx_module in self._all_mx_layers:
             for parent_name, layer_type in classified:
@@ -751,11 +979,8 @@ class PhaseLayerAutoSwitch:
         return hook
 
     def _make_submodule_hook(self, layer_type: str, owned_mx: list):
-        """
-        Per-submodule hook: applies the (current_phase, layer_type) config
-        to the owned MX layers of this submodule.
-        """
-        phase_cell    = self._phase
+        """Apply the active phase/layer-type config to owned MX layers."""
+        phase_cell = self._phase
         phase_configs = self.phase_configs
 
         def hook(module, args, kwargs):
@@ -775,10 +1000,9 @@ class PhaseLayerAutoSwitch:
     def _on_phase_transition(self, new_phase: str, past_key_values=None) -> None:
         """Central handler called exactly once per real phase change.
 
-        Stage 1: mutate attention wrapper qk / av / kv_cache sub-configs.
-        Stage 2: prime LinearMXInt ``weight_width`` in config for quantized
-                 phases (FP weight phases skip this because no re-quant runs).
-        Stage 3: load/restore LinearMXInt weights according to weight_mode.
+        Stage 1: mutate attention/nonlinear wrapper sub-configs.
+        Stage 2: prime explicit Linear weight precision for quantized phases.
+        Stage 3: select or load weights according to weight_mode.
         Stage 4: in-place re-quant of existing K/V cache entries.
 
         Prefill-only Level 1 note: ``weight_mode='fp'`` means FP Linear
@@ -790,7 +1014,7 @@ class PhaseLayerAutoSwitch:
         """
         phase_overrides = self.phase_configs.get(new_phase, {})
 
-        # ── Stage 1: mutate attention wrapper sub-configs ────────────
+        # ── Stage 1: mutate attention/nonlinear wrapper configs ─────
         # Use (phase, "attn") as the single source of truth for QK, AV,
         # KV-cache, softmax, and rope sub-configs. Width/block size only
         # matter for MX paths; bypass is mirrored to wrapper attributes because
@@ -843,6 +1067,11 @@ class PhaseLayerAutoSwitch:
                 else:
                     _sync_attention_bypass_attrs(wrapper)
 
+        ffn_overrides = phase_overrides.get("ffn") or {}
+        if ffn_overrides:
+            for _, wrapper in self.mlp_wrappers:
+                _apply_expert_activation_config(wrapper, ffn_overrides)
+
         mlp_overrides = phase_overrides.get("mlp") or {}
         if mlp_overrides:
             for _, wrapper in self.mlp_wrappers:
@@ -853,19 +1082,22 @@ class PhaseLayerAutoSwitch:
             for _, wrapper in self.rmsnorm_wrappers:
                 _apply_nonlinear_config(wrapper, rms_overrides)
 
-        # ── Stage 2: prime LinearMXInt weight_width in config ─────────
+        # ── Stage 2: prime explicit quantized weight config ─────────
+        weight_keys = {
+            "weight_width",
+            "weight_exponent_width",
+            "weight_frac_width",
+            "weight_block_size",
+        }
         for info in self._submodule_info.values():
-            lt_overrides = phase_overrides.get(info["layer_type"]) or {}
-            if _normalize_weight_mode(lt_overrides) == "fp":
+            overrides = phase_overrides.get(info["layer_type"]) or {}
+            if _normalize_weight_mode(overrides) == "fp":
                 continue
-            weight_keys = {
-                "weight_width", "weight_exponent_width", "weight_frac_width", "weight_block_size"
-            }
-            explicit_weight_overrides = {k: v for k, v in lt_overrides.items() if k in weight_keys}
-            if not explicit_weight_overrides:
+            explicit = {key: overrides[key] for key in weight_keys if key in overrides}
+            if not explicit:
                 continue
-            for mx in info["owned_mx"]:
-                mx.config.update(explicit_weight_overrides)
+            for mx_module in info["owned_mx"]:
+                mx_module.config.update(explicit)
 
         # ── Stage 3: weight residency switch / reload ────────────────
         if self.weight_residency == "gpu_dual":
@@ -917,6 +1149,205 @@ class PhaseLayerAutoSwitch:
             mx.bypass = bool(cached.get("bypass_attr", False))
         self._fp_weight_active.discard(mx_id)
 
+    @staticmethod
+    def _decoder_layer_tensor_name(module_name: str) -> tuple[int, str]:
+        """Map ``model.layers.N.foo`` to its per-layer cache key."""
+        prefix = "model.layers."
+        if not module_name.startswith(prefix):
+            raise ValueError(
+                f"GPTQ layer cache restoration requires a decoder-layer module, got {module_name!r}."
+            )
+        layer_text, separator, local_name = module_name[len(prefix):].partition(".")
+        if not separator or not layer_text.isdigit() or not local_name:
+            raise ValueError(f"Malformed decoder-layer module name: {module_name!r}.")
+        return int(layer_text), local_name
+
+    def _quant_layer_path(self, layer_idx: int) -> Path:
+        if self.quant_checkpoint_dir is None:
+            raise RuntimeError("No quant_checkpoint_dir is configured.")
+        path = self.quant_checkpoint_dir / f"quantized_model_layer_{layer_idx}.safetensors"
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing GPTQ layer checkpoint for disk reload: {path}"
+            )
+        return path
+
+    def _restore_linears_from_quant_checkpoint(
+        self,
+        targets: list[tuple[str, object, dict]],
+    ) -> None:
+        """Restore fake-quantized Linear tensors without a full CPU backup."""
+        by_layer: dict[int, list[tuple[str, object, dict]]] = {}
+        for module_name, mx, overrides in targets:
+            layer_idx, local_name = self._decoder_layer_tensor_name(module_name)
+            by_layer.setdefault(layer_idx, []).append(
+                (f"{local_name}.weight", mx, overrides)
+            )
+
+        host_jobs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        restored: list[tuple[object, dict]] = []
+        for layer_idx, items in sorted(by_layer.items()):
+            with self._open_safetensor(self._quant_layer_path(layer_idx)) as handle:
+                keys = set(handle.keys())
+                for tensor_name, mx, overrides in items:
+                    if tensor_name not in keys:
+                        raise KeyError(
+                            f"GPTQ layer {layer_idx} is missing {tensor_name!r}."
+                        )
+                    quant_cpu = handle.get_tensor(tensor_name)
+                    if self._retained_file_cache_enabled:
+                        host_jobs.append((mx.weight.data, quant_cpu))
+                        restored.append((mx, overrides))
+                    else:
+                        with torch.no_grad():
+                            mx.weight.data.copy_(
+                                quant_cpu.to(mx.weight.device, dtype=mx.weight.dtype)
+                            )
+                        _apply_module_config(mx, overrides)
+                        self._fp_weight_active.discard(id(mx))
+        if host_jobs:
+            self._copy_host_cached_jobs(host_jobs, label="GPTQ Linear restore")
+            for mx, overrides in restored:
+                _apply_module_config(mx, overrides)
+                self._fp_weight_active.discard(id(mx))
+
+    @staticmethod
+    def _primary_expert_target(
+        expert_module,
+        expert_idx: int,
+        projection: str,
+    ) -> torch.Tensor:
+        split = int(expert_module.intermediate_dim)
+        if projection == "gate":
+            return expert_module.gate_up_proj[expert_idx, :split]
+        if projection == "up":
+            return expert_module.gate_up_proj[expert_idx, split:]
+        if projection == "down":
+            return expert_module.down_proj[expert_idx]
+        raise ValueError(f"Unsupported expert projection: {projection!r}.")
+
+    @classmethod
+    def _copy_primary_expert_tensor(
+        cls,
+        expert_module,
+        expert_idx: int,
+        projection: str,
+        tensor: torch.Tensor,
+    ) -> None:
+        target = cls._primary_expert_target(
+            expert_module, expert_idx, projection
+        )
+        with torch.no_grad():
+            target.copy_(tensor.to(target.device, dtype=target.dtype))
+
+    def _restore_experts_from_quant_checkpoint(self) -> None:
+        host_jobs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        restored_modules: list[object] = []
+        for expert_name, expert_module in self.expert_weight_wrappers:
+            if id(expert_module) not in self._fp_expert_active:
+                continue
+            layer_idx, local_name = self._decoder_layer_tensor_name(expert_name)
+            gate_up_name = f"{local_name}.gate_up_proj"
+            down_name = f"{local_name}.down_proj"
+            with self._open_safetensor(self._quant_layer_path(layer_idx)) as handle:
+                keys = set(handle.keys())
+                missing = [name for name in (gate_up_name, down_name) if name not in keys]
+                if missing:
+                    raise KeyError(
+                        f"GPTQ layer {layer_idx} is missing packed expert tensors {missing}."
+                    )
+                gate_up = handle.get_tensor(gate_up_name)
+                down = handle.get_tensor(down_name)
+                if self._retained_file_cache_enabled:
+                    host_jobs.extend(
+                        (
+                            (expert_module.gate_up_proj.data, gate_up),
+                            (expert_module.down_proj.data, down),
+                        )
+                    )
+                    restored_modules.append(expert_module)
+                else:
+                    with torch.no_grad():
+                        expert_module.gate_up_proj.data.copy_(
+                            gate_up.to(
+                                expert_module.gate_up_proj.device,
+                                dtype=expert_module.gate_up_proj.dtype,
+                            )
+                        )
+                        expert_module.down_proj.data.copy_(
+                            down.to(
+                                expert_module.down_proj.device,
+                                dtype=expert_module.down_proj.dtype,
+                            )
+                        )
+                    expert_module.set_use_fp_weight(False)
+                    self._fp_expert_active.discard(id(expert_module))
+        if host_jobs:
+            self._copy_host_cached_jobs(host_jobs, label="GPTQ expert restore")
+            for expert_module in restored_modules:
+                expert_module.set_use_fp_weight(False)
+                self._fp_expert_active.discard(id(expert_module))
+
+    def _load_fp_experts_from_model_checkpoint(self) -> None:
+        by_shard: dict[str, list[tuple[str, object, int, str]]] = {}
+        for expert_name, expert_module in self.expert_weight_wrappers:
+            if id(expert_module) in self._fp_expert_active:
+                continue
+            for expert_idx in range(int(expert_module.num_experts)):
+                for projection in ("gate", "up", "down"):
+                    tensor_name = f"{expert_name}.{expert_idx}.{projection}_proj.weight"
+                    shard_path = None if self._shard_map is None else self._shard_map.get(tensor_name)
+                    if shard_path is None:
+                        raise ValueError(
+                            f"Missing checkpoint tensor {tensor_name!r}; cannot enter FP decode."
+                        )
+                    by_shard.setdefault(shard_path, []).append(
+                        (tensor_name, expert_module, expert_idx, projection)
+                    )
+
+        host_jobs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        loaded_modules: set[object] = set()
+        for shard_path, items in by_shard.items():
+            with self._open_safetensor(shard_path) as handle:
+                keys = set(handle.keys())
+                for tensor_name, expert_module, expert_idx, projection in items:
+                    if tensor_name not in keys:
+                        raise KeyError(
+                            f"Checkpoint shard {shard_path} is missing {tensor_name!r}."
+                        )
+                    source = handle.get_tensor(tensor_name)
+                    if self._retained_file_cache_enabled:
+                        host_jobs.append(
+                            (
+                                self._primary_expert_target(
+                                    expert_module, expert_idx, projection
+                                ),
+                                source,
+                            )
+                        )
+                        loaded_modules.add(expert_module)
+                    else:
+                        self._copy_primary_expert_tensor(
+                            expert_module,
+                            expert_idx,
+                            projection,
+                            source,
+                        )
+                        self._fp_expert_active.add(id(expert_module))
+        if host_jobs:
+            self._copy_host_cached_jobs(host_jobs, label="FP expert load")
+            self._fp_expert_active.update(id(module) for module in loaded_modules)
+
+    def _reload_expert_weights_for_phase(self, phase: str) -> None:
+        if not self._fp_expert_weight_requested:
+            return
+        phase_overrides = self.phase_configs.get(phase, {})
+        use_fp = _normalize_weight_mode(phase_overrides.get("ffn") or {}) == "fp"
+        if use_fp:
+            self._load_fp_experts_from_model_checkpoint()
+        elif self._fp_expert_active:
+            self._restore_experts_from_quant_checkpoint()
+
     def _reload_weights_for_phase(self, phase: str) -> None:
         """Load or restore Linear weights for the requested phase.
 
@@ -930,27 +1361,29 @@ class PhaseLayerAutoSwitch:
         avoids ``load_state_dict`` because that would either re-quantize the
         weight or skip GPTQ modules without guaranteeing activation bypass.
         """
-        from safetensors import safe_open
-
+        reload_started = time.perf_counter()
         phase_overrides = self.phase_configs.get(phase, {})
 
         # Group target weight tensors by shard path for I/O locality.
         by_shard: dict[str, list[tuple[str, object, str]]] = {}
+        quant_checkpoint_targets: list[tuple[str, object, dict]] = []
         for info in self._submodule_info.values():
             lt_overrides = phase_overrides.get(info["layer_type"]) or {}
             mode = _normalize_weight_mode(lt_overrides)
-            needs_weight = mode == "fp" or any(
-                k in lt_overrides
-                for k in ("weight_width", "weight_exponent_width", "weight_frac_width")
-            )
-            if not needs_weight:
-                continue
             for mx in info["owned_mx"]:
                 if mode == "quantized" and id(mx) in self._fp_weight_active:
-                    self._restore_quantized_weight(mx)
-                    # Exact GPTQ/quantized state is back; do not fall through
-                    # to disk reload, which would create a fresh quantization
-                    # and lose the cached GPTQ tensor.
+                    mx_name = self._mx_name_by_id.get(id(mx))
+                    if self.quant_checkpoint_dir is not None and mx_name is not None:
+                        quant_checkpoint_targets.append((mx_name, mx, lt_overrides))
+                    else:
+                        self._restore_quantized_weight(mx)
+                    continue
+
+                needs_weight = mode == "fp" or any(
+                    k in lt_overrides
+                    for k in ("weight_width", "weight_exponent_width", "weight_frac_width")
+                )
+                if not needs_weight:
                     continue
 
                 mx_name = self._mx_name_by_id.get(id(mx))
@@ -967,38 +1400,44 @@ class PhaseLayerAutoSwitch:
                     continue
                 by_shard.setdefault(shard_path, []).append((tensor_name, mx, mode))
 
-        if not by_shard:
-            return
-
+        host_jobs: list[tuple[torch.Tensor, torch.Tensor]] = []
+        host_fp_modules: list[object] = []
         for shard_path, items in by_shard.items():
-            with safe_open(shard_path, framework="pt") as f:
+            with self._open_safetensor(shard_path) as f:
                 shard_keys = set(f.keys())
                 for tensor_name, mx, mode in items:
                     fp_cpu = f.get_tensor(tensor_name)
                     if mode == "fp":
-                        self._cache_quantized_weight(mx)
-                        with torch.no_grad():
-                            mx.weight.data.copy_(
-                                fp_cpu.to(mx.weight.device, dtype=mx.weight.dtype)
-                            )
-                            bias_name = tensor_name[:-len(".weight")] + ".bias"
-                            if getattr(mx, "bias", None) is not None:
-                                bias_cpu = None
-                                if bias_name in shard_keys:
-                                    bias_cpu = f.get_tensor(bias_name)
-                                elif self._shard_map is not None:
-                                    bias_shard = self._shard_map.get(bias_name)
-                                    if bias_shard is not None:
-                                        with safe_open(bias_shard, framework="pt") as bf:
-                                            bias_cpu = bf.get_tensor(bias_name)
+                        if self.quant_checkpoint_dir is None:
+                            self._cache_quantized_weight(mx)
+                        bias_name = tensor_name[:-len(".weight")] + ".bias"
+                        bias_cpu = None
+                        if getattr(mx, "bias", None) is not None:
+                            if bias_name in shard_keys:
+                                bias_cpu = f.get_tensor(bias_name)
+                            elif self._shard_map is not None:
+                                bias_shard = self._shard_map.get(bias_name)
+                                if bias_shard is not None:
+                                    with self._open_safetensor(bias_shard) as bf:
+                                        bias_cpu = bf.get_tensor(bias_name)
+                        if self._retained_file_cache_enabled:
+                            host_jobs.append((mx.weight.data, fp_cpu))
+                            if bias_cpu is not None:
+                                host_jobs.append((mx.bias.data, bias_cpu))
+                            host_fp_modules.append(mx)
+                        else:
+                            with torch.no_grad():
+                                mx.weight.data.copy_(
+                                    fp_cpu.to(mx.weight.device, dtype=mx.weight.dtype)
+                                )
                                 if bias_cpu is not None:
                                     mx.bias.data.copy_(
                                         bias_cpu.to(mx.bias.device, dtype=mx.bias.dtype)
                                     )
-                        mx.config["bypass"] = True
-                        if hasattr(mx, "bypass"):
-                            mx.bypass = True
-                        self._fp_weight_active.add(id(mx))
+                            mx.config["bypass"] = True
+                            if hasattr(mx, "bypass"):
+                                mx.bypass = True
+                            self._fp_weight_active.add(id(mx))
                     else:
                         local_sd = {
                             "weight": fp_cpu.to(
@@ -1008,6 +1447,23 @@ class PhaseLayerAutoSwitch:
                         # LinearMXInt/LinearMXFP.load_state_dict re-runs the
                         # module's own weight quantizer using Stage 2's config.
                         mx.load_state_dict(local_sd, strict=False)
+
+        if host_jobs:
+            self._copy_host_cached_jobs(host_jobs, label="FP Linear load")
+            for mx in host_fp_modules:
+                mx.config["bypass"] = True
+                if hasattr(mx, "bypass"):
+                    mx.bypass = True
+                self._fp_weight_active.add(id(mx))
+        if quant_checkpoint_targets:
+            self._restore_linears_from_quant_checkpoint(quant_checkpoint_targets)
+        self._reload_expert_weights_for_phase(phase)
+        logger.info(
+            "Phase %s weight reload via %s completed in %.1fs",
+            phase,
+            self.weight_residency,
+            time.perf_counter() - reload_started,
+        )
 
     def _gpu_dual_target_modules(self) -> dict[int, tuple[str, object]]:
         """Return MX modules that need an original FP backup in gpu_dual mode."""
@@ -1062,6 +1518,76 @@ class PhaseLayerAutoSwitch:
                     bias_cpu = f.get_tensor(bias_name) if bias_name in shard_keys else None
                     mx.set_fp_weight_backup(fp_cpu, bias_cpu)
 
+        if not self._fp_expert_weight_requested:
+            logger.info(
+                "Materialized gpu_dual FP backups for %d Linear weights; no packed experts requested",
+                len(targets),
+            )
+            return
+
+        expert_by_shard: dict[str, list[tuple[str, object, int, str]]] = {}
+        expected_tensors = 0
+        for expert_name, expert_module in self.expert_weight_wrappers:
+            for expert_idx in range(int(expert_module.num_experts)):
+                for projection in ("gate", "up", "down"):
+                    tensor_name = (
+                        f"{expert_name}.{expert_idx}.{projection}_proj.weight"
+                    )
+                    shard_path = None if self._shard_map is None else self._shard_map.get(tensor_name)
+                    if shard_path is None:
+                        raise ValueError(
+                            f"Missing checkpoint tensor {tensor_name!r}; cannot materialize "
+                            "gpu_dual FP expert backup."
+                        )
+                    expert_by_shard.setdefault(shard_path, []).append(
+                        (tensor_name, expert_module, expert_idx, projection)
+                    )
+                    expected_tensors += 1
+
+        # Validate the complete source map before committing hundreds of GiB
+        # of GPU memory to packed FP expert buffers.
+        for _, expert_module in self.expert_weight_wrappers:
+            expert_module.allocate_fp_weight_backup()
+
+        loaded_tensors = 0
+        for shard_position, (shard_path, items) in enumerate(expert_by_shard.items(), start=1):
+            with safe_open(shard_path, framework="pt") as f:
+                shard_keys = set(f.keys())
+                for tensor_name, expert_module, expert_idx, projection in items:
+                    if tensor_name not in shard_keys:
+                        raise ValueError(
+                            f"Checkpoint index maps {tensor_name!r} to {shard_path}, "
+                            "but the tensor is absent from that shard."
+                        )
+                    fp_cpu = f.get_tensor(tensor_name)
+                    expert_module.copy_fp_expert_tensor(
+                        expert_idx,
+                        projection,
+                        fp_cpu,
+                    )
+                    del fp_cpu
+                    loaded_tensors += 1
+            if shard_position == 1 or shard_position == len(expert_by_shard) or shard_position % 10 == 0:
+                logger.info(
+                    "Materialized gpu_dual FP experts from shard %d/%d (%d/%d tensors)",
+                    shard_position,
+                    len(expert_by_shard),
+                    loaded_tensors,
+                    expected_tensors,
+                )
+
+        if loaded_tensors != expected_tensors:
+            raise RuntimeError(
+                f"Incomplete FP expert backup: loaded {loaded_tensors}/{expected_tensors} tensors."
+            )
+        for _, expert_module in self.expert_weight_wrappers:
+            expert_module.mark_fp_weight_ready()
+        logger.info(
+            "Materialized gpu_dual FP backups for %d Linear weights and %d packed expert modules",
+            len(targets),
+            len(self.expert_weight_wrappers),
+        )
+
     def _select_gpu_dual_weight_phase(self, phase: str) -> None:
         """Select quantized or FP resident weights for this phase."""
         phase_overrides = self.phase_configs.get(phase, {})
@@ -1071,6 +1597,9 @@ class PhaseLayerAutoSwitch:
             for mx in info["owned_mx"]:
                 if hasattr(mx, "set_use_fp_weight"):
                     mx.set_use_fp_weight(use_fp)
+        use_fp_experts = _normalize_weight_mode(phase_overrides.get("ffn") or {}) == "fp"
+        for _, expert_module in self.expert_weight_wrappers:
+            expert_module.set_use_fp_weight(use_fp_experts)
 
     def _requant_kv_cache(self, past_key_values, new_phase: str) -> None:
         """In-place fake-quant of existing K/V entries in ``past_key_values``
@@ -1133,6 +1662,20 @@ class PhaseLayerAutoSwitch:
     # Public API
     # ------------------------------------------------------------------
 
+    def apply_phase(
+        self,
+        phase: str,
+        phase_config: dict[str, dict] | None = None,
+        past_key_values=None,
+    ) -> None:
+        """Apply a phase and optionally replace its runtime config."""
+        if phase_config is not None:
+            self.phase_configs[phase] = phase_config
+        elif phase not in self.phase_configs:
+            raise KeyError(f"Unknown phase {phase!r}.")
+        self._on_phase_transition(phase, past_key_values)
+        self._phase[0] = phase
+
     def enable(self) -> "PhaseLayerAutoSwitch":
         """Register all hooks and initialise layers to the prefill config."""
         if self._hook_handles:
@@ -1146,25 +1689,22 @@ class PhaseLayerAutoSwitch:
         )
         self._hook_handles.append(h)
 
-        # Per-submodule hooks.
+        # Per-submodule hooks preserve the established runtime behavior.
         for info in self._submodule_info.values():
             if not info["owned_mx"]:
-                continue  # classified module but no MX children — skip
+                continue
             h = info["module"].register_forward_pre_hook(
                 self._make_submodule_hook(info["layer_type"], info["owned_mx"]),
                 with_kwargs=True,
             )
             self._hook_handles.append(h)
 
-        # Initialise everything to prefill config.
+        # Initialise Linear and nonlinear wrappers to prefill.
         self._phase[0] = "prefill"
         for info in self._submodule_info.values():
             overrides = self.phase_configs.get("prefill", {}).get(info["layer_type"])
             if overrides:
-                _apply_config([(None, m) for m in info["owned_mx"]], overrides)
-        # Also initialise attention, MLP, and RMSNorm wrapper configs.  The
-        # per-submodule hooks above only touch Linear MX children during
-        # forward; nonlinear wrapper state must be set once up front.
+                _apply_config([(None, module) for module in info["owned_mx"]], overrides)
         self._on_phase_transition("prefill", None)
 
         return self
@@ -1184,11 +1724,19 @@ class PhaseLayerAutoSwitch:
             h.remove()
         self._hook_handles.clear()
 
+        if (
+            self.weight_residency in {"disk_reload", "host_cached"}
+            and (self._fp_weight_active or self._fp_expert_active)
+        ):
+            self._reload_weights_for_phase("prefill")
+
         for _, module in self._all_mx_layers:
             if id(module) in self._fp_weight_active:
                 self._restore_quantized_weight(module)
             if hasattr(module, "set_use_fp_weight"):
                 module.set_use_fp_weight(False)
+        for _, expert_module in self.expert_weight_wrappers:
+            expert_module.set_use_fp_weight(False)
 
         for name, module in self._all_mx_layers:
             original = self._original_configs.get(name, {})
@@ -1217,6 +1765,9 @@ class PhaseLayerAutoSwitch:
         for name, wrapper in self.mlp_wrappers:
             wrapper.q_config.clear()
             wrapper.q_config.update(self._original_mlp_configs.get(name, {}))
+            if hasattr(wrapper, "act_config"):
+                wrapper.act_config.clear()
+                wrapper.act_config.update(self._original_mlp_act_configs.get(name, {}))
             if hasattr(wrapper, "bypass"):
                 wrapper.bypass = bool(wrapper.q_config.get("bypass", False))
 
@@ -1226,6 +1777,7 @@ class PhaseLayerAutoSwitch:
             _rebuild_rmsnorm_minifloat_quantizers(wrapper)
 
         self._phase[0] = "prefill"
+        self._close_host_cached_sources()
 
     def summary(self) -> str:
         """Human-readable table of the active phase config mapping."""
@@ -1304,7 +1856,17 @@ class PhaseLayerAutoSwitch:
         )
         lines.append(
             f"\n  Hooked submodules: {n_attn} attn, {n_ffn} ffn; "
-            f"nonlinear wrappers: {len(self.mlp_wrappers)} mlp, {len(self.rmsnorm_wrappers)} rms_norm"
+            f"nonlinear wrappers: {len(self.mlp_wrappers)} mlp, {len(self.rmsnorm_wrappers)} rms_norm; "
+            f"packed expert weight wrappers: {len(self.expert_weight_wrappers)}"
+        )
+        effective_io = (
+            "retained_mmap_page_cache"
+            if self._retained_file_cache_enabled
+            else self.weight_residency
+        )
+        lines.append(
+            f"  Weight residency: requested={self.weight_residency}, "
+            f"effective_io={effective_io}"
         )
         return "\n".join(lines)
 

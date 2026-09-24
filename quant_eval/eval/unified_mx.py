@@ -9,6 +9,10 @@ module replacement flow for weight preparation.
 
 from __future__ import annotations
 
+import gc
+import logging
+import threading
+import traceback
 from copy import deepcopy
 from functools import partial
 from typing import Optional, Tuple
@@ -45,6 +49,133 @@ from chop.nn.quantizers import mxint_quantizer, mxfp_quantizer
 from chop.nn.quantizers._minifloat_mx import MinifloatMeta, minifloat_quantizer_sim
 from chop.nn.quantized.functional.rope import rope_minifloat
 from chop.nn.quantized.functional.silu import silu_minifloat
+
+
+logger = logging.getLogger(__name__)
+
+ATTENTION_MEMORY_MODES = ("full", "query_chunked")
+
+
+class AttentionQueryChunkController:
+    """Share query-chunk sizing and OOM fallback state across attention layers."""
+
+    def __init__(
+        self,
+        *,
+        mode: str = "full",
+        chunk_size: int = 512,
+        min_chunk_size: int = 128,
+        oom_fallback: bool = True,
+    ) -> None:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in ATTENTION_MEMORY_MODES:
+            raise ValueError(
+                f"attention memory mode must be one of {ATTENTION_MEMORY_MODES}, "
+                f"got {mode!r}."
+            )
+        if int(chunk_size) <= 0 or int(min_chunk_size) <= 0:
+            raise ValueError("Attention query chunk sizes must be positive integers.")
+        if int(min_chunk_size) > int(chunk_size):
+            raise ValueError(
+                "attention_query_chunk_min_size cannot exceed "
+                "attention_query_chunk_size."
+            )
+        self.mode = normalized_mode
+        self.initial_chunk_size = int(chunk_size)
+        self.min_chunk_size = int(min_chunk_size)
+        self.oom_fallback = bool(oom_fallback)
+        self._effective_chunk_sizes: dict[str, int] = {}
+        self._calls = 0
+        self._chunked_calls = 0
+        self._oom_count = 0
+        self._fallback_count = 0
+        self._max_query_length = 0
+        self._max_materialized_query_chunk = 0
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _device_key(device: torch.device | str) -> str:
+        return str(torch.device(device))
+
+    def effective_chunk_size(self, device: torch.device | str) -> int:
+        key = self._device_key(device)
+        with self._lock:
+            return self._effective_chunk_sizes.get(key, self.initial_chunk_size)
+
+    def should_use_manual_core(self, query: Tensor) -> bool:
+        return self.mode == "query_chunked" and int(query.shape[-2]) > self.min_chunk_size
+
+    def set_mode(self, mode: str) -> None:
+        normalized_mode = str(mode).strip().lower()
+        if normalized_mode not in ATTENTION_MEMORY_MODES:
+            raise ValueError(
+                f"attention memory mode must be one of {ATTENTION_MEMORY_MODES}, "
+                f"got {mode!r}."
+            )
+        with self._lock:
+            self.mode = normalized_mode
+
+    def record_call(self, *, query_length: int, materialized_chunk: int) -> None:
+        with self._lock:
+            self._calls += 1
+            self._chunked_calls += int(materialized_chunk < query_length)
+            self._max_query_length = max(self._max_query_length, int(query_length))
+            self._max_materialized_query_chunk = max(
+                self._max_materialized_query_chunk, int(materialized_chunk)
+            )
+
+    def reduce_after_oom(
+        self,
+        device: torch.device | str,
+        current_chunk_size: int,
+    ) -> int | None:
+        key = self._device_key(device)
+        current = int(current_chunk_size)
+        with self._lock:
+            self._oom_count += 1
+            if not self.oom_fallback or current <= self.min_chunk_size:
+                return None
+            reduced = max(self.min_chunk_size, current // 2)
+            if reduced >= current:
+                return None
+            self._effective_chunk_sizes[key] = reduced
+            self._fallback_count += 1
+            return reduced
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "mode": self.mode,
+                "initial_chunk_size": self.initial_chunk_size,
+                "min_chunk_size": self.min_chunk_size,
+                "oom_fallback": self.oom_fallback,
+                "effective_chunk_sizes": dict(self._effective_chunk_sizes),
+                "calls": self._calls,
+                "chunked_calls": self._chunked_calls,
+                "oom_count": self._oom_count,
+                "fallback_count": self._fallback_count,
+                "max_query_length": self._max_query_length,
+                "max_materialized_query_chunk": self._max_materialized_query_chunk,
+            }
+
+
+def get_attention_memory_stats(model: nn.Module) -> dict:
+    controller = getattr(model, "_plena_attention_query_chunk_controller", None)
+    if isinstance(controller, AttentionQueryChunkController):
+        return controller.snapshot()
+    return {
+        "mode": "full",
+        "initial_chunk_size": None,
+        "min_chunk_size": None,
+        "oom_fallback": False,
+        "effective_chunk_sizes": {},
+        "calls": 0,
+        "chunked_calls": 0,
+        "oom_count": 0,
+        "fallback_count": 0,
+        "max_query_length": 0,
+        "max_materialized_query_chunk": 0,
+    }
 
 
 def _minifloat_quantize(x: Tensor, config: dict) -> Tensor:
@@ -192,7 +323,164 @@ def _eager_attention_forward_unified(
     return attn_output, attn_weights
 
 
-def _eager_qwen3_attention_forward_unified(
+def _slice_attention_mask_for_query_chunk(
+    attention_mask: Optional[Tensor],
+    *,
+    query_start: int,
+    query_end: int,
+    query_length: int,
+    key_length: int,
+) -> Optional[Tensor]:
+    if attention_mask is None:
+        return None
+    mask = attention_mask[..., :key_length]
+    if mask.ndim < 3:
+        return mask
+    mask_query_length = int(mask.shape[-2])
+    if mask_query_length == 1:
+        return mask
+    if mask_query_length == query_length or mask_query_length >= query_end:
+        return mask[..., query_start:query_end, :]
+    raise ValueError(
+        "Attention mask query dimension is incompatible with query chunking: "
+        f"mask={tuple(mask.shape)}, query_length={query_length}, "
+        f"chunk=[{query_start}:{query_end}]."
+    )
+
+
+def _qwen3_attention_chunk(
+    module,
+    query: Tensor,
+    key_states: Tensor,
+    value_states: Tensor,
+    attention_mask: Optional[Tensor],
+    *,
+    scaling: float,
+    dropout: float,
+    av_bypass: bool,
+    av_config: dict | None,
+    softmax_bypass: bool,
+    softmax_config: dict | None,
+) -> tuple[Tensor, Tensor]:
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if not softmax_bypass:
+        attn_weights = _softmax_minifloat_preserve_mask(
+            attn_weights, attention_mask, softmax_config, dim=-1
+        )
+    else:
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(
+            attn_weights.dtype
+        )
+
+    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
+    if not av_bypass:
+        attn_weights = quantize_mx(
+            attn_weights, av_config, block_dim=-1, prefix="data_in"
+        )
+    return torch.matmul(attn_weights, value_states), attn_weights
+
+
+def _qwen3_attention_with_query_chunks(
+    module,
+    query: Tensor,
+    key_states: Tensor,
+    value_states: Tensor,
+    attention_mask: Optional[Tensor],
+    *,
+    scaling: float,
+    dropout: float,
+    av_bypass: bool,
+    av_config: dict | None,
+    softmax_bypass: bool,
+    softmax_config: dict | None,
+    chunk_size: int | None,
+    output_attentions: bool,
+) -> tuple[Tensor, Optional[Tensor], int]:
+    query_length = int(query.shape[-2])
+    key_length = int(key_states.shape[-2])
+    if chunk_size is None or query_length <= int(chunk_size):
+        mask = _slice_attention_mask_for_query_chunk(
+            attention_mask,
+            query_start=0,
+            query_end=query_length,
+            query_length=query_length,
+            key_length=key_length,
+        )
+        output, weights = _qwen3_attention_chunk(
+            module,
+            query,
+            key_states,
+            value_states,
+            mask,
+            scaling=scaling,
+            dropout=dropout,
+            av_bypass=av_bypass,
+            av_config=av_config,
+            softmax_bypass=softmax_bypass,
+            softmax_config=softmax_config,
+        )
+        return output.transpose(1, 2).contiguous(), weights, query_length
+
+    if module.training or dropout:
+        raise RuntimeError(
+            "Query-chunked attention is inference-only; call model.eval() and "
+            "use attention dropout 0."
+        )
+    if output_attentions:
+        raise RuntimeError(
+            "output_attentions=True is incompatible with query-chunked "
+            "attention because it would reconstruct the full QxK tensor."
+        )
+
+    outputs = []
+    actual_chunk_size = min(query_length, int(chunk_size))
+    for start in range(0, query_length, actual_chunk_size):
+        end = min(query_length, start + actual_chunk_size)
+        mask = _slice_attention_mask_for_query_chunk(
+            attention_mask,
+            query_start=start,
+            query_end=end,
+            query_length=query_length,
+            key_length=key_length,
+        )
+        chunk_output, chunk_weights = _qwen3_attention_chunk(
+            module,
+            query[..., start:end, :],
+            key_states,
+            value_states,
+            mask,
+            scaling=scaling,
+            dropout=dropout,
+            av_bypass=av_bypass,
+            av_config=av_config,
+            softmax_bypass=softmax_bypass,
+            softmax_config=softmax_config,
+        )
+        outputs.append(chunk_output)
+        del chunk_weights, chunk_output, mask
+    output = torch.cat(outputs, dim=-2)
+    return output.transpose(1, 2).contiguous(), None, actual_chunk_size
+
+
+def _release_attention_oom_memory(device: torch.device, error: BaseException) -> None:
+    if error.__traceback__ is not None:
+        traceback.clear_frames(error.__traceback__)
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(error).lower()
+    return "cuda" in message and "out of memory" in message
+
+
+def _eager_qwen3_attention_forward_common(
     module,
     query: Tensor,
     key: Tensor,
@@ -206,31 +494,105 @@ def _eager_qwen3_attention_forward_unified(
     av_config: dict | None = None,
     softmax_bypass: bool = False,
     softmax_config: dict | None = None,
+    repeat_kv_fn=qwen3_repeat_kv,
+    attention_chunk_controller: AttentionQueryChunkController | None = None,
+    output_attentions: bool = False,
     **kwargs,
 ):
-    key_states = qwen3_repeat_kv(key, module.num_key_value_groups)
-    value_states = qwen3_repeat_kv(value, module.num_key_value_groups)
+    key_states = repeat_kv_fn(key, module.num_key_value_groups)
+    value_states = repeat_kv_fn(value, module.num_key_value_groups)
 
     if not qk_bypass:
         query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
 
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    controller = attention_chunk_controller
+    if controller is None or controller.mode == "full":
+        attn_output, attn_weights, _ = _qwen3_attention_with_query_chunks(
+            module,
+            query,
+            key_states,
+            value_states,
+            attention_mask,
+            scaling=scaling,
+            dropout=dropout,
+            av_bypass=av_bypass,
+            av_config=av_config,
+            softmax_bypass=softmax_bypass,
+            softmax_config=softmax_config,
+            chunk_size=None,
+            output_attentions=output_attentions,
+        )
+        return attn_output, attn_weights
 
-    if not softmax_bypass:
-        attn_weights = _softmax_minifloat_preserve_mask(attn_weights, attention_mask, softmax_config, dim=-1)
-    else:
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
-        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
+    query_length = int(query.shape[-2])
+    chunk_size = controller.effective_chunk_size(query.device)
+    while True:
+        try:
+            attn_output, attn_weights, materialized_chunk = (
+                _qwen3_attention_with_query_chunks(
+                    module,
+                    query,
+                    key_states,
+                    value_states,
+                    attention_mask,
+                    scaling=scaling,
+                    dropout=dropout,
+                    av_bypass=av_bypass,
+                    av_config=av_config,
+                    softmax_bypass=softmax_bypass,
+                    softmax_config=softmax_config,
+                    chunk_size=chunk_size,
+                    output_attentions=output_attentions,
+                )
+            )
+            controller.record_call(
+                query_length=query_length,
+                materialized_chunk=materialized_chunk,
+            )
+            return attn_output, attn_weights
+        except Exception as error:
+            if not _is_cuda_oom(error):
+                raise
+            reduced_chunk_size = controller.reduce_after_oom(
+                query.device, chunk_size
+            )
+            if reduced_chunk_size is None:
+                raise
+            if output_attentions and query_length > reduced_chunk_size:
+                raise RuntimeError(
+                    "CUDA OOM requires query chunking, but "
+                    "output_attentions=True requests the full QxK tensor."
+                ) from error
+            logger.warning(
+                "CUDA OOM in Qwen attention on %s at query chunk %d; "
+                "retrying locally with chunk %d.",
+                query.device,
+                chunk_size,
+                reduced_chunk_size,
+            )
+            _release_attention_oom_memory(query.device, error)
+            chunk_size = reduced_chunk_size
 
-    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
 
-    if not av_bypass:
-        attn_weights = quantize_mx(attn_weights, av_config, block_dim=-1, prefix="data_in")
-
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
+def _eager_qwen3_attention_forward_unified(
+    module,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    attention_mask: Optional[Tensor],
+    scaling: float,
+    **kwargs,
+):
+    return _eager_qwen3_attention_forward_common(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        repeat_kv_fn=qwen3_repeat_kv,
+        **kwargs,
+    )
 
 
 def _eager_qwen3_moe_attention_forward_unified(
@@ -240,38 +602,18 @@ def _eager_qwen3_moe_attention_forward_unified(
     value: Tensor,
     attention_mask: Optional[Tensor],
     scaling: float,
-    dropout: float = 0.0,
-    qk_bypass: bool = False,
-    qk_config: dict | None = None,
-    av_bypass: bool = False,
-    av_config: dict | None = None,
-    softmax_bypass: bool = False,
-    softmax_config: dict | None = None,
     **kwargs,
 ):
-    key_states = qwen3_moe_repeat_kv(key, module.num_key_value_groups)
-    value_states = qwen3_moe_repeat_kv(value, module.num_key_value_groups)
-
-    if not qk_bypass:
-        query = quantize_mx(query, qk_config, block_dim=-1, prefix="data_in")
-
-    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
-
-    if not softmax_bypass:
-        attn_weights = _softmax_minifloat_preserve_mask(attn_weights, attention_mask, softmax_config, dim=-1)
-    else:
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
-        attn_weights = F.softmax(attn_weights.to(torch.float32), dim=-1).to(attn_weights.dtype)
-
-    attn_weights = F.dropout(attn_weights, p=dropout, training=module.training)
-
-    if not av_bypass:
-        attn_weights = quantize_mx(attn_weights, av_config, block_dim=-1, prefix="data_in")
-
-    attn_output = torch.matmul(attn_weights, value_states)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, attn_weights
+    return _eager_qwen3_attention_forward_common(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        repeat_kv_fn=qwen3_moe_repeat_kv,
+        **kwargs,
+    )
 
 
 def _phase_attn_config_to_q_config(config: dict | None) -> dict:
@@ -498,7 +840,13 @@ class LlamaAttentionMXUnified(LlamaAttention):
 class Qwen3AttentionMXUnified(Qwen3Attention):
     """Qwen3 attention wrapper with independent ACT/KV MX families."""
 
-    def __init__(self, config, layer_idx, q_config: dict | None = None):
+    def __init__(
+        self,
+        config,
+        layer_idx,
+        q_config: dict | None = None,
+        attention_chunk_controller: AttentionQueryChunkController | None = None,
+    ):
         super().__init__(config, layer_idx)
         q_config = q_config or {}
         self.qk_config = q_config.get("qk_matmul", {})
@@ -511,9 +859,15 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
         self.rope_bypass = bool(self.rope_config.get("bypass", False))
         self.softmax_bypass = bool(self.softmax_config.get("bypass", False))
         self.kv_cache_bypass = bool(self.kv_cache_config.get("bypass", False))
+        self.attention_chunk_controller = attention_chunk_controller
 
     @classmethod
-    def from_attention(cls, attention: Qwen3Attention, q_config: dict | None = None) -> "Qwen3AttentionMXUnified":
+    def from_attention(
+        cls,
+        attention: Qwen3Attention,
+        q_config: dict | None = None,
+        attention_chunk_controller: AttentionQueryChunkController | None = None,
+    ) -> "Qwen3AttentionMXUnified":
         cfg = q_config or {
             "qk_matmul": deepcopy(getattr(attention, "qk_config", {})),
             "av_matmul": deepcopy(getattr(attention, "av_config", {})),
@@ -522,7 +876,12 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
             "rope": deepcopy(getattr(attention, "rope_config", {})),
         }
         with torch.device("meta"):
-            new = cls(attention.config, attention.layer_idx, cfg)
+            new = cls(
+                attention.config,
+                attention.layer_idx,
+                cfg,
+                attention_chunk_controller=attention_chunk_controller,
+            )
         new.q_proj = attention.q_proj
         new.k_proj = attention.k_proj
         new.v_proj = attention.v_proj
@@ -559,7 +918,16 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
                 value_states = quantize_mx(value_states, self.kv_cache_config, block_dim=-1, prefix="data_in")
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        if self.qk_bypass and self.av_bypass and self.softmax_bypass:
+        use_chunked_manual_core = bool(
+            self.attention_chunk_controller is not None
+            and self.attention_chunk_controller.should_use_manual_core(query_states)
+        )
+        if (
+            self.qk_bypass
+            and self.av_bypass
+            and self.softmax_bypass
+            and not use_chunked_manual_core
+        ):
             attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
                 self.config._attn_implementation,
                 _qwen3_eager_attention_forward,
@@ -590,6 +958,7 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
                 av_config=self.av_config,
                 softmax_bypass=self.softmax_bypass,
                 softmax_config=self.softmax_config,
+                attention_chunk_controller=self.attention_chunk_controller,
                 sliding_window=self.sliding_window,
                 **kwargs,
             )
@@ -602,7 +971,13 @@ class Qwen3AttentionMXUnified(Qwen3Attention):
 class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
     """Qwen3-MoE attention wrapper with independent ACT/KV MX families."""
 
-    def __init__(self, config, layer_idx, q_config: dict | None = None):
+    def __init__(
+        self,
+        config,
+        layer_idx,
+        q_config: dict | None = None,
+        attention_chunk_controller: AttentionQueryChunkController | None = None,
+    ):
         super().__init__(config, layer_idx)
         q_config = q_config or {}
         self.qk_config = q_config.get("qk_matmul", {})
@@ -615,9 +990,15 @@ class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
         self.rope_bypass = bool(self.rope_config.get("bypass", False))
         self.softmax_bypass = bool(self.softmax_config.get("bypass", False))
         self.kv_cache_bypass = bool(self.kv_cache_config.get("bypass", False))
+        self.attention_chunk_controller = attention_chunk_controller
 
     @classmethod
-    def from_attention(cls, attention: Qwen3MoeAttention, q_config: dict | None = None) -> "Qwen3MoeAttentionMXUnified":
+    def from_attention(
+        cls,
+        attention: Qwen3MoeAttention,
+        q_config: dict | None = None,
+        attention_chunk_controller: AttentionQueryChunkController | None = None,
+    ) -> "Qwen3MoeAttentionMXUnified":
         cfg = q_config or {
             "qk_matmul": deepcopy(getattr(attention, "qk_config", {})),
             "av_matmul": deepcopy(getattr(attention, "av_config", {})),
@@ -626,7 +1007,12 @@ class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
             "rope": deepcopy(getattr(attention, "rope_config", {})),
         }
         with torch.device("meta"):
-            new = cls(attention.config, attention.layer_idx, cfg)
+            new = cls(
+                attention.config,
+                attention.layer_idx,
+                cfg,
+                attention_chunk_controller=attention_chunk_controller,
+            )
         new.q_proj = attention.q_proj
         new.k_proj = attention.k_proj
         new.v_proj = attention.v_proj
@@ -663,7 +1049,16 @@ class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
                 value_states = quantize_mx(value_states, self.kv_cache_config, block_dim=-1, prefix="data_in")
             key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
-        if self.qk_bypass and self.av_bypass and self.softmax_bypass:
+        use_chunked_manual_core = bool(
+            self.attention_chunk_controller is not None
+            and self.attention_chunk_controller.should_use_manual_core(query_states)
+        )
+        if (
+            self.qk_bypass
+            and self.av_bypass
+            and self.softmax_bypass
+            and not use_chunked_manual_core
+        ):
             attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
                 self.config._attn_implementation,
                 _qwen3_moe_eager_attention_forward,
@@ -694,6 +1089,7 @@ class Qwen3MoeAttentionMXUnified(Qwen3MoeAttention):
                 av_config=self.av_config,
                 softmax_bypass=self.softmax_bypass,
                 softmax_config=self.softmax_config,
+                attention_chunk_controller=self.attention_chunk_controller,
                 sliding_window=self.sliding_window,
                 **kwargs,
             )
@@ -749,8 +1145,24 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
     def __init__(self, config, q_config: dict | None = None):
         super().__init__(config)
         self.config = config
-        self.q_config = q_config or {}
-        self.bypass = bool(self.q_config.get("bypass", False))
+        raw_config = deepcopy(q_config or {})
+        if "act" in raw_config or "nonlinear" in raw_config:
+            self.act_config = deepcopy(raw_config.get("act", {}))
+            self.nonlinear_config = deepcopy(raw_config.get("nonlinear", {}))
+        else:
+            # Backward compatibility for callers that used one flat config.
+            # MXINT ACT and minifloat SiLU keys can coexist there, but MXFP ACT
+            # and FP_SETTING share data_in_exponent/frac keys and must use the
+            # namespaced form above to avoid silently overwriting each other.
+            self.act_config = deepcopy(raw_config)
+            self.nonlinear_config = deepcopy(raw_config)
+        # PhaseLayerAutoSwitch treats q_config as the nonlinear configuration.
+        self.q_config = self.nonlinear_config
+        self.bypass = bool(raw_config.get("bypass", self.q_config.get("bypass", False)))
+        self.use_fp_weight = False
+        self.register_buffer("fp_gate_up_proj", None, persistent=False)
+        self.register_buffer("fp_down_proj", None, persistent=False)
+        self._fp_weight_ready = False
 
     @classmethod
     def from_experts(cls, experts: Qwen3MoeExperts, q_config: dict | None = None) -> "Qwen3MoeExpertsMXUnified":
@@ -779,8 +1191,16 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
         top_k_weights: Tensor,
     ) -> Tensor:
         self._materialize_on_input_device(hidden_states.device)
-        if self.bypass:
-            return super().forward(hidden_states, top_k_index, top_k_weights)
+        gate_up_proj = (
+            self.fp_gate_up_proj
+            if self.use_fp_weight and self.fp_gate_up_proj is not None
+            else self.gate_up_proj
+        )
+        down_proj = (
+            self.fp_down_proj
+            if self.use_fp_weight and self.fp_down_proj is not None
+            else self.down_proj
+        )
 
         final_hidden_states = torch.zeros_like(hidden_states)
         with torch.no_grad():
@@ -794,11 +1214,25 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
                 continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             current_state = hidden_states[token_idx]
-            current_state = quantize_mx(current_state, self.q_config, block_dim=-1, prefix="data_in")
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            current_hidden_states = silu_minifloat(gate, self.q_config) * up
-            current_hidden_states = quantize_mx(current_hidden_states, self.q_config, block_dim=-1, prefix="data_in")
-            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx])
+            if not self.bypass:
+                current_state = quantize_mx(
+                    current_state,
+                    self.act_config,
+                    block_dim=-1,
+                    prefix="data_in",
+                )
+            gate, up = F.linear(current_state, gate_up_proj[expert_idx]).chunk(2, dim=-1)
+            current_hidden_states = (
+                self.act_fn(gate) if self.bypass else silu_minifloat(gate, self.nonlinear_config)
+            ) * up
+            if not self.bypass:
+                current_hidden_states = quantize_mx(
+                    current_hidden_states,
+                    self.act_config,
+                    block_dim=-1,
+                    prefix="data_in",
+                )
+            current_hidden_states = F.linear(current_hidden_states, down_proj[expert_idx])
             current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
             final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
 
@@ -810,6 +1244,62 @@ class Qwen3MoeExpertsMXUnified(Qwen3MoeExperts):
             self.gate_up_proj.data = self.gate_up_proj.data.to(device=device)
         if self.down_proj.device != device:
             self.down_proj.data = self.down_proj.data.to(device=device)
+        if self.fp_gate_up_proj is not None and self.fp_gate_up_proj.device != device:
+            self.fp_gate_up_proj = self.fp_gate_up_proj.to(device=device)
+        if self.fp_down_proj is not None and self.fp_down_proj.device != device:
+            self.fp_down_proj = self.fp_down_proj.to(device=device)
+
+    @torch.no_grad()
+    def allocate_fp_weight_backup(self) -> None:
+        """Allocate packed FP expert buffers beside the GPTQ parameters."""
+        if self.fp_gate_up_proj is None:
+            self.fp_gate_up_proj = torch.empty_like(self.gate_up_proj)
+        if self.fp_down_proj is None:
+            self.fp_down_proj = torch.empty_like(self.down_proj)
+        self._fp_weight_ready = False
+
+    @torch.no_grad()
+    def copy_fp_expert_weight(
+        self,
+        expert_idx: int,
+        *,
+        gate: Tensor,
+        up: Tensor,
+        down: Tensor,
+    ) -> None:
+        self.copy_fp_expert_tensor(expert_idx, "gate", gate)
+        self.copy_fp_expert_tensor(expert_idx, "up", up)
+        self.copy_fp_expert_tensor(expert_idx, "down", down)
+
+    @torch.no_grad()
+    def copy_fp_expert_tensor(
+        self,
+        expert_idx: int,
+        projection: str,
+        tensor: Tensor,
+    ) -> None:
+        if self.fp_gate_up_proj is None or self.fp_down_proj is None:
+            raise RuntimeError("FP expert buffers must be allocated before loading weights.")
+        split = self.intermediate_dim
+        if projection == "gate":
+            target = self.fp_gate_up_proj[expert_idx, :split]
+        elif projection == "up":
+            target = self.fp_gate_up_proj[expert_idx, split:]
+        elif projection == "down":
+            target = self.fp_down_proj[expert_idx]
+        else:
+            raise ValueError(f"Unsupported expert projection {projection!r}.")
+        target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+
+    def mark_fp_weight_ready(self) -> None:
+        if self.fp_gate_up_proj is None or self.fp_down_proj is None:
+            raise RuntimeError("Cannot mark missing FP expert buffers as ready.")
+        self._fp_weight_ready = True
+
+    def set_use_fp_weight(self, enabled: bool) -> None:
+        if enabled and not self._fp_weight_ready:
+            raise RuntimeError("FP expert residency requested before its backup was materialized.")
+        self.use_fp_weight = bool(enabled)
 
 
 def _build_minifloat_quantizer(q_config: dict, *, prefix: str):
@@ -977,6 +1467,44 @@ def _qwen3_gptq_linear_config(name: str, attn_config: dict, ffn_config: dict) ->
     return cfg
 
 
+def _attention_chunk_controller_for_model(
+    model: nn.Module,
+    *,
+    mode: str,
+    chunk_size: int,
+    min_chunk_size: int,
+    oom_fallback: bool,
+) -> AttentionQueryChunkController:
+    requested = AttentionQueryChunkController(
+        mode=mode,
+        chunk_size=chunk_size,
+        min_chunk_size=min_chunk_size,
+        oom_fallback=oom_fallback,
+    )
+    existing = getattr(model, "_plena_attention_query_chunk_controller", None)
+    if isinstance(existing, AttentionQueryChunkController):
+        existing_config = (
+            existing.mode,
+            existing.initial_chunk_size,
+            existing.min_chunk_size,
+            existing.oom_fallback,
+        )
+        requested_config = (
+            requested.mode,
+            requested.initial_chunk_size,
+            requested.min_chunk_size,
+            requested.oom_fallback,
+        )
+        if existing_config != requested_config:
+            raise ValueError(
+                "Unified attention wrappers are already installed with a "
+                f"different memory configuration: {existing.snapshot()}."
+            )
+        return existing
+    model._plena_attention_query_chunk_controller = requested
+    return requested
+
+
 def apply_qwen3_gptq_cache_unified_wrappers(
     model: nn.Module,
     *,
@@ -988,6 +1516,10 @@ def apply_qwen3_gptq_cache_unified_wrappers(
     qwen3_moe_attention_config: dict | None = None,
     qwen3_moe_experts_config: dict | None = None,
     qwen3_moe_rms_norm_config: dict | None = None,
+    attention_memory_mode: str = "full",
+    attention_query_chunk_size: int = 512,
+    attention_query_chunk_min_size: int = 128,
+    attention_chunk_oom_fallback: bool = True,
 ) -> dict[str, int]:
     """Install unified wrappers directly on GPTQ-cache-loaded Qwen modules.
 
@@ -1014,6 +1546,10 @@ def apply_qwen3_gptq_cache_unified_wrappers(
         qwen3_moe_attention_config=qwen3_moe_attention_config,
         qwen3_moe_experts_config=qwen3_moe_experts_config,
         qwen3_moe_rms_norm_config=qwen3_moe_rms_norm_config,
+        attention_memory_mode=attention_memory_mode,
+        attention_query_chunk_size=attention_query_chunk_size,
+        attention_query_chunk_min_size=attention_query_chunk_min_size,
+        attention_chunk_oom_fallback=attention_chunk_oom_fallback,
     )
     counts.update(wrapper_counts)
     return counts
@@ -1053,6 +1589,10 @@ def apply_unified_mx_wrappers(
     qwen3_moe_attention_config: dict | None = None,
     qwen3_moe_experts_config: dict | None = None,
     qwen3_moe_rms_norm_config: dict | None = None,
+    attention_memory_mode: str = "full",
+    attention_query_chunk_size: int = 512,
+    attention_query_chunk_min_size: int = 128,
+    attention_chunk_oom_fallback: bool = True,
 ) -> dict[str, int]:
     """Replace Chop/Transformers MX modules with unified runtime wrappers."""
     from chop.nn.quantized.modules.linear import LinearMXInt, LinearMXFP
@@ -1077,6 +1617,13 @@ def apply_unified_mx_wrappers(
         "rms_norm_dtype_patch": 0,
     }
     counts["rms_norm_dtype_patch"] = int(_patch_rms_norm_dtype_preservation())
+    attention_chunk_controller = _attention_chunk_controller_for_model(
+        model,
+        mode=attention_memory_mode,
+        chunk_size=attention_query_chunk_size,
+        min_chunk_size=attention_query_chunk_min_size,
+        oom_fallback=attention_chunk_oom_fallback,
+    )
 
     # Replace leaves first so attention replacement preserves unified projections.
     for name, module in list(model.named_modules()):
@@ -1089,15 +1636,38 @@ def apply_unified_mx_wrappers(
             _replace_child(model, name, LlamaAttentionMXUnified.from_attention(module))
             counts["llama_attention"] += 1
         elif qwen3_chop_attention_types and isinstance(module, qwen3_chop_attention_types):
-            _replace_child(model, name, Qwen3AttentionMXUnified.from_attention(module))
+            _replace_child(
+                model,
+                name,
+                Qwen3AttentionMXUnified.from_attention(
+                    module,
+                    attention_chunk_controller=attention_chunk_controller,
+                ),
+            )
             counts["qwen3_attention"] += 1
         elif qwen3_attention_config is not None and isinstance(module, Qwen3Attention):
             q_config = _phase_attn_config_to_q_config(qwen3_attention_config)
-            _replace_child(model, name, Qwen3AttentionMXUnified.from_attention(module, q_config))
+            _replace_child(
+                model,
+                name,
+                Qwen3AttentionMXUnified.from_attention(
+                    module,
+                    q_config,
+                    attention_chunk_controller=attention_chunk_controller,
+                ),
+            )
             counts["qwen3_attention"] += 1
         elif qwen3_moe_attention_config is not None and isinstance(module, Qwen3MoeAttention):
             q_config = _phase_attn_config_to_q_config(qwen3_moe_attention_config)
-            _replace_child(model, name, Qwen3MoeAttentionMXUnified.from_attention(module, q_config))
+            _replace_child(
+                model,
+                name,
+                Qwen3MoeAttentionMXUnified.from_attention(
+                    module,
+                    q_config,
+                    attention_chunk_controller=attention_chunk_controller,
+                ),
+            )
             counts["qwen3_moe_attention"] += 1
 
     if qwen3_mlp_config is not None:

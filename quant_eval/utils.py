@@ -7,7 +7,7 @@ from typing import Literal
 
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from accelerate import dispatch_model, infer_auto_device_map
 from colorlog import ColoredFormatter
 
@@ -102,16 +102,69 @@ def create_device_map(
     return device_map
 
 
+def create_layer_balanced_device_map(config, n_devices: int) -> dict[str, int]:
+    """Place contiguous decoder-layer ranges evenly across visible GPUs.
+
+    Accelerate's automatic map is optimized for fitting one model copy.  A
+    gpu-dual run later allocates an FP backup beside most decoder weights, and
+    device-map-aware GPTQ needs comparable working-memory headroom on every
+    device.  Keep one fewer decoder layer on the edge devices when possible
+    because they also own the embedding and output modules.
+    """
+    if n_devices <= 0:
+        raise ValueError("Layer-balanced model loading requires at least one visible CUDA device.")
+
+    n_layers = int(getattr(config, "num_hidden_layers", 0))
+    if n_layers <= 0:
+        raise ValueError("Model config does not define a positive num_hidden_layers value.")
+
+    base, remainder = divmod(n_layers, n_devices)
+    layer_counts = [base] * n_devices
+    # Prefer interior devices for remainder layers.  The first and last GPUs
+    # additionally hold embeddings/rotary state and norm/lm_head respectively.
+    remainder_order = list(range(1, max(1, n_devices - 1)))
+    if n_devices > 1:
+        remainder_order.extend((0, n_devices - 1))
+    else:
+        remainder_order = [0]
+    for device in remainder_order[:remainder]:
+        layer_counts[device] += 1
+
+    device_map: dict[str, int] = {
+        "model.embed_tokens": 0,
+        "model.rotary_emb": 0,
+    }
+    layer_idx = 0
+    for device, count in enumerate(layer_counts):
+        for _ in range(count):
+            device_map[f"model.layers.{layer_idx}"] = device
+            layer_idx += 1
+    device_map["model.norm"] = n_devices - 1
+    device_map["lm_head"] = n_devices - 1
+    return device_map
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
-def setup_model(model_name, model_parallel, dtype, device, attn_implementation="sdpa"):
+def setup_model(
+    model_name,
+    model_parallel,
+    dtype,
+    device,
+    attn_implementation="sdpa",
+    layer_balanced_device_map: bool = False,
+    cpu_staged: bool = False,
+):
     logger = get_logger("setup")
     logger.info(
         f"Setting up model {model_name} with dtype {dtype}, device {device}, "
         f"attn_implementation={attn_implementation}"
     )
+
+    if cpu_staged and model_parallel:
+        raise ValueError("cpu_staged model loading is incompatible with model_parallel.")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     logger.info("Tokenizer setup complete")
@@ -121,12 +174,38 @@ def setup_model(model_name, model_parallel, dtype, device, attn_implementation="
         "attn_implementation": attn_implementation,
         "trust_remote_code": True,
     }
-    if model_parallel:
+    if cpu_staged:
+        # Meta initialization plus shard-at-a-time loading avoids a second
+        # full CPU state_dict while keeping the final model free of Accelerate
+        # dispatch hooks. MASE will stage one decoder layer on the GPU itself.
+        load_kwargs["low_cpu_mem_usage"] = True
+        logger.info("Using low-memory CPU-staged model loading")
+    elif model_parallel:
+        device_map = "auto"
+        if layer_balanced_device_map:
+            config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            device_map = create_layer_balanced_device_map(config, torch.cuda.device_count())
+            layer_counts = [0] * torch.cuda.device_count()
+            for name, mapped_device in device_map.items():
+                if name.startswith("model.layers."):
+                    layer_counts[mapped_device] += 1
+            logger.info("Using layer-balanced device map: layers_per_device=%s", layer_counts)
         load_kwargs.update({
-            "device_map": "auto",
+            "device_map": device_map,
             "low_cpu_mem_usage": True,
         })
     model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    if cpu_staged:
+        non_cpu = [
+            f"{name}={parameter.device}"
+            for name, parameter in model.named_parameters()
+            if parameter.device.type != "cpu"
+        ]
+        if non_cpu:
+            raise RuntimeError(
+                "CPU-staged model load produced non-CPU parameters: "
+                + ", ".join(non_cpu[:8])
+            )
     if model_parallel and hasattr(model, "hf_device_map"):
         print(f"Device map: {model.hf_device_map}")
     logger.info("Model setup complete")
