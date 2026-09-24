@@ -213,9 +213,10 @@ def _trial_weight_reuse(cfg: dict[str, Any]) -> bool:
 
 def _decode_weight_residency(cfg: dict[str, Any]) -> str:
     residency = str(cfg.get("runtime", {}).get("decode_weight_residency", "disk_reload")).lower()
-    if residency not in {"disk_reload", "gpu_dual"}:
+    if residency not in {"disk_reload", "host_cached", "gpu_dual"}:
         raise ValueError(
-            f"runtime.decode_weight_residency must be 'disk_reload' or 'gpu_dual', got {residency!r}"
+            "runtime.decode_weight_residency must be 'disk_reload', "
+            f"'host_cached', or 'gpu_dual', got {residency!r}"
         )
     runtime = cfg.get("runtime", {})
     if residency == "gpu_dual":
@@ -226,6 +227,13 @@ def _decode_weight_residency(cfg: dict[str, Any]) -> str:
             )
         if str(runtime.get("decode_weight_mode", "fp")).lower() != "fp":
             raise ValueError("runtime.decode_weight_residency='gpu_dual' requires runtime.decode_weight_mode='fp'.")
+    elif residency == "host_cached" and str(
+        runtime.get("decode_weight_mode", "fp")
+    ).lower() != "fp":
+        raise ValueError(
+            "runtime.decode_weight_residency='host_cached' requires "
+            "runtime.decode_weight_mode='fp'."
+        )
     return residency
 
 
@@ -532,8 +540,24 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
     bfcl_batch_size = args.bfcl_batch_size if args.bfcl_batch_size is not None else bfcl.get("batch_size", 16)
     arg_bfcl_disable_thinking = getattr(args, "bfcl_disable_thinking", None)
     bfcl_disable_thinking = arg_bfcl_disable_thinking if arg_bfcl_disable_thinking is not None else bfcl.get("disable_thinking", False)
+    arg_web_search_max_concurrency = getattr(
+        args, "bfcl_web_search_max_concurrency", None
+    )
+    bfcl_web_search_max_concurrency = (
+        arg_web_search_max_concurrency
+        if arg_web_search_max_concurrency is not None
+        else bfcl.get("web_search_max_concurrency", 1)
+    )
     arg_attn_implementation = getattr(args, "attn_implementation", None)
     attn_implementation = arg_attn_implementation if arg_attn_implementation is not None else runtime.get("attn_implementation", "auto")
+    arg_attention_memory_mode = getattr(args, "attention_memory_mode", None)
+    attention_memory_mode = arg_attention_memory_mode if arg_attention_memory_mode is not None else runtime.get("attention_memory_mode", "full")
+    arg_attention_query_chunk_size = getattr(args, "attention_query_chunk_size", None)
+    attention_query_chunk_size = arg_attention_query_chunk_size if arg_attention_query_chunk_size is not None else runtime.get("attention_query_chunk_size", 512)
+    arg_attention_query_chunk_min_size = getattr(args, "attention_query_chunk_min_size", None)
+    attention_query_chunk_min_size = arg_attention_query_chunk_min_size if arg_attention_query_chunk_min_size is not None else runtime.get("attention_query_chunk_min_size", 128)
+    arg_attention_chunk_oom_fallback = getattr(args, "attention_chunk_oom_fallback", None)
+    attention_chunk_oom_fallback = arg_attention_chunk_oom_fallback if arg_attention_chunk_oom_fallback is not None else runtime.get("attention_chunk_oom_fallback", True)
     runtime_bypass_components = getattr(args, "runtime_bypass_components", None)
     if runtime_bypass_components is None:
         runtime_bypass_components = runtime.get("runtime_bypass_components", runtime.get("bypass_components"))
@@ -550,6 +574,10 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         "--dtype", str(model.get("dtype", "bfloat16")),
         "--quant_config", str(model.get("quant_config", "quant_eval/configs/llama_mxint4.toml")),
         "--attn_implementation", str(attn_implementation),
+        "--attention_memory_mode", str(attention_memory_mode),
+        "--attention_query_chunk_size", str(attention_query_chunk_size),
+        "--attention_query_chunk_min_size", str(attention_query_chunk_min_size),
+        "--attention_chunk_oom_fallback", str(bool(attention_chunk_oom_fallback)).lower(),
         "--device_id", "cuda:0",
         "--bfcl_test_categories", str(bfcl.get("test_categories", "multiple")),
         "--bfcl_tool_mode", str(bfcl.get("tool_mode", "return")),
@@ -559,6 +587,7 @@ def _base_command(cfg: dict[str, Any], trial: Trial, trial_dir: Path, port: int,
         "--bfcl_batch_size", str(bfcl_batch_size),
         "--bfcl_batch_length_bucket", str(bool(bfcl.get("batch_length_bucket", True))).lower(),
         "--bfcl_disable_thinking", str(bool(bfcl_disable_thinking)).lower(),
+        "--bfcl_web_search_max_concurrency", str(bfcl_web_search_max_concurrency),
         "--server_port", str(port),
         "--log_dir", str(trial_dir),
     ]
@@ -783,8 +812,24 @@ def _run_persistent_trial_group(
     bfcl_batch_size = args.bfcl_batch_size if args.bfcl_batch_size is not None else bfcl.get("batch_size", 16)
     arg_bfcl_disable_thinking = getattr(args, "bfcl_disable_thinking", None)
     bfcl_disable_thinking = arg_bfcl_disable_thinking if arg_bfcl_disable_thinking is not None else bfcl.get("disable_thinking", False)
+    arg_web_search_max_concurrency = getattr(
+        args, "bfcl_web_search_max_concurrency", None
+    )
+    bfcl_web_search_max_concurrency = (
+        arg_web_search_max_concurrency
+        if arg_web_search_max_concurrency is not None
+        else bfcl.get("web_search_max_concurrency", 1)
+    )
     arg_attn_implementation = getattr(args, "attn_implementation", None)
     attn_implementation = arg_attn_implementation if arg_attn_implementation is not None else runtime.get("attn_implementation", "auto")
+    arg_attention_memory_mode = getattr(args, "attention_memory_mode", None)
+    attention_memory_mode = arg_attention_memory_mode if arg_attention_memory_mode is not None else runtime.get("attention_memory_mode", "full")
+    arg_attention_query_chunk_size = getattr(args, "attention_query_chunk_size", None)
+    attention_query_chunk_size = arg_attention_query_chunk_size if arg_attention_query_chunk_size is not None else runtime.get("attention_query_chunk_size", 512)
+    arg_attention_query_chunk_min_size = getattr(args, "attention_query_chunk_min_size", None)
+    attention_query_chunk_min_size = arg_attention_query_chunk_min_size if arg_attention_query_chunk_min_size is not None else runtime.get("attention_query_chunk_min_size", 128)
+    arg_attention_chunk_oom_fallback = getattr(args, "attention_chunk_oom_fallback", None)
+    attention_chunk_oom_fallback = arg_attention_chunk_oom_fallback if arg_attention_chunk_oom_fallback is not None else runtime.get("attention_chunk_oom_fallback", True)
     runtime_bypass_components = getattr(args, "runtime_bypass_components", None)
     if runtime_bypass_components is None:
         runtime_bypass_components = runtime.get("runtime_bypass_components", runtime.get("bypass_components"))
@@ -814,6 +859,11 @@ def _run_persistent_trial_group(
             "trial_weight_reuse": _trial_weight_reuse(cfg),
             "decode_weight_residency": _decode_weight_residency(cfg),
             "model_parallel": model_parallel,
+            "attention_memory_mode": attention_memory_mode,
+            "attention_query_chunk_size": int(attention_query_chunk_size),
+            "attention_query_chunk_min_size": int(attention_query_chunk_min_size),
+            "attention_chunk_oom_fallback": bool(attention_chunk_oom_fallback),
+            "bfcl_web_search_max_concurrency": bfcl_web_search_max_concurrency,
             "worker_idx": worker_idx,
             "port": port,
             "timeout_sec": None,
@@ -828,6 +878,10 @@ def _run_persistent_trial_group(
         dtype=str(model.get("dtype", "bfloat16")),
         quant_config=str(model.get("quant_config", "quant_eval/configs/llama_mxint4.toml")),
         attn_implementation=str(attn_implementation),
+        attention_memory_mode=str(attention_memory_mode),
+        attention_query_chunk_size=int(attention_query_chunk_size),
+        attention_query_chunk_min_size=int(attention_query_chunk_min_size),
+        attention_chunk_oom_fallback=bool(attention_chunk_oom_fallback),
         device_id="cuda:0",
         model_parallel=model_parallel,
         bfcl_test_categories=str(bfcl.get("test_categories", "multiple")),
@@ -838,6 +892,7 @@ def _run_persistent_trial_group(
         bfcl_batch_size=int(bfcl_batch_size),
         bfcl_batch_length_bucket=bool(bfcl.get("batch_length_bucket", True)),
         bfcl_disable_thinking=bool(bfcl_disable_thinking),
+        bfcl_web_search_max_concurrency=bfcl_web_search_max_concurrency,
         server_port=port,
         decode_weight_mode=str(runtime.get("decode_weight_mode", "fp")),
         decode_weight_residency=_decode_weight_residency(cfg),
@@ -1378,7 +1433,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bfcl-generate-mode", choices=["cli", "batched"], default=None)
     parser.add_argument("--bfcl-batch-size", type=int, default=None)
     parser.add_argument("--bfcl-disable-thinking", type=_bool_arg, default=None)
+    parser.add_argument("--bfcl-web-search-max-concurrency", type=int, default=None)
     parser.add_argument("--attn-implementation", choices=["auto", "sdpa", "eager"], default=None)
+    parser.add_argument("--attention-memory-mode", choices=["full", "query_chunked"], default=None)
+    parser.add_argument("--attention-query-chunk-size", type=int, default=None)
+    parser.add_argument("--attention-query-chunk-min-size", type=int, default=None)
+    parser.add_argument("--attention-chunk-oom-fallback", type=_bool_arg, default=None)
     parser.add_argument("--runtime-bypass-components", default=None)
     parser.add_argument("--max-trials", type=int, default=None)
     parser.add_argument("--only-trials", default=None)

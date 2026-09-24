@@ -31,22 +31,26 @@ Example:
 
 from __future__ import annotations
 
+import copy
 import gc
 import hashlib
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Sequence, Union
+from typing import Any, Callable, Sequence, Union
 
 import torch
 import transformers
+from torch import Tensor
 
 from quant_eval.utils import (
     get_logger,
@@ -60,14 +64,20 @@ from quant_eval.utils import (
 from quant_eval.eval.phase_quant import PhaseLayerAutoSwitch
 from quant_eval.quantize import load_quant_config
 from quant_eval.precision import apply_dse_quant_config, parse_fp_setting, parse_mx_precision, mx_data_config, fp_data_config
-from quant_eval.eval.unified_mx import apply_qwen3_gptq_cache_unified_wrappers, apply_unified_mx_wrappers
+from quant_eval.eval.unified_mx import (
+    ATTENTION_MEMORY_MODES,
+    AttentionQueryChunkController,
+    apply_qwen3_gptq_cache_unified_wrappers,
+    apply_unified_mx_wrappers,
+    get_attention_memory_stats,
+)
 from quant_eval.bfcl_adapters import BFCL_ADAPTER_NAMES, resolve_bfcl_adapter
 
 from fastapi import FastAPI, Request
 
 import httpx
 from bs4 import BeautifulSoup
-import markdownify, random
+import markdownify
 
 
 logger = get_logger(__name__)
@@ -77,6 +87,11 @@ set_logging_verbosity("debug")
 BFCL_WEB_SEARCH_CATEGORIES = ("web_search_base", "web_search_no_snippet")
 BFCL_TOOL_MODES = ("auto", "return", "execute")
 BFCL_GENERATE_MODES = ("cli", "batched")
+BFCL_WEB_SEARCH_BACKENDS = (
+    "bfcl_web_search_api_serpapi_duckduckgo",
+    "bfcl_harness_ddgs_duckduckgo",
+)
+BFCL_WEB_SEARCH_CACHE_MODES = ("off", "record", "replay", "auto")
 ATTN_IMPLEMENTATIONS = ("auto", "sdpa", "eager")
 
 # ── OpenAI-compatible server defaults ─────────────────────────────────────────
@@ -110,8 +125,7 @@ def resolve_attention_backend(
 
 
 def _execute_tool(tool_call: dict) -> str:
-    """Execute duckduckgo_search or fetch_url_content and return result as string."""
-    import random
+    """Legacy in-server web tools used only by explicit ``tool_mode=execute``."""
     import httpx
     from bs4 import BeautifulSoup
 
@@ -121,23 +135,35 @@ def _execute_tool(tool_call: dict) -> str:
     except json.JSONDecodeError:
         return json.dumps({"error": "Failed to parse tool arguments"})
 
-    print(f"DEBUG: Executing tool '{name}' with arguments: {args}")
+    logger.debug("Executing tool %s with arguments: %s", name, args)
 
     # ── duckduckgo_search ──────────────────────────────────────────
     if name in ("duckduckgo_search", "search_engine_query"):
         try:
             from ddgs import DDGS
             with DDGS() as ddgs:
-                print(f"DEBUG: Performing DuckDuckGo search with keywords='{args.get('keywords', '')}' and region='{args.get('region', 'wt-wt')}'")
+                logger.debug(
+                    "Performing DuckDuckGo search with keywords=%r and region=%r",
+                    args.get("keywords", ""),
+                    args.get("region", "wt-wt"),
+                )
                 results = list(ddgs.text(
                     args.get("keywords", args.get("query", "")),  # positional, not keyword
                     region=args.get("region", "wt-wt"),
                     max_results=args.get("max_results", 10),
                 ))
-                print(f"DEBUG: DuckDuckGo search returned {len(results)} results")
-                print(f"DEBUG: Sample result: {results[0] if results else 'No results'}")
-            # Normalise keys to what BFCL expects: title, href, body
-            results = [{"title": r["title"], "url": r["href"]} for r in results]
+                logger.debug("DuckDuckGo search returned %d results", len(results))
+            # Match BFCL's WebSearchAPI schema. In particular, base-category
+            # scoring expects snippets (``body``); dropping them silently
+            # changes the task into the harder no-snippet variant.
+            results = [
+                {
+                    "title": result.get("title", ""),
+                    "href": result.get("href", ""),
+                    "body": result.get("body", ""),
+                }
+                for result in results
+            ]
             return json.dumps(results)
         except Exception as e:
             return json.dumps({"error": f"duckduckgo_search failed: {e}"})
@@ -147,29 +173,20 @@ def _execute_tool(tool_call: dict) -> str:
         url  = args.get("url", "")
         mode = args.get("mode", "raw")
 
-        # Simulate probabilistic failures (matches BFCL benchmark behaviour)
-        error_templates = [
-            f"503 Server Error: Service Unavailable for url: {url}",
-            f"429 Client Error: Too Many Requests for url: {url}",
-            f"403 Client Error: Forbidden for url: {url}",
-            f"HTTPSConnectionPool(host='{url}', port=443): Max retries exceeded",
-            f"HTTPSConnectionPool(host='{url}', port=443): Read timed out. (read timeout=5)",
-        ]
-        if random.random() < 0.1:
-            return json.dumps({"error": random.choice(error_templates)})
-
         try:
             resp = httpx.get(url, timeout=10, follow_redirects=True,
                              headers={"User-Agent": "Mozilla/5.0"})
             html = resp.text
 
             if mode == "raw":
-                return html[:20000]  # cap to avoid huge prompts
+                return json.dumps({"content": html[:20000]})
 
             elif mode == "markdown":
                 try:
                     import markdownify
-                    return markdownify.markdownify(html)[:20000]
+                    return json.dumps(
+                        {"content": markdownify.markdownify(html)[:20000]}
+                    )
                 except ImportError:
                     # fallback to truncate if markdownify not installed
                     mode = "truncate"
@@ -179,7 +196,7 @@ def _execute_tool(tool_call: dict) -> str:
                 for tag in soup(["script", "style", "nav", "footer", "head"]):
                     tag.decompose()
                 text = " ".join(soup.get_text().split())
-                return text[:8000]
+                return json.dumps({"content": text[:8000]})
 
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -194,7 +211,49 @@ def _execute_tool(tool_call: dict) -> str:
 #  Minimal OpenAI-compatible chat-completion server
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute", max_new_tokens: int | None = 2048, bfcl_adapter=None):
+def _is_cuda_oom(error: Exception) -> bool:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(error).lower()
+    return "cuda" in message and "out of memory" in message
+
+
+def _generate_with_oom_retry(
+    model,
+    *,
+    oom_retries: int = 2,
+    request_label: str = "generation",
+    **generate_kwargs,
+):
+    """Retry a batch-1 server generation after releasing allocator cache."""
+    for attempt in range(int(oom_retries) + 1):
+        try:
+            return model.generate(**generate_kwargs)
+        except Exception as error:
+            if not _is_cuda_oom(error) or attempt >= int(oom_retries):
+                raise
+            logger.warning(
+                "CUDA OOM during %s (attempt %d/%d); clearing transient "
+                "allocations and retrying the same request.",
+                request_label,
+                attempt + 1,
+                int(oom_retries) + 1,
+            )
+            gc.collect()
+            if torch.cuda.is_available():
+                for device_index in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device_index):
+                        torch.cuda.empty_cache()
+
+
+def _build_server_app(
+    model,
+    tokenizer,
+    device: str,
+    tool_mode: str = "execute",
+    max_new_tokens: int | None = 2048,
+    bfcl_adapter=None,
+):
     """
     Return a FastAPI application that exposes POST /v1/chat/completions.
 
@@ -203,7 +262,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
     through transparently so that BFCL can exercise them.
     """
     try:
-        from fastapi import FastAPI, Request
+        from fastapi import FastAPI, HTTPException, Request
         from fastapi.responses import JSONResponse
     except ImportError as exc:
         raise ImportError(
@@ -230,60 +289,127 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
             return requested_toks
         return min(requested_toks, int(max_new_tokens))
 
+    model_context_length = getattr(
+        getattr(model, "config", None), "max_position_embeddings", None
+    )
+    if not isinstance(model_context_length, int) or model_context_length <= 0:
+        tokenizer_limit = getattr(tokenizer, "model_max_length", None)
+        model_context_length = (
+            int(tokenizer_limit)
+            if isinstance(tokenizer_limit, int) and 0 < tokenizer_limit < 1_000_000_000
+            else None
+        )
+
     app = FastAPI(title="quant-model-server")
+    def _generate_serialized(**generate_kwargs):
+        with torch.inference_mode():
+            if tool_mode == "execute" and torch.cuda.is_available():
+                # Agentic turns grow their eager-attention matrices over time.
+                # Release inactive blocks between turns so the next large
+                # FP32 softmax can obtain a contiguous allocation on tight
+                # model-parallel deployments.
+                for device_index in range(torch.cuda.device_count()):
+                    with torch.cuda.device(device_index):
+                        torch.cuda.empty_cache()
+            return _generate_with_oom_retry(model, **generate_kwargs)
+
+    def _prepare_prompt_ids(builder: Callable[[], Tensor]) -> Tensor:
+        prompt_ids = builder()
+        if not isinstance(prompt_ids, Tensor) or prompt_ids.ndim != 2:
+            raise TypeError("BFCL tokenizer must return a rank-2 token tensor.")
+        return prompt_ids.to(device=_input_device(), dtype=torch.long)
+
+    def _generate_turn(
+        *,
+        prompt_ids: Tensor,
+        max_new_toks: int,
+        temperature: float,
+        request_label: str,
+    ) -> Tensor:
+        prompt_length = int(prompt_ids.shape[-1])
+        if model_context_length is not None:
+            available_generation_tokens = (
+                int(model_context_length) - prompt_length - 2
+            )
+            if available_generation_tokens <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Prompt length {prompt_length} exceeds the model "
+                        f"context window {model_context_length}."
+                    ),
+                )
+            max_new_toks = min(max_new_toks, available_generation_tokens)
+        attention_mask = torch.ones_like(prompt_ids)
+        generate_kwargs = {
+            "input_ids": prompt_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": max_new_toks,
+            "do_sample": temperature > 0,
+            "temperature": temperature if temperature > 0 else 1.0,
+            "pad_token_id": tokenizer.eos_token_id,
+            "request_label": request_label,
+        }
+        return _generate_serialized(**generate_kwargs)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
-        print("🚀 REQUEST HIT")
+        logger.debug("Chat-completions request received")
         body = await request.json()
         messages     = list(body.get("messages", []))  # make a mutable copy
         tools        = body.get("tools", None)
         temperature  = body.get("temperature", 0.0)
         max_new_toks = _cap_max_new_tokens(body.get("max_tokens", 1024))
-
         MAX_TURNS = 15  # prevent infinite agentic loops
+        last_prompt_tokens = 0
+        last_completion_tokens = 0
 
         for turn in range(MAX_TURNS):
-            print(f"🔄 Agentic turn {turn + 1}/{MAX_TURNS}, messages so far: {len(messages)}")
+            logger.debug(
+                "Chat-completions agentic turn %d/%d with %d messages",
+                turn + 1,
+                MAX_TURNS,
+                len(messages),
+            )
 
             # ── Build prompt ───────────────────────────────────────────
-            if hasattr(tokenizer, "apply_chat_template"):
-                try:
-                    prompt_ids = tokenizer.apply_chat_template(
-                        messages,
-                        tools=tools,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                    ).to(_input_device())
-                except Exception:
-                    prompt_ids = tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        return_tensors="pt",
-                    ).to(_input_device())
-            else:
+            def build_chat_prompt_ids() -> Tensor:
+                if hasattr(tokenizer, "apply_chat_template"):
+                    try:
+                        return tokenizer.apply_chat_template(
+                            messages,
+                            tools=tools,
+                            add_generation_prompt=True,
+                            return_tensors="pt",
+                        )
+                    except Exception:
+                        return tokenizer.apply_chat_template(
+                            messages,
+                            add_generation_prompt=True,
+                            return_tensors="pt",
+                        )
                 text = "\n".join(
                     f"{m.get('role','user').upper()}: {m.get('content','')}"
                     for m in messages
                 ) + "\nASSISTANT:"
-                prompt_ids = tokenizer(text, return_tensors="pt").input_ids.to(_input_device())
+                return tokenizer(text, return_tensors="pt").input_ids
+
+            prompt_ids = _prepare_prompt_ids(build_chat_prompt_ids)
 
             # ── Inference ──────────────────────────────────────────────
-            with torch.no_grad():
-                attention_mask = torch.ones_like(prompt_ids)
-                output_ids = model.generate(
-                    prompt_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_toks,
-                    do_sample=(temperature > 0),
-                    temperature=temperature if temperature > 0 else 1.0,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
+            output_ids = _generate_turn(
+                prompt_ids=prompt_ids,
+                max_new_toks=max_new_toks,
+                temperature=temperature,
+                request_label=f"chat completion turn {turn + 1}",
+            )
 
-            print(f"DEBUG: output_ids shape: {output_ids.shape}")
+            logger.debug("Generated output shape: %s", tuple(output_ids.shape))
             generated_ids = output_ids[0][prompt_ids.shape[-1]:]
+            last_prompt_tokens = int(prompt_ids.shape[-1])
+            last_completion_tokens = int(generated_ids.shape[-1])
             raw_text = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
-            print(f"DEBUG: raw_text: {raw_text[:200]}")
+            logger.debug("Generated text preview: %s", raw_text[:200])
 
             logger.debug("Prompt tokens: %s", raw_text[:200])
             # ── Parse tool calls ───────────────────────────────────────
@@ -292,8 +418,11 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
 
             # ── No tool calls → final answer, return immediately ───────
             if not tool_calls:
-                print(f"✅ Final answer reached at turn {turn + 1}")
-                message = {"role": "assistant", "content": content}
+                logger.debug("Final answer reached at turn %d", turn + 1)
+                message = {
+                    "role": "assistant",
+                    "content": bfcl_adapter.normalize_return_text(content or raw_text),
+                }
                 response = {
                     "id":      f"chatcmpl-{int(time.time()*1000)}",
                     "object":  "chat.completion",
@@ -317,7 +446,11 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
             # benchmark functions here would append synthetic tool results and
             # force a second generation, changing the response that BFCL scores.
             if tool_mode == "return":
-                print(f"↩️ Returning tool calls at turn {turn + 1}: {[tc['function']['name'] for tc in tool_calls]}")
+                logger.debug(
+                    "Returning tool calls at turn %d: %s",
+                    turn + 1,
+                    [tc["function"]["name"] for tc in tool_calls],
+                )
                 message = {
                     "role": "assistant",
                     "content": content,
@@ -342,7 +475,11 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 return JSONResponse(content=response)
 
             # ── Tool calls found → execute them and loop back ──────────
-            print(f"🔧 Tool calls at turn {turn + 1}: {[tc['function']['name'] for tc in tool_calls]}")
+            logger.debug(
+                "Executing tool calls at turn %d: %s",
+                turn + 1,
+                [tc["function"]["name"] for tc in tool_calls],
+            )
 
             # Append the assistant's tool-call message to history
             messages.append({
@@ -351,12 +488,18 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 "tool_calls": tool_calls,
             })
 
+            # Do not retain one request's CUDA tensors while it waits for a
+            # web tool and another concurrent request enters generation.
+            del output_ids, generated_ids, prompt_ids
+
             # Execute each tool and append results
             for tc in tool_calls:
                 tool_name   = tc["function"]["name"]
                 logger.info("Executing tool '%s' with arguments: %s", tool_name, tc["function"]["arguments"])
                 tool_result = _execute_tool(tc)
-                print(f"🔍 Tool '{tool_name}' result preview: {str(tool_result)[:200]}")
+                logger.debug(
+                    "Tool %s result preview: %s", tool_name, str(tool_result)[:200]
+                )
                 messages.append({
                     "role":         "tool",
                     "tool_call_id": tc["id"],
@@ -365,7 +508,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 })
 
         # ── Exceeded MAX_TURNS → return whatever we have ───────────────
-        print(f"⚠️ MAX_TURNS ({MAX_TURNS}) exceeded, returning last content")
+        logger.warning("MAX_TURNS (%d) exceeded; returning last content", MAX_TURNS)
         message = {"role": "assistant", "content": content}
         response = {
             "id":      f"chatcmpl-{int(time.time()*1000)}",
@@ -378,16 +521,16 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 "finish_reason": "stop",
             }],
             "usage": {
-                "prompt_tokens":     int(prompt_ids.shape[-1]),
-                "completion_tokens": int(generated_ids.shape[-1]),
-                "total_tokens":      int(prompt_ids.shape[-1] + generated_ids.shape[-1]),
+                "prompt_tokens":     last_prompt_tokens,
+                "completion_tokens": last_completion_tokens,
+                "total_tokens":      last_prompt_tokens + last_completion_tokens,
             },
         }
         return JSONResponse(content=response)
 
     @app.post("/v1/completions")
     async def completions(request: Request):
-        print("🚀 /v1/completions REQUEST HIT")
+        logger.debug("Text-completions request received")
         body = await request.json()
 
         prompt = body.get("prompt", "")
@@ -397,47 +540,45 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
         tools        = body.get("tools", None)
         temperature  = body.get("temperature", 0.0)
         max_new_toks = _cap_max_new_tokens(body.get("max_tokens", 1024))
-
         MAX_TURNS = 15  # prevent infinite agentic loops
 
         total_prompt_tokens     = 0
         total_completion_tokens = 0
 
         for turn in range(MAX_TURNS):
-            print(f"🔄 Agentic turn {turn + 1}/{MAX_TURNS}")
+            logger.debug("Text-completions agentic turn %d/%d", turn + 1, MAX_TURNS)
 
             # Tokenize the current prompt string directly (no chat template).
-            prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(_input_device())
+            # BFCL's QwenFCHandler has already rendered all Qwen control tokens
+            # into the prompt string. Do not let the tokenizer prepend another
+            # model-level special token.
+            prompt_ids = _prepare_prompt_ids(
+                lambda: tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                ).input_ids
+            )
 
-            with torch.no_grad():
-                attention_mask = torch.ones_like(prompt_ids)
-                output_ids = model.generate(
-                    prompt_ids,
-                    attention_mask=attention_mask,
-                    max_new_tokens=max_new_toks,
-                    do_sample=(temperature > 0),
-                    temperature=temperature if temperature > 0 else 1.0,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
+            output_ids = _generate_turn(
+                prompt_ids=prompt_ids,
+                max_new_toks=max_new_toks,
+                temperature=temperature,
+                request_label=f"text completion turn {turn + 1}",
+            )
 
             generated_ids = output_ids[0][prompt_ids.shape[-1]:]
             raw_text = tokenizer.decode(generated_ids, skip_special_tokens=False).strip()
-            print(raw_text)
+            logger.debug("Generated text preview: %s", raw_text[:500])
 
             total_prompt_tokens     += int(prompt_ids.shape[-1])
             total_completion_tokens += int(generated_ids.shape[-1])
 
-            # ── Parse tool calls ───────────────────────────────────────
-            tool_calls, content = bfcl_adapter.parse_tool_calls(raw_text)
-            content = content or ""
-            print(tool_calls)
-
-            # ── No tool calls → final answer, return immediately ───────
-            if not tool_calls:
-                print(f"✅ Final answer reached at turn {turn + 1}")
-                response_text = raw_text
-                if tool_mode == "return":
-                    response_text = bfcl_adapter.normalize_return_text(raw_text)
+            # Official BFCL handlers own parsing. Returning the model text
+            # before any relaxed local parsing ensures malformed JSON, missing
+            # tags, and reasoning blocks are scored exactly as generated.
+            if tool_mode == "return":
+                response_text = bfcl_adapter.completion_response_text(raw_text)
                 response = {
                     "id":      f"cmpl-{int(time.time()*1000)}",
                     "object":  "text_completion",
@@ -458,12 +599,15 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 }
                 return JSONResponse(content=response)
 
-            # BFCL non-live categories should receive the model's function
-            # call response. Llama 3.1 FC emits special tokens around JSON
-            # (<|python_tag|>...<|eom_id|>); strip those before BFCL evaluates.
-            if tool_mode == "return":
-                print(f"↩️ Returning completion tool calls at turn {turn + 1}: {[tc['function']['name'] for tc in tool_calls]}")
-                response_text = bfcl_adapter.return_text_from_tool_calls(tool_calls, raw_text=raw_text)
+            # ── Parse tool calls for the legacy in-server agent loop ───
+            tool_calls, content = bfcl_adapter.parse_tool_calls(raw_text)
+            content = content or ""
+            logger.debug("Parsed tool calls: %s", tool_calls)
+
+            # ── No tool calls → final answer, return immediately ───────
+            if not tool_calls:
+                logger.debug("Final answer reached at turn %d", turn + 1)
+                response_text = bfcl_adapter.normalize_return_text(raw_text)
                 response = {
                     "id":      f"cmpl-{int(time.time()*1000)}",
                     "object":  "text_completion",
@@ -488,12 +632,18 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
             # Append the model's output (with tool calls) to the running prompt.
             prompt = prompt + raw_text
 
+            # The text is now materialized on CPU; release CUDA references
+            # before this request waits on tools and yields to another request.
+            del output_ids, generated_ids, prompt_ids
+
             # Execute each tool and append results in a structured block.
             for tc in tool_calls:
                 tool_name   = tc["function"]["name"]
                 logger.info("Executing tool '%s' with arguments: %s", tool_name, tc["function"]["arguments"])
                 tool_result = _execute_tool(tc)
-                print(f"🔍 Tool '{tool_name}' result preview: {str(tool_result)[:200]}")
+                logger.debug(
+                    "Tool %s result preview: %s", tool_name, str(tool_result)[:200]
+                )
                 prompt += (
                     f"\n<tool_response>\n"
                     f"{json.dumps({'tool_call_id': tc['id'], 'name': tool_name, 'content': tool_result})}\n"
@@ -501,7 +651,7 @@ def _build_server_app(model, tokenizer, device: str, tool_mode: str = "execute",
                 )
 
         # ── Exceeded MAX_TURNS → return whatever we have ───────────────
-        print(f"⚠️ MAX_TURNS ({MAX_TURNS}) exceeded, returning last output")
+        logger.warning("MAX_TURNS (%d) exceeded; returning last output", MAX_TURNS)
         response = {
             "id":      f"cmpl-{int(time.time()*1000)}",
             "object":  "text_completion",
@@ -568,7 +718,7 @@ def _normalize_bfcl_return_text(text: str) -> str:
         normalized = normalized[5:].strip()
 
     if normalized != text.strip():
-        print(f"DEBUG: Normalized BFCL return text: {normalized[:300]}")
+        logger.debug("Normalized BFCL return text: %s", normalized[:300])
     return normalized or text
 
 
@@ -691,7 +841,7 @@ def _parse_bfcl_payload_tool_calls(payload: str) -> list:
             else:
                 _append_tool_call(tool_calls, parsed)
     except (json.JSONDecodeError, SyntaxError, ValueError):
-        print(f"WARNING: Failed to parse BFCL tool-call payload: {payload[:200]}")
+        logger.warning("Failed to parse BFCL tool-call payload: %s", payload[:200])
         return []
     return tool_calls
 
@@ -780,15 +930,19 @@ def _parse_tool_calls(text: str) -> tuple[list | None, str]:
     for pat in patterns:
         matches = re.findall(pat, text, re.DOTALL)
         if matches:
-            print(f"DEBUG: Found {len(matches)} tool call(s) with pattern: {pat}")
+            logger.debug("Found %d tool calls with pattern %s", len(matches), pat)
             tool_calls = []
             for m in matches:
                 try:
                     parsed = _loads_tool_payload(m.strip())
                     _append_tool_call(tool_calls, parsed)
-                    print(f"DEBUG: Parsed tool call {len(tool_calls) - 1}: {tool_calls[-1]}")
+                    logger.debug(
+                        "Parsed tool call %d: %s",
+                        len(tool_calls) - 1,
+                        tool_calls[-1],
+                    )
                 except (json.JSONDecodeError, SyntaxError, ValueError, IndexError):
-                    print(f"WARNING: Failed to parse tool call JSON: {m[:200]}")
+                    logger.warning("Failed to parse tool-call JSON: %s", m[:200])
                     continue
             if tool_calls:
                 leftover = re.sub(pat, "", text, flags=re.DOTALL).strip()
@@ -828,6 +982,10 @@ def _start_server(app, host: str, port: int) -> threading.Thread:
     server = uvicorn.Server(config)
 
     thread = threading.Thread(target=server.run, daemon=True)
+    # Keep an explicit lifecycle handle so repeated persistent trials can stop
+    # their embedded server deterministically.
+    app.state.uvicorn_server = server
+    app.state.uvicorn_thread = thread
     thread.start()
 
     # Wait for *this* uvicorn instance to start. A stale process can already
@@ -855,6 +1013,30 @@ def _start_server(app, host: str, port: int) -> threading.Thread:
         f"Server at http://{host}:{port} did not start in time."
         + (f" Last error: {last_error}" if last_error else "")
     )
+
+
+def _stop_server(app, timeout: float = 60.0) -> None:
+    """Stop the embedded server deterministically."""
+    if app is None:
+        return
+
+    server = getattr(app.state, "uvicorn_server", None)
+    thread = getattr(app.state, "uvicorn_thread", None)
+    if server is not None:
+        server.should_exit = True
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout)))
+    if thread is not None and thread.is_alive():
+        logger.warning(
+            "BFCL server did not stop within %.1fs; forcing uvicorn exit.",
+            float(timeout),
+        )
+        if server is not None:
+            server.force_exit = True
+        thread.join(timeout=5.0)
+
+    app.state.uvicorn_server = None
+    app.state.uvicorn_thread = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -922,7 +1104,13 @@ def _normalize_bfcl_categories(
 
 
 def _resolve_bfcl_tool_mode(categories: Sequence[str], mode: str) -> str:
-    """Resolve auto tool behavior for BFCL live vs non-live categories."""
+    """Resolve server tool behavior for BFCL generation.
+
+    BFCL owns the multi-step executable-tool loop, including WebSearchAPI
+    state, snippets, and inference logs. The local model endpoint must return
+    each tool call immediately. ``execute`` remains an explicit legacy mode
+    for experiments that intentionally use PLENA's in-server tool runner.
+    """
     mode = mode.lower()
     if mode not in BFCL_TOOL_MODES:
         raise ValueError(
@@ -930,10 +1118,7 @@ def _resolve_bfcl_tool_mode(categories: Sequence[str], mode: str) -> str:
         )
     if mode != "auto":
         return mode
-    # Only BFCL web-search categories need live tool execution. Standard
-    # function-calling categories such as `multiple` are scored on the function
-    # call returned by the model, so the local server must not execute tools.
-    return "execute" if all(cat.startswith("web_search") for cat in categories) else "return"
+    return "return"
 
 
 def _normalize_gptq_dataset(dataset: str) -> str:
@@ -1004,6 +1189,7 @@ def _inject_gptq_config(
     cali_batch_size: int,
     max_layers: int | None,
     device_map_aware: bool = False,
+    cpu_staged: bool = False,
 ) -> dict | None:
     """Merge CLI GPTQ options into pass_args; CLI values take precedence."""
     if dataset is None:
@@ -1040,6 +1226,7 @@ def _inject_gptq_config(
         "weight_config": weight_config,
         "cali_batch_size": cali_batch_size,
         "device_map_aware": bool(device_map_aware),
+        "cpu_staged": bool(cpu_staged),
     })
     if max_layers is not None:
         if max_layers <= 0:
@@ -1105,6 +1292,7 @@ class _GptqWeightCache:
         self.loaded_layers = 0
         self.partial_layers = 0
         self.resuming = False
+        self.model_path_alias_hit = False
         self._lock_acquired = False
         self._wait_sec = 7200
         self._poll_sec = 5.0
@@ -1118,6 +1306,7 @@ class _GptqWeightCache:
             "loaded_layers": self.loaded_layers,
             "partial_layers": self.partial_layers,
             "resuming": self.resuming,
+            "model_path_alias_hit": self.model_path_alias_hit,
             "expected_layers": self.expected_layers,
         }
 
@@ -1154,6 +1343,67 @@ class _GptqWeightCache:
             return False
         return all(self._layer_path(i).exists() for i in self.expected_layers)
 
+    @staticmethod
+    def _snapshot_identity(model_name: object) -> str | None:
+        value = str(model_name or "").rstrip("/")
+        marker = "/snapshots/"
+        if marker in value:
+            revision = value.split(marker, 1)[1].split("/", 1)[0]
+            return f"snapshot:{revision}" if revision else None
+        return None
+
+    @staticmethod
+    def _dataset_identity(dataset: object) -> str:
+        """Fingerprint local calibration contents independently of path."""
+        value = str(dataset or "")
+        if not value.startswith("file:"):
+            return f"spec:{value}"
+        raw_path = Path(value[len("file:"):]).expanduser()
+        candidates = [raw_path]
+        if not raw_path.is_absolute():
+            candidates = [Path.cwd() / raw_path, Path(__file__).resolve().parents[2] / raw_path]
+        path = next((candidate.resolve() for candidate in candidates if candidate.is_file()), None)
+        if path is None:
+            return f"missing-file:{raw_path}"
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return f"file-sha256:{path.stat().st_size}:{digest.hexdigest()}"
+
+    def _find_model_path_alias_cache(self) -> Path | None:
+        """Find a complete cache whose only fingerprint change is local path."""
+        requested_identity = self._snapshot_identity(self.fingerprint.get("model_name"))
+        if requested_identity is None or not self.root.is_dir():
+            return None
+        requested = dict(self.fingerprint)
+        requested.pop("model_name", None)
+        requested_dataset = self._dataset_identity(requested.pop("dataset", None))
+        for metadata_path in sorted(self.root.glob("*/metadata.json")):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            candidate_fingerprint = metadata.get("fingerprint")
+            if not metadata.get("complete") or not isinstance(candidate_fingerprint, dict):
+                continue
+            if self._snapshot_identity(candidate_fingerprint.get("model_name")) != requested_identity:
+                continue
+            candidate = dict(candidate_fingerprint)
+            candidate.pop("model_name", None)
+            candidate_dataset = self._dataset_identity(candidate.pop("dataset", None))
+            if candidate_dataset != requested_dataset:
+                continue
+            if candidate != requested:
+                continue
+            candidate_path = metadata_path.parent
+            if all(
+                (candidate_path / f"{_GPTQ_CACHE_MODEL_NAME}_layer_{i}.safetensors").is_file()
+                for i in self.expected_layers
+            ):
+                return candidate_path
+        return None
+
     def _acquire_lock(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         deadline = time.time() + self._wait_sec
@@ -1161,8 +1411,35 @@ class _GptqWeightCache:
             try:
                 os.mkdir(self.lock_path)
                 self._lock_acquired = True
+                owner = {
+                    "hostname": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "created_time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+                (self.lock_path / "owner.json").write_text(
+                    json.dumps(owner, indent=2, sort_keys=True), encoding="utf-8"
+                )
                 return
             except FileExistsError:
+                owner_path = self.lock_path / "owner.json"
+                try:
+                    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+                except Exception:
+                    owner = {}
+                owner_pid = owner.get("pid")
+                if owner.get("hostname") == socket.gethostname() and isinstance(owner_pid, int):
+                    try:
+                        os.kill(owner_pid, 0)
+                    except ProcessLookupError:
+                        logger.warning(
+                            "Removing stale GPTQ cache lock owned by dead pid %s: %s",
+                            owner_pid,
+                            self.lock_path,
+                        )
+                        shutil.rmtree(self.lock_path, ignore_errors=True)
+                        continue
+                    except PermissionError:
+                        pass
                 logger.info("Waiting for GPTQ cache lock: key=%s", self.key)
                 if time.time() >= deadline:
                     raise TimeoutError(f"Timed out waiting for GPTQ cache lock {self.lock_path}")
@@ -1254,17 +1531,43 @@ class _GptqWeightCache:
         )
         return self.loaded_layers
 
-    def prepare(self, model) -> bool:
+    def _accept_complete_cache(self, model, *, load_on_hit: bool) -> bool:
+        if load_on_hit:
+            self.load(model)
+        else:
+            self.hit = True
+            self.loaded_layers = 0
+            logger.info(
+                "GPTQ cache-only hit: verified %d cached layers without loading weights (key=%s)",
+                len(self.expected_layers),
+                self.key,
+            )
+        return True
+
+    def prepare(self, model, *, load_on_hit: bool = True) -> bool:
         if self.mode == "off":
             return False
         if self.mode != "refresh" and self._is_complete():
-            self.load(model)
-            return True
+            return self._accept_complete_cache(model, load_on_hit=load_on_hit)
+        if self.mode != "refresh":
+            alias_path = self._find_model_path_alias_cache()
+            if alias_path is not None:
+                logger.info(
+                    "GPTQ cache model-path alias hit: requested=%s cached=%s path=%s",
+                    self.fingerprint.get("model_name"),
+                    json.loads((alias_path / "metadata.json").read_text(encoding="utf-8"))
+                    .get("fingerprint", {})
+                    .get("model_name"),
+                    alias_path,
+                )
+                self.cache_path = alias_path
+                self.model_path_alias_hit = True
+                return self._accept_complete_cache(model, load_on_hit=load_on_hit)
 
         self._acquire_lock()
         try:
             if self.mode != "refresh" and self._is_complete():
-                self.load(model)
+                self._accept_complete_cache(model, load_on_hit=load_on_hit)
                 self.release()
                 return True
             if self.mode == "require":
@@ -1319,6 +1622,62 @@ class _GptqWeightCache:
         )
 
 
+def _configure_bfcl_web_backend_env(
+    env: dict[str, str],
+    *,
+    search_backend: str,
+    cache_mode: str,
+    cache_dir: str | Path | None,
+    stats_path: str | Path | None,
+    max_search_concurrency: int = 1,
+) -> None:
+    """Configure the standalone BFCL process without patching site-packages."""
+    backend = str(search_backend or BFCL_WEB_SEARCH_BACKENDS[0]).strip().lower()
+    if backend not in BFCL_WEB_SEARCH_BACKENDS:
+        raise ValueError(
+            f"Unknown BFCL-Web search backend {search_backend!r}; expected one "
+            f"of {BFCL_WEB_SEARCH_BACKENDS}."
+        )
+    if backend != "bfcl_harness_ddgs_duckduckgo":
+        return
+
+    selected_cache_mode = str(cache_mode or "off").strip().lower()
+    if selected_cache_mode not in BFCL_WEB_SEARCH_CACHE_MODES:
+        raise ValueError(
+            "BFCL-Web cache mode must be one of "
+            f"{BFCL_WEB_SEARCH_CACHE_MODES}, got {cache_mode!r}."
+        )
+    if selected_cache_mode != "off" and cache_dir is None:
+        raise ValueError(
+            "A BFCL-Web cache directory is required for DDGS cache mode "
+            f"{selected_cache_mode!r}."
+        )
+
+    overlay_dir = _REPO_ROOT / "quant_eval" / "bfcl_runtime"
+    python_path_entries = [str(overlay_dir), str(_REPO_ROOT)]
+    python_path_entries.extend(
+        entry for entry in env.get("PYTHONPATH", "").split(os.pathsep) if entry
+    )
+    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(python_path_entries))
+    env["PLENA_BFCL_WEB_SEARCH_BACKEND"] = backend
+    env["PLENA_BFCL_WEB_CACHE_MODE"] = selected_cache_mode
+    if int(max_search_concurrency) <= 0:
+        raise ValueError("BFCL-Web search concurrency must be positive.")
+    env["PLENA_BFCL_WEB_DDGS_MAX_CONCURRENCY"] = str(
+        int(max_search_concurrency)
+    )
+    if cache_dir is not None:
+        resolved_cache_dir = Path(cache_dir).expanduser().resolve()
+        if selected_cache_mode in {"record", "auto"}:
+            resolved_cache_dir.mkdir(parents=True, exist_ok=True)
+        env["PLENA_BFCL_WEB_CACHE_DIR"] = str(resolved_cache_dir)
+    if stats_path is not None:
+        resolved_stats_path = Path(stats_path).expanduser().resolve()
+        resolved_stats_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_stats_path.unlink(missing_ok=True)
+        env["PLENA_BFCL_WEB_STATS_PATH"] = str(resolved_stats_path)
+
+
 def _run_bfcl_generate(
     model_name: str,
     test_categories: Sequence[str],
@@ -1328,6 +1687,13 @@ def _run_bfcl_generate(
     num_threads: int,
     limit: int | None,
     model_alias: str | None = None,
+    temperature: float | None = None,
+    allow_overwrite: bool = False,
+    web_search_backend: str = "bfcl_web_search_api_serpapi_duckduckgo",
+    web_search_cache_mode: str = "off",
+    web_search_cache_dir: str | Path | None = None,
+    web_search_stats_path: str | Path | None = None,
+    web_search_max_concurrency: int = 1,
 ) -> int:
     """Call ``bfcl generate`` against the local server; return the exit code."""
     bfcl_name = _bfcl_model_name(model_name, model_alias=model_alias)
@@ -1343,11 +1709,29 @@ def _run_bfcl_generate(
     local_model_path = Path(model_name)
     if local_model_path.is_dir():
         cmd.extend(["--local-model-path", str(local_model_path.resolve())])
+    if temperature is not None:
+        cmd.extend(["--temperature", str(float(temperature))])
+    if allow_overwrite:
+        cmd.append("--allow-overwrite")
     env = os.environ.copy()
     env["LOCAL_SERVER_ENDPOINT"] = host
     env["LOCAL_SERVER_PORT"]     = str(port)
     if local_model_path.is_dir():
         env.setdefault("REMOTE_OPENAI_TOKENIZER_PATH", str(local_model_path.resolve()))
+    if any(category in BFCL_WEB_SEARCH_CATEGORIES for category in test_categories):
+        if (
+            web_search_backend == "bfcl_harness_ddgs_duckduckgo"
+            and web_search_stats_path is None
+        ):
+            web_search_stats_path = result_dir / "bfcl_web_backend_stats.json"
+        _configure_bfcl_web_backend_env(
+            env,
+            search_backend=web_search_backend,
+            cache_mode=web_search_cache_mode,
+            cache_dir=web_search_cache_dir,
+            stats_path=web_search_stats_path,
+            max_search_concurrency=web_search_max_concurrency,
+        )
 
     if limit is not None:
         if limit <= 0:
@@ -1360,7 +1744,22 @@ def _run_bfcl_generate(
         env["BFCL_PROJECT_ROOT"] = str(project_root)
         project_root.mkdir(parents=True, exist_ok=True)
         ids_path = project_root / "test_case_ids_to_generate.json"
-        ids = {cat: [f"{cat}_{idx}" for idx in range(limit)] for cat in test_categories}
+        _ensure_bfcl_eval_importable()
+        try:
+            from bfcl_eval.utils import load_dataset_entry  # type: ignore
+
+            ids = {
+                cat: [str(row["id"]) for row in load_dataset_entry(cat)[:limit]]
+                for cat in test_categories
+            }
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to resolve official BFCL IDs for a limited run."
+            ) from exc
+        if any(len(values) != limit for values in ids.values()):
+            raise ValueError(
+                f"Requested limit={limit}, but selected BFCL IDs were {ids}."
+            )
         ids_path.write_text(json.dumps(ids, indent=2) + "\n")
         cmd.append("--run-ids")
 
@@ -1527,7 +1926,12 @@ def _run_batched_bfcl_multiple_generate(
             batch_prompts = [prompts[idx] for idx in batch_indices]
             encoded = input_ids = attention_mask = output_ids = generated = None
             try:
-                encoded = tokenizer(batch_prompts, return_tensors="pt", padding=True)
+                encoded = tokenizer(
+                    batch_prompts,
+                    return_tensors="pt",
+                    padding=True,
+                    add_special_tokens=False,
+                )
                 input_ids = encoded.input_ids.to(input_device)
                 attention_mask = encoded.attention_mask.to(input_device)
                 t0 = time.time()
@@ -1548,19 +1952,10 @@ def _run_batched_bfcl_multiple_generate(
                         tokenizer.eos_token_id,
                     )
                     raw_text = tokenizer.decode(gen_ids, skip_special_tokens=False).strip()
-                    try:
-                        tool_calls, _content = bfcl_adapter.parse_tool_calls(raw_text)
-                        if tool_calls:
-                            result_text = bfcl_adapter.return_text_from_tool_calls(tool_calls, raw_text=raw_text)
-                        else:
-                            result_text = bfcl_adapter.normalize_return_text(raw_text)
-                    except (RecursionError, ValueError, TypeError, MemoryError) as exc:
-                        logger.warning(
-                            "BFCL adapter failed for sample %s; preserving raw output for scoring: %s",
-                            rows[idx].get("id"),
-                            exc,
-                        )
-                        result_text = raw_text
+                    # As with the OpenAI Completions endpoint, retain the
+                    # model's exact callable syntax for BFCL's official parser.
+                    # The adapter may only remove transport-level stop tokens.
+                    result_text = bfcl_adapter.completion_response_text(raw_text)
                     prompt_tokens = int(attention_mask[row_pos].sum().item())
                     completion_tokens = int(gen_ids.numel())
                     results_by_index[idx] = {
@@ -1588,12 +1983,17 @@ def _run_batched_bfcl_multiple_generate(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
     finally:
         tokenizer.padding_side = old_padding_side
         tokenizer.pad_token = old_pad_token
 
     records = [results_by_index[idx] for idx in range(len(rows))]
-    out_path = _write_bfcl_multiple_results(result_dir, _bfcl_model_name(model_name, model_alias=model_alias), records)
+    out_path = _write_bfcl_multiple_results(
+        result_dir,
+        _bfcl_model_name(model_name, model_alias=model_alias),
+        records,
+    )
     logger.info("Wrote batched BFCL multiple results: %s", out_path)
     return 0
 
@@ -1711,6 +2111,599 @@ def _run_bfcl_evaluate(
     return returncode, scores
 
 
+def _write_json_atomic(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _json_digest(payload: object) -> str:
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _count_jsonl(path: Path) -> int:
+    if not path.is_file():
+        return 0
+    return sum(bool(line.strip()) for line in path.read_text(encoding="utf-8").splitlines())
+
+
+def _task_success(task_dir: Path, protocol: dict, expected_count: int) -> dict | None:
+    success_path = task_dir / "task_success.json"
+    if not success_path.is_file():
+        return None
+    try:
+        payload = json.loads(success_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        payload.get("protocol_digest") == _json_digest(protocol)
+        and payload.get("sample_count") == expected_count
+        and payload.get("status") == "complete"
+    ):
+        return payload
+    return None
+
+
+def _first_nested_string(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_nested_string(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _gsm8k_metrics(
+    results: dict,
+    *,
+    tokenizer=None,
+    max_new_tokens: int | None = None,
+    response_scope: str = "decoded_response",
+) -> dict:
+    task_metrics = results.get("results", {}).get("gsm8k", {})
+    samples = results.get("samples", {}).get("gsm8k", [])
+
+    def metric(name: str) -> float | None:
+        for key, value in task_metrics.items():
+            if (key == name or key.split(",", 1)[0] == name) and isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    metrics = {
+        # lm-eval duplicates logged sample records for each output filter
+        # (strict-match and flexible-extract). ``sample_len`` is the number of
+        # evaluated documents and is therefore the completion invariant.
+        "sample_count": int(task_metrics.get("sample_len", len(samples))),
+        "strict_match": metric("exact_match,strict-match"),
+        "flexible_extract": metric("exact_match,flexible-extract"),
+    }
+    if tokenizer is None:
+        return metrics
+
+    # Logged samples are duplicated once per output filter. Deduplicate by
+    # document id before reporting response-length diagnostics.
+    responses_by_doc: dict[object, str] = {}
+    for sample in samples:
+        if not isinstance(sample, dict):
+            continue
+        doc_id = sample.get("doc_id", len(responses_by_doc))
+        response = _first_nested_string(sample.get("resps"))
+        if response is not None:
+            responses_by_doc.setdefault(doc_id, response)
+    output_lengths = [
+        len(tokenizer.encode(text, add_special_tokens=False))
+        for text in responses_by_doc.values()
+    ]
+    cap_hits = (
+        sum(length >= int(max_new_tokens) for length in output_lengths)
+        if max_new_tokens is not None
+        else 0
+    )
+    sorted_lengths = sorted(output_lengths)
+    metrics.update(
+        {
+            "decoded_response_count": len(output_lengths),
+            "decoded_output_tokens_mean": (
+                sum(output_lengths) / len(output_lengths) if output_lengths else None
+            ),
+            "decoded_output_tokens_p50": (
+                sorted_lengths[(len(sorted_lengths) - 1) // 2]
+                if sorted_lengths
+                else None
+            ),
+            "decoded_output_tokens_max": max(output_lengths, default=None),
+            "decoded_token_cap_hits": cap_hits,
+            "decoded_token_cap_hit_rate": (
+                cap_hits / len(output_lengths) if output_lengths else None
+            ),
+            "decoded_response_scope": response_scope,
+        }
+    )
+    return metrics
+
+
+def _validate_bfcl_web_environment(workload: dict) -> None:
+    """Fail before generation when a BFCL-harness web run is misconfigured."""
+    if workload.get("tool_execution_owner") != "bfcl_harness":
+        return
+    if str(workload.get("generate_mode", "cli")) != "cli":
+        raise ValueError("BFCL-Web harness execution requires generate_mode='cli'.")
+    if str(workload.get("tool_mode", "return")) != "return":
+        raise ValueError(
+            "BFCL-Web harness execution requires tool_mode='return' so the BFCL "
+            "harness owns tool execution."
+        )
+    search_backend = str(workload.get("search_backend", "")).strip().lower()
+    if search_backend not in BFCL_WEB_SEARCH_BACKENDS:
+        raise ValueError(
+            "BFCL-Web search_backend must be one of "
+            f"{BFCL_WEB_SEARCH_BACKENDS}, got {search_backend!r}."
+        )
+    if int(workload.get("max_turns", 20)) != 20:
+        raise ValueError("BFCL-Web 2026.3.23 uses max_turns=20.")
+    max_new_tokens = workload.get("max_new_tokens")
+    if max_new_tokens is not None and int(max_new_tokens) < 4096:
+        raise ValueError(
+            "Official QwenFCHandler requests up to 4096 tokens per step; "
+            "max_new_tokens must be at least 4096."
+        )
+    num_threads = int(workload.get("num_threads", 1))
+    if search_backend == "bfcl_web_search_api_serpapi_duckduckgo":
+        if bool(workload.get("require_serpapi_api_key", True)) and not os.getenv(
+            "SERPAPI_API_KEY"
+        ):
+            raise RuntimeError(
+                "Official BFCL-Web requires SERPAPI_API_KEY for BFCL's "
+                "WebSearchAPI. Select search_backend="
+                "'bfcl_harness_ddgs_duckduckgo' for the free controlled "
+                "DuckDuckGo transport."
+            )
+        return
+
+    if num_threads != 1:
+        raise ValueError(
+            "Direct-DDGS BFCL-Web uses the correctness-first serial protocol; "
+            "set num_threads=1."
+        )
+    if int(workload.get("search_max_concurrency", 1)) <= 0:
+        raise ValueError("BFCL-Web search_max_concurrency must be positive.")
+    cache_mode = str(workload.get("search_cache_mode", "off")).strip().lower()
+    if cache_mode not in BFCL_WEB_SEARCH_CACHE_MODES:
+        raise ValueError(
+            "BFCL-Web search_cache_mode must be one of "
+            f"{BFCL_WEB_SEARCH_CACHE_MODES}, got {cache_mode!r}."
+        )
+    if cache_mode != "off" and not workload.get("search_cache_dir"):
+        raise ValueError(
+            "Direct DDGS BFCL-Web runs require search_cache_dir unless "
+            "search_cache_mode='off'."
+        )
+
+
+def _validate_official_bfcl_web_environment(workload: dict) -> None:
+    """Backward-compatible alias for existing callers and tests."""
+    _validate_bfcl_web_environment(workload)
+
+
+def _release_persistent_task_cuda_memory(label: str) -> None:
+    """Release transient allocations while keeping model weights resident."""
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+
+    device_stats = []
+    for device_index in range(torch.cuda.device_count()):
+        allocated_before = torch.cuda.memory_allocated(device_index)
+        reserved_before = torch.cuda.memory_reserved(device_index)
+        with torch.cuda.device(device_index):
+            torch.cuda.empty_cache()
+        reserved_after = torch.cuda.memory_reserved(device_index)
+        device_stats.append(
+            "cuda:%d allocated=%.2fGiB reserved=%.2f->%.2fGiB"
+            % (
+                device_index,
+                allocated_before / (1024**3),
+                reserved_before / (1024**3),
+                reserved_after / (1024**3),
+            )
+        )
+    logger.info("Persistent task CUDA cleanup (%s): %s", label, "; ".join(device_stats))
+
+
+def _bfcl_category_metrics(scores: dict, category: str) -> dict:
+    entry = scores.get("per_category", {}).get(category, {})
+    if isinstance(entry, list):
+        summary = entry[0] if entry and isinstance(entry[0], dict) else {}
+    elif isinstance(entry, dict):
+        summary = entry
+    else:
+        summary = {}
+    return {
+        "accuracy": summary.get("accuracy"),
+        "correct": int(summary.get("correct_count", 0)),
+        "total": int(summary.get("total_count", 0)),
+    }
+
+
+def _bfcl_raw_stats(result_dir: Path, category: str, max_new_tokens: int) -> dict:
+    candidates = sorted(result_dir.rglob(f"BFCL_v4_{category}_result.json"))
+    if not candidates:
+        return {
+            "sample_count": 0,
+            "token_cap_hits": 0,
+            "tool_error_records": 0,
+            "inference_error_records": 0,
+            "result_path": None,
+        }
+    path = candidates[0]
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    def flattened_numbers(value: object) -> list[int]:
+        if isinstance(value, bool):
+            return []
+        if isinstance(value, (int, float)):
+            return [int(value)]
+        if isinstance(value, list):
+            result: list[int] = []
+            for item in value:
+                result.extend(flattened_numbers(item))
+            return result
+        if isinstance(value, dict):
+            result = []
+            for item in value.values():
+                result.extend(flattened_numbers(item))
+            return result
+        return []
+
+    cap_hits = 0
+    error_records = 0
+    inference_error_records = 0
+    for record in records:
+        output_counts = flattened_numbers(record.get("output_token_count"))
+        cap_hits += int(any(count >= max_new_tokens for count in output_counts))
+        serialized = json.dumps(record, ensure_ascii=False).lower()
+        error_records += int('"error"' in serialized or "tool_error" in serialized)
+        result_text = str(record.get("result", "")).lower()
+        inference_error_records += int(
+            "error during inference" in result_text
+            or "internal server error" in result_text
+        )
+    return {
+        "sample_count": len(records),
+        "token_cap_hits": cap_hits,
+        "tool_error_records": error_records,
+        "inference_error_records": inference_error_records,
+        "result_path": str(path),
+    }
+
+
+def _run_persistent_generation_suite(
+    *,
+    model,
+    tokenizer,
+    workloads: list[dict],
+    switch: PhaseLayerAutoSwitch | None,
+    model_name: str,
+    model_alias: str | None,
+    server_host: str,
+    server_port: int,
+    gptq_cache_info: dict,
+    decode_weight_mode: str,
+    decode_weight_residency: str,
+    attention_backend: str,
+) -> dict:
+    """Run report tasks while retaining one prepared model for the profile."""
+    suite_results = {
+        "model_name": model_name,
+        "profile_id": workloads[0].get("profile_id") if workloads else None,
+        "attention_backend": attention_backend,
+        "decode_weight_mode": decode_weight_mode,
+        "decode_weight_residency": decode_weight_residency,
+        "gptq_cache": gptq_cache_info,
+        "tasks": [],
+    }
+    for workload in workloads:
+        task = str(workload["task"])
+        requested_memory_mode = str(
+            workload.get("attention_memory_mode", "full")
+        ).strip().lower()
+        controller = getattr(
+            model, "_plena_attention_query_chunk_controller", None
+        )
+        if isinstance(controller, AttentionQueryChunkController):
+            controller.set_mode(requested_memory_mode)
+        elif requested_memory_mode != "full":
+            raise RuntimeError(
+                f"Persistent task {task!r} requested attention memory mode "
+                f"{requested_memory_mode!r}, but the model has no unified "
+                "Qwen attention chunk controller."
+            )
+        task_dir = Path(str(workload["output_dir"])).resolve()
+        task_dir.mkdir(parents=True, exist_ok=True)
+        expected_count = int(workload["expected_count"])
+        protocol = {
+            key: value
+            for key, value in workload.items()
+            if key not in {"output_dir"}
+        }
+        prior = _task_success(task_dir, protocol, expected_count)
+        if prior is not None:
+            logger.info("Skipping completed persistent task %s: %s", task, task_dir)
+            suite_results["tasks"].append(prior)
+            continue
+
+        _release_persistent_task_cuda_memory(f"before {task}")
+        if switch is not None:
+            switch._on_phase_transition("prefill", None)
+            switch._phase[0] = "prefill"
+
+        started = time.time()
+        logger.info("Starting persistent evaluation task %s (expected=%d)", task, expected_count)
+        if task == "humaneval":
+            from quant_eval.eval.evalplus import (
+                evaluate_with_evalplus,
+                summarize_evalplus_results,
+            )
+
+            raw_results = evaluate_with_evalplus(
+                model=model,
+                tokenizer=tokenizer,
+                dataset="humaneval",
+                batch_size=int(workload.get("batch_size", 1)),
+                greedy=True,
+                n_samples=1,
+                max_new_tokens=int(workload["max_new_tokens"]),
+                output_dir=str(task_dir / "evalplus"),
+                parallel=int(workload.get("scoring_workers", 16)),
+                version=str(workload.get("version", "default")),
+                limit=workload.get("limit"),
+                batch_length_bucket=bool(
+                    workload.get("batch_length_bucket", True)
+                ),
+                adaptive_batch=bool(workload.get("adaptive_batch", True)),
+            )
+            metrics = summarize_evalplus_results(raw_results)
+            sample_count = int(raw_results.get("generated_count", metrics["total"]))
+            result = {
+                "task": task,
+                "protocol": protocol,
+                "metrics": metrics,
+                "sample_count": sample_count,
+                "partial": bool(raw_results.get("partial", False)),
+                "samples_path": raw_results.get("samples_path"),
+                "batch_stats": raw_results.get("batch_stats"),
+                "elapsed_sec": time.time() - started,
+            }
+            _write_json_atomic(task_dir / "results.json", result)
+        elif task == "gsm8k":
+            from quant_eval.eval.lm_eval import evaluate_with_lm_eval
+
+            requested_batch_size = max(1, int(workload.get("batch_size", 1)))
+            current_batch_size = requested_batch_size
+            attempted_batch_sizes = []
+            adaptive_batch = bool(workload.get("adaptive_batch", True))
+            while True:
+                attempted_batch_sizes.append(current_batch_size)
+                oom_message = None
+                try:
+                    raw_results = evaluate_with_lm_eval(
+                        model=model,
+                        tokenizer=tokenizer,
+                        tasks="gsm8k",
+                        max_length=int(workload.get("max_length", 32768)),
+                        batch_size=current_batch_size,
+                        log_samples=True,
+                        limit=workload.get("limit"),
+                        num_fewshot=int(workload.get("num_fewshot", 5)),
+                        apply_chat_template=bool(
+                            workload.get("apply_chat_template", False)
+                        ),
+                        fewshot_as_multiturn=bool(
+                            workload.get("fewshot_as_multiturn", False)
+                        ),
+                        enable_thinking=workload.get("enable_thinking"),
+                        think_end_token=workload.get("think_end_token"),
+                        chat_template_args=workload.get("chat_template_args"),
+                        gen_kwargs=dict(
+                            workload.get("gen_kwargs")
+                            or {
+                                "max_gen_toks": int(workload["max_new_tokens"]),
+                                "do_sample": False,
+                            }
+                        ),
+                        random_seed=int(workload.get("random_seed", 0)),
+                        numpy_random_seed=int(
+                            workload.get("numpy_random_seed", 1234)
+                        ),
+                        torch_random_seed=int(
+                            workload.get("torch_random_seed", 1234)
+                        ),
+                        fewshot_random_seed=int(
+                            workload.get("fewshot_random_seed", 1234)
+                        ),
+                    )
+                except Exception as error:
+                    if (
+                        not adaptive_batch
+                        or current_batch_size <= 1
+                        or not _is_cuda_oom(error)
+                    ):
+                        raise
+                    oom_message = str(error).splitlines()[0]
+
+                if oom_message is None:
+                    break
+                next_batch_size = max(1, current_batch_size // 2)
+                logger.warning(
+                    "GSM8K CUDA OOM at batch_size=%d; retrying at batch_size=%d (%s)",
+                    current_batch_size,
+                    next_batch_size,
+                    oom_message,
+                )
+                current_batch_size = next_batch_size
+                _release_persistent_task_cuda_memory("GSM8K OOM retry")
+
+            metrics = _gsm8k_metrics(
+                raw_results,
+                tokenizer=tokenizer,
+                max_new_tokens=int(workload["max_new_tokens"]),
+                response_scope=(
+                    "post_thinking_strip"
+                    if workload.get("think_end_token") is not None
+                    else "full_decoded_response"
+                ),
+            )
+            sample_count = int(metrics["sample_count"])
+            result = {
+                "task": task,
+                "protocol": protocol,
+                "metrics": metrics,
+                "sample_count": sample_count,
+                "batch_stats": {
+                    "requested_batch_size": requested_batch_size,
+                    "effective_batch_size": current_batch_size,
+                    "attempted_batch_sizes": attempted_batch_sizes,
+                    "adaptive_batch": adaptive_batch,
+                },
+                "elapsed_sec": time.time() - started,
+            }
+            save_results(task_dir, raw_results)
+            _write_json_atomic(task_dir / "summary.json", result)
+        elif task == "bfcl_web":
+            _validate_official_bfcl_web_environment(workload)
+            category = str(workload.get("category", "web_search_base"))
+            result_dir = task_dir / "bfcl_results"
+            score_dir = task_dir / "bfcl_scores"
+            result_dir.mkdir(parents=True, exist_ok=True)
+            score_dir.mkdir(parents=True, exist_ok=True)
+            num_threads = max(1, int(workload.get("num_threads", 1)))
+            backend_stats_path = workload.get(
+                "search_stats_path", task_dir / "backend_stats.json"
+            )
+            gen_rc = _run_bfcl_generate(
+                model_name=model_name,
+                test_categories=[category],
+                host=server_host,
+                port=server_port,
+                result_dir=result_dir,
+                num_threads=num_threads,
+                limit=workload.get("limit"),
+                model_alias=model_alias,
+                temperature=float(workload.get("temperature", 0.001)),
+                allow_overwrite=True,
+                web_search_backend=str(
+                    workload.get(
+                        "search_backend",
+                        "bfcl_web_search_api_serpapi_duckduckgo",
+                    )
+                ),
+                web_search_cache_mode=str(
+                    workload.get("search_cache_mode", "off")
+                ),
+                web_search_cache_dir=workload.get("search_cache_dir"),
+                web_search_stats_path=backend_stats_path,
+                web_search_max_concurrency=int(
+                    workload.get("search_max_concurrency", 1)
+                ),
+            )
+            eval_rc, raw_scores = _run_bfcl_evaluate(
+                model_name=model_name,
+                test_categories=[category],
+                result_dir=result_dir,
+                score_dir=score_dir,
+                model_alias=model_alias,
+                partial_eval=workload.get("limit") is not None,
+            )
+            raw_stats = _bfcl_raw_stats(
+                result_dir, category, int(workload["max_new_tokens"])
+            )
+            selected_search_backend = str(
+                workload.get(
+                    "search_backend",
+                    "bfcl_web_search_api_serpapi_duckduckgo",
+                )
+            )
+            web_backend_stats = {}
+            backend_stats_file = Path(str(backend_stats_path))
+            if (
+                selected_search_backend == "bfcl_harness_ddgs_duckduckgo"
+                and backend_stats_file.is_file()
+            ):
+                web_backend_stats = json.loads(
+                    backend_stats_file.read_text(encoding="utf-8")
+                )
+            elif selected_search_backend == "bfcl_harness_ddgs_duckduckgo":
+                web_backend_stats = {
+                    "backend": selected_search_backend,
+                    "errors": 1,
+                    "status": "missing_backend_stats",
+                }
+            metrics = _bfcl_category_metrics(raw_scores, category)
+            sample_count = int(raw_stats["sample_count"])
+            result = {
+                "task": task,
+                "protocol": protocol,
+                "metrics": metrics,
+                "raw_stats": raw_stats,
+                "sample_count": sample_count,
+                "generate_returncode": gen_rc,
+                "evaluate_returncode": eval_rc,
+                "scores": raw_scores,
+                "search_backend": selected_search_backend,
+                "web_search_backend": web_backend_stats,
+                "elapsed_sec": time.time() - started,
+            }
+            _write_json_atomic(task_dir / "results.json", result)
+            if (
+                gen_rc != 0
+                or eval_rc != 0
+                or int(raw_stats.get("inference_error_records", 0)) > 0
+                or int(web_backend_stats.get("errors", 0)) > 0
+            ):
+                raise RuntimeError(
+                    "BFCL Web failed: "
+                    f"generate rc={gen_rc}, evaluate rc={eval_rc}, "
+                    "inference errors="
+                    f"{raw_stats.get('inference_error_records', 0)}, "
+                    "web backend errors="
+                    f"{web_backend_stats.get('errors', 0)}."
+                )
+        else:
+            raise ValueError(f"Unsupported persistent workload: {task!r}.")
+
+        if sample_count != expected_count:
+            raise RuntimeError(
+                f"Incomplete {task} result: {sample_count}/{expected_count} samples in {task_dir}."
+            )
+        result["attention_memory"] = get_attention_memory_stats(model)
+        success = {
+            **result,
+            "status": "complete",
+            "protocol_digest": _json_digest(protocol),
+            "completed_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        _write_json_atomic(task_dir / "task_success.json", success)
+        suite_results["tasks"].append(success)
+        _release_persistent_task_cuda_memory(f"after {task}")
+
+    suite_results["complete"] = len(suite_results["tasks"]) == len(workloads)
+    suite_results["attention_memory"] = get_attention_memory_stats(model)
+    return suite_results
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main entry-point
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1722,6 +2715,10 @@ def main(
     quant_config: str = "quant_eval/configs/qwen3_mxint16.toml",
     model_parallel: bool = False,
     attn_implementation: str = "auto",
+    attention_memory_mode: str = "full",
+    attention_query_chunk_size: int = 512,
+    attention_query_chunk_min_size: int = 128,
+    attention_chunk_oom_fallback: bool = True,
     # ── BFCL settings ──────────────────────────────────────────────────────
     bfcl_test_categories: Union[list[str], str, None] = None,
     bfcl_model_alias:     str | None = "Qwen/Qwen3-8B-FC",
@@ -1736,6 +2733,11 @@ def main(
     bfcl_batch_size:      int = 16,
     bfcl_batch_length_bucket: bool = True,
     bfcl_disable_thinking: bool = False,
+    bfcl_web_search_backend: str = "bfcl_web_search_api_serpapi_duckduckgo",
+    bfcl_web_search_cache_mode: str = "off",
+    bfcl_web_search_cache_dir: str | None = None,
+    bfcl_web_search_stats_path: str | None = None,
+    bfcl_web_search_max_concurrency: int = 1,
     # ── GPTQ calibration/weight quantization ───────────────────────────────
     gptq_dataset:          str | None = None,
     gptq_nsamples:         int = 32,
@@ -1781,6 +2783,8 @@ def main(
     run_evaluate: bool = True,
     persistent_trials: list[dict] | None = None,
     persistent_progress_path: str | None = None,
+    persistent_workloads: list[dict] | None = None,
+    persistent_suite_output_path: str | None = None,
 ):
     """
     Run BFCL web-search evaluation with phase- and layer-type-dependent
@@ -1803,6 +2807,16 @@ def main(
             ``"auto"`` keeps FP baselines on SDPA but uses eager for quantized
             Qwen3/Qwen3-MoE paths where runtime wrappers insert quantization
             inside the attention core.
+        attention_memory_mode: ``"full"`` preserves the existing eager
+            attention allocation. ``"query_chunked"`` computes complete-key
+            attention for bounded query slices to avoid materializing full
+            ``Q x K`` score/probability tensors.
+        attention_query_chunk_size: Initial query chunk size for chunked Qwen
+            attention.
+        attention_query_chunk_min_size: Lowest chunk size used by local CUDA
+            OOM fallback.
+        attention_chunk_oom_fallback: Halve the query chunk after a CUDA OOM,
+            down to ``attention_query_chunk_min_size``.
         bfcl_test_categories: BFCL category names to evaluate (e.g.
             ``["web_search_base", "web_search_no_snippet"]``). ``None`` uses
             the default web-search category set. Also accepts JSON-list string
@@ -1821,12 +2835,24 @@ def main(
         bfcl_disable_thinking: In batched Qwen3 generation, prefill an empty
             thinking block after the assistant prefix, matching the tokenizer
             template's ``enable_thinking=False`` behavior.
+        bfcl_web_search_backend: Tool transport used by the BFCL harness.
+            The default is BFCL's SerpAPI-backed DuckDuckGo implementation;
+            ``bfcl_harness_ddgs_duckduckgo`` uses direct DDGS without an API
+            key and is reported as a controlled, non-leaderboard protocol.
+        bfcl_web_search_cache_mode: Direct-DDGS cache policy: off, record,
+            replay, or auto (replay hits and record misses).
+        bfcl_web_search_cache_dir: Shared response-cache directory for direct
+            DDGS search and URL-fetch tool calls.
+        bfcl_web_search_stats_path: Optional per-run JSON file receiving DDGS
+            live-call, cache-hit, cache-miss, and error counters.
+        bfcl_web_search_max_concurrency: Maximum number of simultaneous live
+            direct-DDGS search requests.
         server_host: Host for the local OpenAI-compatible server.
         server_port: Port for the local OpenAI-compatible server.
-        bfcl_tool_mode: ``"auto"`` executes tools only for web-search categories;
-            ``"return"`` returns model tool calls directly for BFCL function-call
-            categories such as ``multiple``; ``"execute"`` preserves agentic
-            web-search behavior.
+        bfcl_tool_mode: ``"auto"`` and ``"return"`` return model tool calls to
+            the BFCL harness, which owns official multi-turn tool execution.
+            ``"execute"`` preserves the legacy PLENA in-server tool loop and is
+            not directly comparable to official BFCL-Web results.
         bfcl_max_new_tokens: Local cap applied to BFCL-requested ``max_tokens``
             before calling ``model.generate``. ``None`` disables the cap.
         gptq_dataset: Optional GPTQ calibration dataset. Plain paths are treated
@@ -1857,8 +2883,10 @@ def main(
             ``"fp"`` loads original checkpoint weights for decode Linear
             layers and bypasses Linear activation quantization.
         decode_weight_residency: ``"disk_reload"`` keeps the legacy FP decode
-            weight reload path. ``"gpu_dual"`` keeps original FP Linear weights
-            in GPU-resident wrapper buffers and phase-switches by flag.
+            weight reload path. ``"host_cached"`` retains safetensors mmaps and
+            uses Linux page cache plus per-device parallel copies without a
+            second GPU-resident weight set. ``"gpu_dual"`` keeps original FP
+            weights in GPU-resident wrapper buffers and phase-switches by flag.
         runtime_weight_only: Debug/sanity mode for quantized runs. If true,
             keep GPTQ/fake-quantized weights but bypass runtime activation,
             KV, attention nonlinear, MLP nonlinear, and RMSNorm quantization.
@@ -1875,6 +2903,9 @@ def main(
         run_evaluate: Run ``bfcl evaluate`` after generation. Set to ``False``
             when only raw generation artifacts, for example token length
             statistics, are needed.
+        persistent_workloads: Optional generation-suite task specifications.
+            The prepared model remains resident while HumanEval, GSM8K and
+            BFCL-Web execute sequentially.
 
     Returns:
         BFCL evaluation summary — per-category scores plus aggregate metrics,
@@ -1895,6 +2926,44 @@ def main(
             )
         if int(bfcl_batch_size) <= 0:
             raise ValueError("bfcl_batch_size must be positive.")
+    if (
+        bfcl_tool_mode == "return"
+        and any(category in BFCL_WEB_SEARCH_CATEGORIES for category in bfcl_test_categories)
+        and (
+            persistent_workloads is None
+            or any(
+                str(workload.get("task")) == "bfcl_web"
+                for workload in persistent_workloads
+            )
+        )
+    ):
+        persistent_web_workload = next(
+            (
+                workload
+                for workload in (persistent_workloads or [])
+                if str(workload.get("task")) == "bfcl_web"
+            ),
+            None,
+        )
+        _validate_bfcl_web_environment(
+            persistent_web_workload
+            or {
+                "tool_execution_owner": "bfcl_harness",
+                "generate_mode": bfcl_generate_mode,
+                "tool_mode": bfcl_tool_mode,
+                "search_backend": bfcl_web_search_backend,
+                "search_cache_mode": bfcl_web_search_cache_mode,
+                "search_cache_dir": bfcl_web_search_cache_dir,
+                "search_max_concurrency": bfcl_web_search_max_concurrency,
+                "num_threads": bfcl_num_threads,
+                "max_turns": 20,
+                "max_new_tokens": bfcl_max_new_tokens,
+                "require_serpapi_api_key": (
+                    bfcl_web_search_backend
+                    == "bfcl_web_search_api_serpapi_duckduckgo"
+                ),
+            }
+        )
     bfcl_adapter_obj = resolve_bfcl_adapter(bfcl_adapter, model_name=model_name, model_alias=bfcl_model_alias)
     resolved_bfcl_adapter = bfcl_adapter_obj.name
     model_family = model_family.lower()
@@ -1906,13 +2975,20 @@ def main(
             f"got {decode_weight_mode!r}."
         )
     decode_weight_residency = str(decode_weight_residency or "disk_reload").lower()
-    if decode_weight_residency not in {"disk_reload", "gpu_dual"}:
+    if decode_weight_residency not in {"disk_reload", "host_cached", "gpu_dual"}:
         raise ValueError(
-            "decode_weight_residency must be 'disk_reload' or 'gpu_dual', "
+            "decode_weight_residency must be 'disk_reload', 'host_cached', "
+            "or 'gpu_dual', "
             f"got {decode_weight_residency!r}."
         )
-    if decode_weight_residency == "gpu_dual" and decode_weight_mode != "fp":
-        raise ValueError("decode_weight_residency='gpu_dual' requires decode_weight_mode='fp'.")
+    if (
+        decode_weight_residency in {"host_cached", "gpu_dual"}
+        and decode_weight_mode != "fp"
+    ):
+        raise ValueError(
+            f"decode_weight_residency={decode_weight_residency!r} requires "
+            "decode_weight_mode='fp'."
+        )
     device_id = _normalize_device_id(device_id)
     quant_config_is_none = quant_config is None or str(quant_config).strip().lower() in {"", "none", "fp", "false"}
     if quant_config_is_none:
@@ -1941,6 +3017,27 @@ def main(
         if decode_weight_residency != "disk_reload":
             raise ValueError("--decode_weight_residency is only meaningful for quantized runs.")
 
+    attention_memory_mode = str(attention_memory_mode or "full").strip().lower()
+    if attention_memory_mode not in ATTENTION_MEMORY_MODES:
+        raise ValueError(
+            f"attention_memory_mode must be one of {ATTENTION_MEMORY_MODES}, "
+            f"got {attention_memory_mode!r}."
+        )
+    if int(attention_query_chunk_size) <= 0 or int(attention_query_chunk_min_size) <= 0:
+        raise ValueError("Attention query chunk sizes must be positive integers.")
+    if int(attention_query_chunk_min_size) > int(attention_query_chunk_size):
+        raise ValueError(
+            "attention_query_chunk_min_size cannot exceed "
+            "attention_query_chunk_size."
+        )
+    if attention_memory_mode == "query_chunked" and (
+        not qwen_model_family or quant_config_is_none
+    ):
+        raise ValueError(
+            "attention_memory_mode='query_chunked' currently requires a "
+            "quantized qwen3 or qwen3_moe unified-wrapper run. FP baselines "
+            "should use native SDPA."
+        )
     # ------------------------------------------------------------------
     # Build the nested phase × layer/nonlinear config
     # ------------------------------------------------------------------
@@ -2223,7 +3320,9 @@ def main(
     # ------------------------------------------------------------------
     _pa = _prefill_precision["display"]
     _pf = _prefill_precision["ffn_display"]
-    if decode_weight_mode == "fp":
+    if quant_config_is_none:
+        _pa = _pf = _da = _df = f"native {dtype}"
+    elif decode_weight_mode == "fp":
         _da = "Linear FP/bypass, attn FP/bypass, old KV no-requant"
         _df = "Linear FP/bypass"
     else:
@@ -2241,13 +3340,24 @@ def main(
     print(f"  Adapter    : {resolved_bfcl_adapter} (requested={bfcl_adapter})")
     print(f"  Family     : {model_family}")
     print(f"  Attention  : {resolved_attn_implementation} (requested={requested_attn_implementation})")
+    print(
+        f"  Attn memory: {attention_memory_mode}"
+        + (
+            f" (chunk={int(attention_query_chunk_size)}, "
+            f"min={int(attention_query_chunk_min_size)}, "
+            f"oom_fallback={bool(attention_chunk_oom_fallback)})"
+            if attention_memory_mode == "query_chunked"
+            else ""
+        )
+    )
     print(f"  Max new tok: {bfcl_max_new_tokens if bfcl_max_new_tokens is not None else 'uncapped'}")
     print(f"  Generate   : {bfcl_generate_mode}" + (f" (batch={bfcl_batch_size})" if bfcl_generate_mode == "batched" else ""))
+    print("  HTTP mode  : serial")
     if bfcl_generate_mode == "batched":
         print(f"  Thinking   : {'disabled' if bfcl_disable_thinking else 'enabled'}")
     print(f"  Weights    : {'FP baseline (no quantization)' if quant_config_is_none else quant_config}")
-    print(f"  Decode W   : {decode_weight_mode}")
-    print(f"  Weight res : {decode_weight_residency}")
+    print(f"  Decode W   : {'n/a (native weights)' if quant_config_is_none else decode_weight_mode}")
+    print(f"  Weight res : {'n/a' if quant_config_is_none else decode_weight_residency}")
     if bypass_components:
         print(f"  Runtime    : bypass {','.join(sorted(bypass_components))}")
     if gptq_dataset:
@@ -2301,8 +3411,17 @@ def main(
         dtype=torch_dtype,
         device=device_id if not model_parallel else None,
         attn_implementation=resolved_attn_implementation,
+        layer_balanced_device_map=bool(
+            model_parallel
+            and qwen_model_family
+            and (
+                decode_weight_residency in {"host_cached", "gpu_dual"}
+                or gptq_device_map_aware
+            )
+        ),
     )
     model.eval()
+    app = None
 
     try:
         # ------------------------------------------------------------------
@@ -2417,8 +3536,8 @@ def main(
                     _qwen3_moe_experts_config = None
                     if model_family == "qwen3_moe" and phase_configs["prefill"]["mlp"]:
                         _qwen3_moe_experts_config = {
-                            **phase_configs["prefill"]["ffn"],
-                            **phase_configs["prefill"]["mlp"],
+                            "act": phase_configs["prefill"]["ffn"],
+                            "nonlinear": phase_configs["prefill"]["mlp"],
                         }
                     t_unified = time.time()
                     wrapper_kwargs = {
@@ -2428,6 +3547,10 @@ def main(
                         "qwen3_moe_attention_config": phase_configs["prefill"]["attn"] if model_family == "qwen3_moe" else None,
                         "qwen3_moe_experts_config": _qwen3_moe_experts_config,
                         "qwen3_moe_rms_norm_config": phase_configs["prefill"]["rms_norm"] if model_family == "qwen3_moe" and phase_configs["prefill"]["rms_norm"] else None,
+                        "attention_memory_mode": attention_memory_mode,
+                        "attention_query_chunk_size": int(attention_query_chunk_size),
+                        "attention_query_chunk_min_size": int(attention_query_chunk_min_size),
+                        "attention_chunk_oom_fallback": bool(attention_chunk_oom_fallback),
                     }
                     if qwen_cache_fast_path:
                         unified_counts = apply_qwen3_gptq_cache_unified_wrappers(
@@ -2478,6 +3601,10 @@ def main(
             if decode_weight_mode == "fp":
                 switch_kwargs["model_name"] = model_name
                 switch_kwargs["weight_residency"] = decode_weight_residency
+                if decode_weight_residency in {"disk_reload", "host_cached"}:
+                    quant_checkpoint_dir = gptq_cache_info.get("path")
+                    if quant_checkpoint_dir:
+                        switch_kwargs["quant_checkpoint_dir"] = quant_checkpoint_dir
 
             t_switch = time.time()
             switch = PhaseLayerAutoSwitch(model, phase_configs, **switch_kwargs)
@@ -2502,12 +3629,34 @@ def main(
         else:
             logger.info("Skipping local OpenAI server; using in-process batched BFCL generation.")
 
+        if persistent_workloads:
+            suite_results = _run_persistent_generation_suite(
+                model=model,
+                tokenizer=tokenizer,
+                workloads=persistent_workloads,
+                switch=switch,
+                model_name=model_name,
+                model_alias=bfcl_model_alias,
+                server_host=server_host,
+                server_port=server_port,
+                gptq_cache_info=gptq_cache_info,
+                decode_weight_mode=decode_weight_mode,
+                decode_weight_residency=decode_weight_residency,
+                attention_backend=resolved_attn_implementation,
+            )
+            if persistent_suite_output_path:
+                _write_json_atomic(Path(persistent_suite_output_path), suite_results)
+            if switch is not None:
+                switch.disable()
+            return suite_results
+
         if persistent_trials:
             persistent_results = {
                 "model_family": model_family,
                 "decode_weight_mode": decode_weight_mode,
                 "decode_weight_residency": decode_weight_residency,
                 "gptq_cache": gptq_cache_info,
+                "attention_memory": get_attention_memory_stats(model),
                 "trials": [],
             }
             for trial_spec in persistent_trials:
@@ -2561,6 +3710,11 @@ def main(
                         num_threads=bfcl_num_threads,
                         limit=limit,
                         model_alias=bfcl_model_alias,
+                        web_search_backend=bfcl_web_search_backend,
+                        web_search_cache_mode=bfcl_web_search_cache_mode,
+                        web_search_cache_dir=bfcl_web_search_cache_dir,
+                        web_search_stats_path=bfcl_web_search_stats_path,
+                        web_search_max_concurrency=bfcl_web_search_max_concurrency,
                     )
                 if run_evaluate:
                     eval_rc, scores = _run_bfcl_evaluate(
@@ -2590,10 +3744,13 @@ def main(
                     "bfcl_batch_length_bucket": bool(bfcl_batch_length_bucket) if bfcl_generate_mode == "batched" else None,
                     "bfcl_disable_thinking": bool(bfcl_disable_thinking) if bfcl_generate_mode == "batched" else None,
                     "model_family": model_family,
+                    "attn_implementation_requested": requested_attn_implementation,
+                    "attn_implementation": resolved_attn_implementation,
                     "bfcl_max_new_tokens": bfcl_max_new_tokens,
                     "decode_weight_mode": decode_weight_mode,
                     "decode_weight_residency": decode_weight_residency,
                     "gptq_cache": gptq_cache_info,
+                    "attention_memory": get_attention_memory_stats(model),
                     "persistent_trial": {
                         "trial_id": trial_spec.get("trial_id", ""),
                         "act": trial_spec.get("act", ""),
@@ -2616,6 +3773,7 @@ def main(
 
             if switch is not None:
                 switch.disable()
+            persistent_results["attention_memory"] = get_attention_memory_stats(model)
             return persistent_results
 
         # ------------------------------------------------------------------
@@ -2647,6 +3805,11 @@ def main(
                 num_threads     = bfcl_num_threads,
                 limit           = limit,
                 model_alias     = bfcl_model_alias,
+                web_search_backend = bfcl_web_search_backend,
+                web_search_cache_mode = bfcl_web_search_cache_mode,
+                web_search_cache_dir = bfcl_web_search_cache_dir,
+                web_search_stats_path = bfcl_web_search_stats_path,
+                web_search_max_concurrency = bfcl_web_search_max_concurrency,
             )
         if gen_rc != 0:
             logger.error("bfcl generate exited with code %d", gen_rc)
@@ -2674,6 +3837,7 @@ def main(
                 "decode_weight_mode": decode_weight_mode,
                 "decode_weight_residency": decode_weight_residency,
                 "precision_metadata": precision_metadata,
+                "attention_memory": get_attention_memory_stats(model),
             }
             if resolved_gptq_config:
                 scores["gptq"] = {
@@ -2689,7 +3853,6 @@ def main(
                 scores["gptq_cache"] = gptq_cache_info
             if log_dir:
                 save_results(log_dir, scores)
-            _tmpdir_ctx.cleanup()
             return scores
 
     #     # ------------------------------------------------------------------
@@ -2754,6 +3917,7 @@ def main(
         scores["decode_weight_mode"] = decode_weight_mode
         scores["decode_weight_residency"] = decode_weight_residency
         scores["precision_metadata"] = precision_metadata
+        scores["attention_memory"] = get_attention_memory_stats(model)
         if resolved_gptq_config:
             scores["gptq"] = {
                 "dataset": resolved_gptq_config.get("dataset"),
@@ -2770,9 +3934,10 @@ def main(
         if log_dir:
             save_results(log_dir, scores)
 
-        _tmpdir_ctx.cleanup()
         return scores
     finally:
+        _stop_server(app)
+        _tmpdir_ctx.cleanup()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

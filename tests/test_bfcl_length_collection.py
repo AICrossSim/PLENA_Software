@@ -44,6 +44,7 @@ def test_load_length_rows_from_single_json_usage_payload(tmp_path):
             "input_tokens": 12,
             "output_tokens": 3,
             "total_tokens": 15,
+            "osl_isl_ratio": 0.25,
             "latency": 0.25,
         }
     ]

@@ -106,6 +106,25 @@ def test_gpu_dual_allowed_for_persistent_multiworker():
     assert _trial_weight_reuse(cfg) is True
 
 
+def test_host_cached_residency_is_passed_without_requiring_persistent_lifecycle(tmp_path):
+    cfg = _cfg(parallel_mode="pp")
+    cfg["runtime"]["decode_weight_residency"] = "host_cached"
+    trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
+    cmd = bfcl_base_command(cfg, trial, tmp_path, 9000, _args())
+
+    assert _decode_weight_residency(cfg) == "host_cached"
+    assert "--decode_weight_residency host_cached" in " ".join(cmd)
+
+
+def test_host_cached_requires_fp_decode():
+    cfg = _cfg(parallel_mode="pp")
+    cfg["runtime"]["decode_weight_residency"] = "host_cached"
+    cfg["runtime"]["decode_weight_mode"] = "quantized"
+
+    with pytest.raises(ValueError, match="host_cached.*decode_weight_mode='fp'"):
+        _decode_weight_residency(cfg)
+
+
 def test_bfcl_batched_generate_mode_is_passed_to_eval(tmp_path):
     cfg = _cfg(parallel_mode="pp")
     cfg["bfcl"]["generate_mode"] = "batched"
@@ -117,6 +136,26 @@ def test_bfcl_batched_generate_mode_is_passed_to_eval(tmp_path):
     assert "--bfcl_generate_mode batched" in joined
     assert "--bfcl_batch_size 16" in joined
     assert "--bfcl_batch_length_bucket true" in joined
+
+
+def test_bfcl_query_chunked_attention_config_is_passed_to_eval(tmp_path):
+    cfg = _cfg(parallel_mode="pp")
+    cfg["runtime"].update(
+        {
+            "attention_memory_mode": "query_chunked",
+            "attention_query_chunk_size": 512,
+            "attention_query_chunk_min_size": 128,
+            "attention_chunk_oom_fallback": True,
+        }
+    )
+    trial = BfclTrial("trial", "MXINT_8", "MXINT_8", "FP_E8M5", 0)
+    cmd = bfcl_base_command(cfg, trial, tmp_path, 9000, _args())
+    joined = " ".join(cmd)
+
+    assert "--attention_memory_mode query_chunked" in joined
+    assert "--attention_query_chunk_size 512" in joined
+    assert "--attention_query_chunk_min_size 128" in joined
+    assert "--attention_chunk_oom_fallback true" in joined
 
 
 def test_ppl_passes_device_map_aware_gptq_flag(tmp_path):

@@ -145,6 +145,19 @@ def _strip_qwen_think(text: str) -> str:
     return text
 
 
+def _strip_qwen_transport(text: str) -> str:
+    """Remove chat-template boundary tokens leaked by completion endpoints."""
+    value = (text or "").strip()
+    if value.startswith("<|im_start|>"):
+        value = value[len("<|im_start|>") :].lstrip()
+        if value.startswith("assistant\n"):
+            value = value[len("assistant\n") :]
+    for token in ("<|im_end|>", "<|endoftext|>"):
+        if token in value:
+            value = value.split(token, 1)[0]
+    return value.strip()
+
+
 def _parse_tool_call_tags(text: str) -> tuple[list[dict[str, Any]], str]:
     # Official QwenFCHandler uses newlines around the JSON payload.  Accept a
     # relaxed form too so we can canonicalize generated variants back to the
@@ -181,6 +194,15 @@ class BFCLAdapter:
     def normalize_return_text(self, text: str) -> str:
         return text
 
+    def completion_response_text(self, text: str) -> str:
+        """Prepare raw generation text for an OpenAI Completions response.
+
+        This hook may remove model-specific transport tokens, but it must not
+        repair the model's callable payload. The BFCL model handler owns output
+        parsing and should observe format errors exactly as generated.
+        """
+        return self.normalize_return_text(text)
+
     def return_text_from_tool_calls(self, tool_calls: list[dict[str, Any]], raw_text: str | None = None) -> str:
         return raw_text or self.normalize_return_text("")
 
@@ -197,7 +219,7 @@ class Qwen3FCAdapter(BFCLAdapter):
         super().__init__("qwen3_fc")
 
     def parse_tool_calls(self, text: str) -> tuple[list[dict[str, Any]] | None, str]:
-        cleaned = _strip_qwen_think(text or "")
+        cleaned = _strip_qwen_transport(_strip_qwen_think(text or ""))
         for parser in (_parse_tool_call_tags, _parse_fenced_json):
             calls, leftover = parser(cleaned)
             if calls:
@@ -216,14 +238,21 @@ class Qwen3FCAdapter(BFCLAdapter):
             embedded.extend(_parse_payload_sequence(candidate))
         if embedded:
             return embedded, ""
-        return None, text
+        return None, cleaned
 
     def normalize_return_text(self, text: str) -> str:
-        cleaned = _strip_qwen_think(text or "").strip()
+        cleaned = _strip_qwen_transport(_strip_qwen_think(text or "")).strip()
         calls, _ = _parse_tool_call_tags(cleaned)
         if calls:
             return self.return_text_from_tool_calls(calls, raw_text=cleaned)
         return cleaned
+
+    def completion_response_text(self, text: str) -> str:
+        # QwenFCHandler extracts ``reasoning_content`` from the raw <think>
+        # block and then parses exact <tool_call> tags. Preserve both here and
+        # remove only chat-template boundary tokens emitted by local HF
+        # generation.
+        return _strip_qwen_transport(text or "")
 
     def return_text_from_tool_calls(self, tool_calls: list[dict[str, Any]], raw_text: str | None = None) -> str:
         payloads: list[str] = []
